@@ -31,7 +31,7 @@ from ..data.interleave import interleaved_stream
 from ..data.synthetic import generate_all_synthetic
 from .optimizer import setup_optimizer
 from .schedule import get_lr_multiplier, get_alpha
-from .distributed import setup_device, get_batch_to_device
+from .distributed import setup_device, setup_data_parallel, unwrap_model, get_batch_to_device
 
 
 def _load_env():
@@ -94,11 +94,14 @@ def train(
     print("Building model...")
     model = MemoriaModel(config)
     model.init_weights()
-    model = model.to(device)
-    print(model.summary())
+    model, is_parallel = setup_data_parallel(model)
+    base_model = unwrap_model(model, is_parallel)  # unwrapped for state access + pass 2
+    print(base_model.summary())
+    if is_parallel:
+        print(f"  DataParallel across {torch.cuda.device_count()} GPUs")
 
-    # Optimizer
-    optimizer = setup_optimizer(model, config)
+    # Optimizer (always on the base model, not the DataParallel wrapper)
+    optimizer = setup_optimizer(base_model, config)
 
     # Data
     print("Generating synthetic data...")
@@ -119,7 +122,7 @@ def train(
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
         model.load_state_dict(checkpoint['model_state'], strict=False)
-        model.state.load_state_cognitive(checkpoint['cognitive_state'])
+        base_model.state.load_state_cognitive(checkpoint['cognitive_state'])
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_step = checkpoint['step']
         print(f"Resumed from step {start_step}")
@@ -173,6 +176,9 @@ def train(
         total_loss_fe = 0.0
 
         for micro_step in range(grad_accum):
+            if step == 0:
+                print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
+
             # Get batch (use prefetched if available)
             if prefetched is not None:
                 batch = prefetched
@@ -194,6 +200,9 @@ def train(
             total_loss_fe += result['loss_fe'].item()
             all_candidates.extend(result['candidates'])
 
+        if step == 0:
+            print(f"\r  Step 0 complete.{' ' * 30}", flush=True)
+
         # Optimizer step
         optimizer.step()
         model.zero_grad(set_to_none=True)
@@ -204,7 +213,7 @@ def train(
             break
 
         # Pass 2: cognitive update (detached from optimizer graph)
-        model.detach_state()
+        base_model.detach_state()
 
         # Collect read indices from candidates (which beliefs were accessed)
         read_indices = list(set(
@@ -212,7 +221,7 @@ def train(
         ))
 
         pass2_stats = run_pass2(
-            state=model.state,
+            state=base_model.state,
             candidates=all_candidates,
             read_belief_indices=read_indices,
             current_step=step,
@@ -269,11 +278,11 @@ def train(
 
         # Checkpoint
         if step > 0 and step % tc.checkpoint_interval == 0:
-            save_checkpoint(model, optimizer, step, ckpt_path / f"step_{step}.pt")
+            save_checkpoint(base_model, optimizer, step, ckpt_path / f"step_{step}.pt")
 
         # Push to HuggingFace Hub
         if push_to_hub and step > 0 and step % hub_push_every == 0:
-            _push_to_hub(model, step, ckpt_path, hf_repo, hf_token)
+            _push_to_hub(base_model, step, ckpt_path, hf_repo, hf_token)
 
         # Time budget
         if time_budget and total_training_time >= time_budget:
@@ -287,11 +296,11 @@ def train(
     print(f"\nTraining complete. {step + 1} steps, {total_training_time:.1f}s training time.")
 
     # Final checkpoint
-    save_checkpoint(model, optimizer, step, ckpt_path / "final.pt")
+    save_checkpoint(base_model, optimizer, step, ckpt_path / "final.pt")
 
     # Final push to hub
     if push_to_hub:
-        _push_to_hub(model, step, ckpt_path, hf_repo, hf_token, is_final=True)
+        _push_to_hub(base_model, step, ckpt_path, hf_repo, hf_token, is_final=True)
 
     if log_to_wandb:
         import wandb
