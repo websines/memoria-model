@@ -1,26 +1,20 @@
 # Training Log
 
-## Run 1 — March 28, 2026, ~4:03 AM UTC
+## Run 2 — March 28, 2026, ~5:46 AM UTC
 
-**Config:** small (324M params: 318M transformer + 5.8M interface)
-**Hardware:** 2x RTX 3090 (WSL2), single GPU training
-**Command:** `python -m memoria train --config small --max-steps 5000`
+**Config:** small (327M params: 318M transformer + 8.6M interface)
+**Hardware:** 2x RTX 3090 (WSL2), DDP multi-GPU
+**Command:** `torchrun --nproc_per_node=2 -m memoria train --config small --max-steps 5000`
 **wandb:** https://wandb.ai/subh03/memoria_prototype
-**Run:** `faithful-plasma-4` (axn7ojv0)
-
-**Setup issues resolved:**
-- `memoria.data` module not tracked in git (empty `__init__.py` skipped by git) → fixed
-- CUDA not available in WSL2 ("GPU access blocked by operating system") → fixed with `wsl --shutdown` restart
-- The Stack v2 gated dataset → got HF approval
-- FineWeb-Edu timeout → increased `HF_HUB_DOWNLOAD_TIMEOUT=360`
-- PyTorch cu128 needed `--no-cache` to avoid cached CPU wheel
+**Run:** `generous-blaze-12` (dfa6k1zo)
 
 **Model:**
 ```
 Transformer: 318.3M params (151K Qwen3 vocab = ~117M in embeddings)
-Interfaces:  5.8M params (3 layers at positions [3, 7, 11])
-Total trainable: 324.1M params
+Interfaces:  8.6M params (3 layers at positions [3, 7, 11])
+Total trainable: 326.9M params
 CognitiveState: 0/4096 beliefs, 0/16384 edges, 0/64 goals, β=1.000
+DDP: 2 GPUs, state on rank 0
 ```
 
 **Training plan:**
@@ -29,21 +23,48 @@ Phase 1 (α=0): steps 0-2000 — language foundation, L_token only
 Phase 2 (α ramps): steps 2000-3000 — cognitive awakening, L_fe introduced
 Phase 3 (α=0.1): steps 3000+ — full training
 grad_accum=32, batch_size=8, seq_len=2048
-Data: FineWeb-Edu 10BT (70%) + Stack v2 dedup (20%) + synthetic (10%)
+Data: FineWeb-Edu 10BT (70%) + starcoderdata (20%) + synthetic (10%)
 ```
 
-**Status:** RUNNING — Step 0 completed successfully. Training in progress.
+**Status:** RUNNING — DDP initialized, micro-batches processing.
 
-**Start time:** ~4:05 AM UTC, March 28, 2026
-**Estimated total time:** ~125 hours (~5 days) on single 3090
-**Estimated completion:** ~April 2, 2026
+**Start time:** ~5:46 AM UTC, March 28, 2026
+**Estimated total time:** ~70 hours (~3 days) on 2x 3090 with DDP
+**Estimated completion:** ~March 31, 2026
+
+**Changes since Run 1:**
+- DDP multi-GPU support: each GPU processes different micro-batches, ~1.7-1.8x speedup
+- Gated writes: learned sigmoid gate (init ~12% open) prevents state flooding with noise
+- Write-read feedback: utility head gives gradient signal for "are stored beliefs useful?"
+- Recency tracking: beliefs track access count + last accessed step, used in eviction
+- Causal edge learning: temporal surprise precedence → directed edges (distinct from Hebbian)
+- Bug fixes: 14 bugs fixed including inverted telos threshold, double-scaled loss logging,
+  edge_src/edge_tgt device placement, BPB formula, duplicate edges after merge, and more
+- `.gitignore` fixed: `memoria/data/` source code no longer ignored
 
 **Issues resolved during launch:**
-- `memoria.data` module not in git → fixed (empty `__init__.py` wasn't tracked)
-- CUDA not available in WSL2 → fixed (`wsl --shutdown` restart)
-- Stack v2 gated → got HF approval, but still timing out → switched to starcoderdata (ungated)
-- FineWeb first shard download slow → added prefetch with progress message
-- DataParallel crash (`compute_loss` not on DP wrapper) → reverted to single GPU for v1
+- DDP `compute_loss` not accessible on wrapper → split into `forward()` (DDP) + `compute_loss_from_forward()` (base)
+
+---
+
+## Run 1 — March 28, 2026, ~4:03 AM UTC (superseded by Run 2)
+
+**Config:** small (324M params: 318M transformer + 5.8M interface)
+**Hardware:** 2x RTX 3090 (WSL2), single GPU training
+**Command:** `python -m memoria train --config small --max-steps 5000`
+**wandb:** https://wandb.ai/subh03/memoria_prototype
+**Run:** `faithful-plasma-4` (axn7ojv0)
+
+**Status:** SUPERSEDED — replaced by Run 2 after bug fixes and DDP support.
+
+**Setup issues resolved:**
+- `memoria.data` module not tracked in git (empty `__init__.py` skipped by git) → fixed
+- CUDA not available in WSL2 ("GPU access blocked by operating system") → fixed with `wsl --shutdown` restart
+- The Stack v2 gated dataset → got HF approval
+- FineWeb-Edu timeout → increased `HF_HUB_DOWNLOAD_TIMEOUT=360`
+- PyTorch cu128 needed `--no-cache` to avoid cached CPU wheel
+- Stack v2 still timing out → switched to starcoderdata (ungated)
+- DataParallel crash → reverted to single GPU for v1
 - `save_checkpoint` / `_push_to_hub` had `base_model` NameError → fixed scope
 
 ---
@@ -108,7 +129,7 @@ Data: FineWeb-Edu 10BT (70%) + Stack v2 dedup (20%) + synthetic (10%)
 ## Monitoring
 
 **wandb:** https://wandb.ai/subh03/memoria_prototype
-**Run:** breezy-field-9 (ybqh2qb1)
+**Run:** generous-blaze-12 (dfa6k1zo)
 
 Key wandb panels to watch:
 - `loss` — overall training loss (should decrease smoothly)
@@ -117,9 +138,10 @@ Key wandb panels to watch:
 - `alpha` — should be 0 for steps 0-2000, ramp to 0.1 by step 3000
 - `beta` — should drop below 1.0 in Phase 2+
 - `active_beliefs` — should grow in Phase 2+
-- `active_edges` — should grow in Phase 2+
+- `active_edges` — should grow in Phase 2+ (Hebbian + causal)
+- `causal_edges_created` — directed edges from temporal surprise (new in Run 2)
 - `active_goals` — may appear in Phase 3
-- `dt_ms` — time per step (should be ~90-120s)
+- `dt_ms` — time per step (expect ~55-70s with 2x 3090 DDP, was ~90-120s single GPU)
 
 ---
 

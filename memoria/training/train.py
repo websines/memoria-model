@@ -33,7 +33,7 @@ from .optimizer import setup_optimizer
 from .schedule import get_lr_multiplier, get_alpha
 from .distributed import (
     setup_distributed, cleanup_distributed, wrap_ddp,
-    broadcast_state, gather_candidates, setup_device, get_batch_to_device,
+    broadcast_state, gather_candidates, sync_ranks, setup_device, get_batch_to_device,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
 
@@ -260,6 +260,9 @@ def train(
                 'beta': 1.0, 'active_beliefs': 0, 'active_edges': 0,
                 'active_goals': 0, 'total_surprise': 0.0,
             }
+
+        # Sync ranks after Pass 2 (rank 0 does extra work, rank 1 must wait)
+        sync_ranks(world_size)
 
         # Timing
         t1 = time.time()

@@ -10,6 +10,8 @@ Single-GPU mode: all DDP ops become no-ops, no overhead.
 """
 
 import os
+from datetime import timedelta
+
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -28,7 +30,7 @@ def setup_distributed() -> tuple[int, int, torch.device]:
         world_size = int(os.environ['WORLD_SIZE'])
         local_rank = int(os.environ['LOCAL_RANK'])
 
-        dist.init_process_group(backend='nccl')
+        dist.init_process_group(backend='nccl', timeout=timedelta(minutes=30))
         torch.cuda.set_device(local_rank)
         device = torch.device(f'cuda:{local_rank}')
 
@@ -95,6 +97,12 @@ def broadcast_state(state, rank: int, world_size: int):
     dist.broadcast(state.belief_access_count, src=0)
     dist.broadcast(state.belief_prev_surprise, src=0)
     dist.broadcast(state.edge_causal_obs, src=0)
+
+
+def sync_ranks(world_size: int):
+    """Barrier to synchronize all ranks. No-op for single GPU."""
+    if world_size > 1:
+        dist.barrier()
 
 
 def gather_candidates(packed_candidates: torch.Tensor, rank: int, world_size: int, belief_dim: int) -> torch.Tensor:
