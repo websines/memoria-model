@@ -200,6 +200,57 @@ class MemoriaModel(nn.Module):
 
         return result
 
+    def compute_loss_from_forward(
+        self,
+        fwd: dict,
+        idx: Tensor,
+        targets: Tensor,
+        alpha: float = 0.0,
+    ) -> dict:
+        """Compute loss from pre-computed forward pass results.
+
+        Use this with DDP: call model(idx, targets) through the DDP wrapper
+        for gradient sync, then pass the result here for loss computation.
+
+        Args:
+            fwd: dict from forward()
+            idx: [B, T] token indices (for device)
+            targets: [B, T] target indices
+            alpha: weight for L_fe
+        """
+        loss_token = fwd['loss_token']
+        result = {
+            'loss_token': loss_token,
+            'candidates': fwd['candidates'],
+            'logits': fwd['logits'],
+        }
+
+        loss_utility = torch.tensor(0.0, device=idx.device)
+        if alpha > 0 and fwd['utility_logits']:
+            lm_head = self.transformer.lm_head
+            for util_hidden in fwd['utility_logits']:
+                util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
+                loss_utility = loss_utility + F.cross_entropy(
+                    util_logits.view(-1, util_logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                )
+            loss_utility = loss_utility / len(fwd['utility_logits'])
+        result['loss_utility'] = loss_utility
+
+        if alpha > 0:
+            fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
+            loss_fe = fe_stats['free_energy']
+            result['loss_fe'] = loss_fe
+            result['free_energy_stats'] = fe_stats
+            result['loss'] = loss_token + alpha * loss_fe + alpha * 0.1 * loss_utility
+        else:
+            result['loss_fe'] = torch.tensor(0.0, device=idx.device)
+            result['free_energy_stats'] = {}
+            result['loss'] = loss_token
+
+        return result
+
     def detach_state(self):
         """Detach cognitive state from computation graph.
 

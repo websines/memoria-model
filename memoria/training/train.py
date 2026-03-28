@@ -208,9 +208,10 @@ def train(
             input_ids = batch['input_ids'].unsqueeze(0).to(device)  # [1, T]
             labels = batch['labels'].unsqueeze(0).to(device)
 
-            # Forward + loss
+            # Forward through DDP wrapper (syncs gradients), loss on base model
             with autocast_ctx:
-                result = model.compute_loss(input_ids, labels, alpha=alpha)
+                fwd = model(input_ids, targets=labels)  # DDP-wrapped forward()
+                result = base_model.compute_loss_from_forward(fwd, input_ids, labels, alpha=alpha)
 
             loss = result['loss'] / grad_accum
             loss.backward()
