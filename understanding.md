@@ -686,6 +686,66 @@ Paper: "Hierarchical Reasoning Model" (arxiv.org/abs/2506.21734). 27M params, tw
 - Learned graph reasoning (HRM-style) where training discovers the traversal pattern
 - Both coexist: engineered ops handle known algorithms, learned recurrence handles novel reasoning
 
+## Build progress (March 28, 2026)
+
+### Phase 1: Core — COMPLETE
+- `memoria/core/polar.py` — polar representation (to_polar, to_cartesian, angular_distance, precision_weighted_average)
+- `memoria/core/state.py` — CognitiveState with all 4 regions, dynamic allocation, kernel rules, checkpoint/restore
+- `memoria/core/free_energy.py` — L_fe: compute_energy (relation agreement), compute_entropy (belief uncertainty), compute_telos_energy (goal drive), compute_free_energy (full Bethe), β computation
+- `tests/test_polar.py` — 9 tests covering roundtrip, distance, similarity, weighted average, active detection
+- `tests/test_state.py` — 12 tests covering allocation, deallocation, kernel rules, edges, checkpointing
+- `tests/test_free_energy.py` — 7 tests covering agreement/disagreement energy, precision amplification, entropy, β, gradient flow
+- `REFERENCES.md` — every module mapped to specific repos/papers to reference
+
+### Phase 2: Interface — COMPLETE
+- `memoria/interface/read_path.py` — Hopfield-style content-addressable lookup (softmax attention over beliefs). Multi-head. Top-k sparse retrieval. Goal modulation via attention bias. Zero-init output projection (residual friendly).
+- `memoria/interface/write_path.py` — Hidden→belief projection + learned precision estimator (Softplus head). Cosine matching against existing beliefs (adaptive threshold from meta). Buffers WriteCandidates for pass 2 (doesn't modify state in forward pass).
+- `memoria/interface/layer.py` — StateInterfaceLayer combining read + write. Pre-norm, residual connection on read, returns candidates for pass 2.
+- `tests/test_interface.py` — 8 tests: empty state graceful degradation, belief retrieval, goal modulation effect, write matching, precision estimation, gradient flow, shape invariance
+
+### Phase 3: Transformer Integration — COMPLETE
+- `memoria/model/config.py` — MemoriaConfig with presets: small (125M), medium (300M), large (500M). Training config with KL annealing schedule, Muon/AdamW params.
+- `memoria/model/transformer.py` — GPT backbone ported from autoresearch: RoPE, QK-Norm, ReLU², per-layer residual scalars, logit softcapping. Exposes forward_blocks() for interleaving.
+- `memoria/model/memoria_model.py` — Full model: transformer blocks interleaved with StateInterfaceLayers at configurable positions. compute_loss() does L_token + α·L_fe. detach_state() for sequence boundaries.
+- `tests/test_model.py` — 10 tests: instantiation, forward pass, L_token loss, L_token+L_fe loss, backward gradients, interface positions, state detach, empty state degradation, parameter counting, candidate production
+
+### Phase 4: Pass 2 (Cognition) — COMPLETE
+- `memoria/cognition/surprise.py` — precision-weighted surprise from Memoria's formula: surprise = pred_error × obs_precision. Kalman-like gain. Reconsolidation trigger.
+- `memoria/cognition/belief_update.py` — incremental (angle shift by gain) vs. reconsolidation (full rewrite). Radius adjusts: consistent updates increase precision, contradictions decrease it. Eviction of weakest belief when full.
+- `memoria/cognition/hebbian.py` — saturating Hebb rule: w += η(1-w). Co-activation creates edges, inactive edges decay and prune below 0.01. From Ba & Hinton Fast Weights.
+- `memoria/cognition/telos.py` — full lifecycle: intrinsic generation from surprise hotspots (gated by β), progress tracking (relevance × surprise), stall detection (urgency-scaled thresholds), deadline enforcement. Status machine: empty→proposed→active→stalled→completed/failed.
+- `memoria/cognition/consolidation.py` — soft merge (cosine_sim > 0.95, precision-weighted average, combined radius = sqrt(r²+r²)). Periodic hard cleanup (remove below threshold). Edge redirection on merge.
+- `memoria/cognition/meta_learning.py` — β = H/(|E|+H+ε) computed from state. SPSA tuning of reconsolidation_threshold and match_threshold. Sequence boundary decay (×0.95 on radii).
+- `memoria/cognition/causal.py` — d-separation via BFS with blocking. Interventions: clamp belief, zero incoming edges, propagate outward. Returns simulated downstream beliefs.
+- `memoria/cognition/pass2.py` — orchestrator: surprise → belief update → Hebbian → goal progress → intrinsic goals → stall detection → meta → consolidation. Full stats returned.
+- `memoria/core/kernel_rules.py` — mark immutable, verify integrity against snapshots.
+- `tests/test_pass2.py` — 10 tests: empty, new beliefs, update, reconsolidation, Hebbian, intrinsic goals, goal progress, consolidation, kernel rules, full cycle.
+
+### Phase 5: Data + Training — COMPLETE
+- `memoria/data/tokenizer.py` — GPT-2 tokenizer setup
+- `memoria/data/streaming.py` — HuggingFace streaming for FineWeb-Edu (10BT) + Stack v2 dedup. Document packing, no disk footprint.
+- `memoria/data/synthetic.py` — 4 task generators: belief tracking, contradiction handling, causal chains, precision calibration. ~2500 sequences per generation.
+- `memoria/data/interleave.py` — weighted mixing (70/20/10), random source selection, auto-restart on exhaustion
+- `memoria/training/optimizer.py` — AdamW with per-group LRs (embedding, unembedding, scalar, matrix, interface). Muon TODO.
+- `memoria/training/schedule.py` — LR: warmup→constant→cosine warmdown. α: KL annealing (0→α_max over phase 1→2→3).
+- `memoria/training/distributed.py` — device setup, DataParallel placeholder for 2x 3090
+- `memoria/training/train.py` — full training loop: 3-phase (language→cognitive awakening→full), gradient accumulation, pass 2 after each step, wandb logging, checkpointing (model + cognitive state + optimizer)
+- `scripts/train_small.sh` — quick train script
+
+### Phase 6: Evaluation — COMPLETE
+- `memoria/eval/perplexity.py` — standard LM perplexity on held-out FineWeb (must not degrade)
+- `memoria/eval/belief_tracking.py` — fact tracking + contradiction resolution accuracy
+- `memoria/eval/hallucination.py` — calibrated refusal: known vs unknown confidence separation, β comparison
+- `memoria/eval/causal.py` — d-separation accuracy + intervention propagation on relation graph
+- `memoria/eval/telos_demo.py` — intrinsic goal generation from surprising stream (3-phase: consistent→contradictory→novel domain)
+- `memoria/eval/improvement.py` — THE hero figure: accuracy vs interactions curve. Should rise for our model, flat for baseline.
+- `memoria/eval/crossover.py` — small+experience vs large+fresh comparison. Finds crossover point.
+- `scripts/eval_all.sh` — run all evals on a checkpoint
+
+### ALL PHASES COMPLETE.
+
+---
+
 ## 10 design problems solved (March 28, 2026 — late session)
 
 All solutions written into architecture.md. Summary:
