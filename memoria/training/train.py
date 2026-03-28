@@ -17,6 +17,7 @@ Reference: modded-nanogpt (training speed tricks)
 
 import gc
 import math
+import os
 import time
 import torch
 import torch.nn.functional as F
@@ -33,12 +34,23 @@ from .schedule import get_lr_multiplier, get_alpha
 from .distributed import setup_device, get_batch_to_device
 
 
+def _load_env():
+    """Load .env file if it exists."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
+
 def train(
     config: MemoriaConfig,
     max_steps: int = 10000,
     time_budget: float | None = None,
     checkpoint_dir: str = "checkpoints",
-    log_to_wandb: bool = False,
+    log_to_wandb: bool = True,
+    push_to_hub: bool = True,
+    hub_push_every: int = 2000,
     resume_from: str | None = None,
 ):
     """Main training entry point.
@@ -51,17 +63,29 @@ def train(
         log_to_wandb: whether to log to wandb
         resume_from: checkpoint path to resume from
     """
+    _load_env()
     device = setup_device()
     tc = config.training
 
-    # Logging
+    # Weights & Biases
     if log_to_wandb:
         import wandb
-        wandb.init(project="memoria", config={
-            'transformer': config.transformer.__dict__,
-            'state': config.state.__dict__,
-            'training': tc.__dict__,
-        })
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "memoria"),
+            config={
+                'transformer': config.transformer.__dict__,
+                'state': config.state.__dict__,
+                'training': tc.__dict__,
+            },
+            save_code=True,
+        )
+
+    # HuggingFace Hub
+    hf_repo = os.environ.get("HF_REPO", None)
+    hf_token = os.environ.get("HF_TOKEN", None)
+    if push_to_hub and (not hf_repo or not hf_token):
+        print("WARNING: push_to_hub=True but HF_REPO or HF_TOKEN not set. Disabling hub push.")
+        push_to_hub = False
 
     # Tokenizer
     tokenizer = get_tokenizer(vocab_size=config.transformer.vocab_size)
@@ -236,6 +260,10 @@ def train(
         if step > 0 and step % tc.checkpoint_interval == 0:
             save_checkpoint(model, optimizer, step, ckpt_path / f"step_{step}.pt")
 
+        # Push to HuggingFace Hub
+        if push_to_hub and step > 0 and step % hub_push_every == 0:
+            _push_to_hub(model, step, ckpt_path, hf_repo, hf_token)
+
         # Time budget
         if time_budget and total_training_time >= time_budget:
             print(f"\nTime budget reached ({time_budget}s) at step {step}")
@@ -250,6 +278,14 @@ def train(
     # Final checkpoint
     save_checkpoint(model, optimizer, step, ckpt_path / "final.pt")
 
+    # Final push to hub
+    if push_to_hub:
+        _push_to_hub(model, step, ckpt_path, hf_repo, hf_token, is_final=True)
+
+    if log_to_wandb:
+        import wandb
+        wandb.finish()
+
     return model
 
 
@@ -262,3 +298,48 @@ def save_checkpoint(model, optimizer, step: int, path: Path):
         'optimizer_state': optimizer.state_dict(),
     }, path)
     print(f"\n  Checkpoint saved: {path}")
+
+
+def _push_to_hub(model, step: int, ckpt_path: Path, repo_id: str, token: str, is_final: bool = False):
+    """Push checkpoint to HuggingFace Hub."""
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+
+        # Upload the latest checkpoint
+        tag = "final" if is_final else f"step-{step}"
+        ckpt_file = ckpt_path / ("final.pt" if is_final else f"step_{step}.pt")
+
+        if ckpt_file.exists():
+            api.upload_file(
+                path_or_fileobj=str(ckpt_file),
+                path_in_repo=f"checkpoints/{ckpt_file.name}",
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=f"Checkpoint at step {step}",
+            )
+            print(f"\n  Pushed to hub: {repo_id}/checkpoints/{ckpt_file.name}")
+
+        # Also upload training state summary
+        summary = {
+            'step': step,
+            'active_beliefs': model.state.num_active_beliefs(),
+            'active_edges': model.state.num_active_edges(),
+            'active_goals': model.state.num_active_goals(),
+            'beta': model.state.beta,
+        }
+        import json, tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(summary, f, indent=2)
+            f.flush()
+            api.upload_file(
+                path_or_fileobj=f.name,
+                path_in_repo=f"checkpoints/{tag}_summary.json",
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=f"Training summary at step {step}",
+            )
+        os.unlink(f.name)
+
+    except Exception as e:
+        print(f"\n  WARNING: Hub push failed: {e}")
