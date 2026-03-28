@@ -156,6 +156,54 @@ def gather_candidates(packed_candidates: torch.Tensor, rank: int, world_size: in
         return torch.zeros(0, cols, device=packed_candidates.device)
 
 
+def gather_read_indices(read_indices: list[int], rank: int, world_size: int, device: torch.device) -> list[int]:
+    """Gather read belief indices from all ranks to rank 0.
+
+    Each rank captures which beliefs its local read path retrieved.
+    For correct Hebbian learning, rank 0 needs the union of all retrievals.
+
+    Args:
+        read_indices: local read indices from this rank
+        rank: this process rank
+        world_size: total processes
+        device: this rank's device
+
+    Returns:
+        On rank 0: deduplicated union of all ranks' read indices.
+        On other ranks: empty list.
+    """
+    if world_size <= 1:
+        return read_indices
+
+    # Share counts
+    local_t = torch.tensor(read_indices, dtype=torch.long, device=device)
+    local_count = torch.tensor([len(read_indices)], dtype=torch.long, device=device)
+    all_counts = [torch.zeros(1, dtype=torch.long, device=device) for _ in range(world_size)]
+    dist.all_gather(all_counts, local_count)
+
+    max_count = max(c.item() for c in all_counts)
+    if max_count == 0:
+        return []
+
+    # Pad to max_count
+    padded = torch.full((max_count,), -1, dtype=torch.long, device=device)
+    if len(read_indices) > 0:
+        padded[:len(read_indices)] = local_t
+
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+
+    if rank == 0:
+        all_indices = set()
+        for i, g in enumerate(gathered):
+            n = all_counts[i].item()
+            if n > 0:
+                all_indices.update(g[:n].tolist())
+        return list(all_indices)
+    else:
+        return []
+
+
 def setup_device() -> torch.device:
     """Get the best available device (backward compat for single-GPU)."""
     if torch.cuda.is_available():

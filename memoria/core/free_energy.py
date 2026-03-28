@@ -129,9 +129,12 @@ def compute_telos_energy(state: CognitiveState) -> Tensor:
     Unachieved important goals increase free energy, driving the system toward action.
 
     For each active goal:
-        preference_precision = priority × confidence (approximated by goal embedding radius)
+        importance = priority × goal_radius
         goal_distance = 1.0 - progress
-        E_telos = -log(preference_precision + ε) × goal_distance
+        E_telos = importance × goal_distance
+
+    Energy is always non-negative: important unfinished goals add pressure,
+    completed goals (distance=0) contribute nothing.
 
     Args:
         state: The cognitive state
@@ -147,14 +150,15 @@ def compute_telos_energy(state: CognitiveState) -> Tensor:
     priority = metadata[:, 0]    # [N_goals]
     progress = metadata[:, 2]    # [N_goals]
 
-    # Goal "precision" from embedding radius (confidence in the goal)
+    # Goal importance from priority and embedding radius (confidence in the goal)
     goal_radii = embeddings.norm(dim=-1)  # [N_goals]
-    preference_precision = priority * goal_radii
+    importance = priority * goal_radii
 
     goal_distance = (1.0 - progress).clamp(min=0.0)
 
-    # Only contribute energy for goals with meaningful distance remaining
-    energy_per_goal = -torch.log(preference_precision + EPSILON) * goal_distance
+    # Energy is always positive: unfinished important goals increase free energy,
+    # creating pressure to resolve them. Completed goals contribute nothing.
+    energy_per_goal = importance * goal_distance
 
     return energy_per_goal.sum()
 

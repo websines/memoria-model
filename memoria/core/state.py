@@ -95,13 +95,15 @@ class CognitiveState(nn.Module):
         # [3] = learning_rate_modulation
         # [4] = reconsolidation_threshold (default 0.3)
         # [5] = match_threshold (default 0.7)
-        # [6:] = SPSA-tunable parameters
+        # [6] = goal_dedup_threshold (default 0.5, SPSA-tunable)
+        # [7:] = SPSA-tunable parameters
 
         # Initialize meta defaults
         with torch.no_grad():
             self.meta[0] = 1.0    # β = 1.0 (maximum exploration, no data yet)
             self.meta[4] = 0.3    # reconsolidation threshold
             self.meta[5] = 0.7    # match threshold
+            self.meta[6] = 0.5    # goal dedup threshold (SPSA-tunable)
 
         # ── Recency Tracking ──
         # Track when beliefs were last accessed (read or written) and how often
@@ -258,21 +260,32 @@ class CognitiveState(nn.Module):
     # ── Goal Region Accessors ──
 
     def get_active_goals(self) -> tuple[Tensor, Tensor, Tensor]:
-        """Get active (non-empty) goals.
+        """Get truly active goals (proposed or active status only).
+
+        Excludes completed, failed, and stalled goals so they don't
+        influence retrieval bias, free energy, or duplicate detection.
 
         Returns:
             indices: [N_active_goals]
             embeddings: [N_active_goals, D]
             metadata: [N_active_goals, G]
         """
-        # Status > 0 means allocated (0 = empty)
+        # Only return goals with PROPOSED (0.2) or ACTIVE (0.4) status
         status = self.goal_metadata.data[:, 3]  # status is at index 3
+        mask = (status > 0.1) & (status < 0.5)  # 0.2 (proposed) and 0.4 (active)
+        indices = mask.nonzero(as_tuple=False).squeeze(-1)
+        return indices, self.goal_embeddings.data[indices], self.goal_metadata.data[indices]
+
+    def get_all_allocated_goals(self) -> tuple[Tensor, Tensor, Tensor]:
+        """Get all non-empty goals (any status). For slot management only."""
+        status = self.goal_metadata.data[:, 3]
         mask = status > 0.0
         indices = mask.nonzero(as_tuple=False).squeeze(-1)
         return indices, self.goal_embeddings.data[indices], self.goal_metadata.data[indices]
 
     def num_active_goals(self) -> int:
-        return (self.goal_metadata.data[:, 3] > 0.0).sum().item()
+        status = self.goal_metadata.data[:, 3]
+        return ((status > 0.1) & (status < 0.5)).sum().item()
 
     # ── Meta Accessors ──
 

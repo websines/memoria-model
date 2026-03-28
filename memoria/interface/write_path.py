@@ -162,18 +162,23 @@ class WritePath(nn.Module):
         obs_precision = self.precision_head(hidden)     # [B, T, 1]
         gated_precision = gate * obs_precision           # [B, T, 1]
 
-        # Mean over batch for state updates (state is shared across batch)
-        obs_mean = obs_vectors.mean(dim=0)           # [T, D]
-        prec_mean = gated_precision.mean(dim=0)      # [T, 1]
+        # Process each batch sample independently to avoid cross-sample contamination.
+        # State is shared, but each sample's observations should be matched and
+        # buffered separately so unrelated samples don't get merged.
+        all_candidates = []
+        for b in range(B):
+            obs_b = obs_vectors[b]          # [T, D]
+            prec_b = gated_precision[b]     # [T, 1]
 
-        # Scale observation vectors by gated precision (set radius)
-        obs_angles = F.normalize(obs_mean, dim=-1, eps=EPSILON)  # [T, D]
-        obs_beliefs = obs_angles * prec_mean                      # [T, D] (radius = gated precision)
+            # Scale observation vectors by gated precision (set radius)
+            obs_angles = F.normalize(obs_b, dim=-1, eps=EPSILON)  # [T, D]
+            obs_beliefs = obs_angles * prec_b                      # [T, D] (radius = gated precision)
 
-        # Match against existing beliefs
-        candidates = self._match_and_buffer(obs_beliefs, state, layer_idx)
+            # Match against existing beliefs
+            candidates = self._match_and_buffer(obs_beliefs, state, layer_idx)
+            all_candidates.extend(candidates)
 
-        return candidates
+        return all_candidates
 
     def _match_and_buffer(
         self,

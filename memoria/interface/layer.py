@@ -61,7 +61,7 @@ class StateInterfaceLayer(nn.Module):
         hidden: Tensor,
         state: CognitiveState,
         current_step: int = -1,
-    ) -> tuple[Tensor, list[WriteCandidate], Tensor]:
+    ) -> tuple[Tensor, list[WriteCandidate], Tensor, list[int]]:
         """Forward pass through the state interface.
 
         Args:
@@ -73,6 +73,7 @@ class StateInterfaceLayer(nn.Module):
             hidden: [B, T, hidden_dim] with belief information added
             candidates: list of WriteCandidate for pass 2
             utility_logits: [B, T, hidden_dim] from utility head (for aux loss)
+            read_indices: list of belief indices actually retrieved
         """
         normed = self.norm(hidden)
 
@@ -81,7 +82,7 @@ class StateInterfaceLayer(nn.Module):
         goal_priorities = goal_metadata[:, 0] if len(goal_indices) > 0 else None
 
         # Read: retrieve beliefs, add to residual stream
-        belief_info, utility_logits = self.read_path(
+        belief_info, utility_logits, read_indices = self.read_path(
             normed, state,
             goal_embeddings=goal_embeddings if len(goal_indices) > 0 else None,
             goal_priorities=goal_priorities,
@@ -92,4 +93,4 @@ class StateInterfaceLayer(nn.Module):
         # Write: project hidden states, match against beliefs, buffer candidates
         candidates = self.write_path(normed, state, layer_idx=self.layer_idx)
 
-        return hidden, candidates, utility_logits
+        return hidden, candidates, utility_logits, read_indices

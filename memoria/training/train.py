@@ -36,7 +36,7 @@ from .optimizer import setup_optimizer
 from .schedule import get_lr_multiplier, get_alpha
 from .distributed import (
     setup_distributed, cleanup_distributed, wrap_ddp,
-    broadcast_state, gather_candidates, sync_ranks, setup_device, get_batch_to_device,
+    broadcast_state, gather_candidates, gather_read_indices, sync_ranks, setup_device, get_batch_to_device,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
 
@@ -248,6 +248,7 @@ def train(
 
         # Accumulate gradients
         all_candidates = []
+        all_read_indices = []
         total_loss = 0.0
         total_loss_token = 0.0
         total_loss_fe = 0.0
@@ -274,6 +275,7 @@ def train(
             total_loss_token += result['loss_token'].item() / grad_accum
             total_loss_fe += result['loss_fe'].item() / grad_accum
             all_candidates.extend(result['candidates'])
+            all_read_indices.extend(result.get('read_indices', []))
 
         if step == 0 and is_main:
             print(f"\r  Step 0 complete.{' ' * 30}", flush=True)
@@ -288,18 +290,19 @@ def train(
                 print(f"\nFAIL: loss exploded at step {step}: {total_loss}")
             break
 
-        # Gather candidates from all ranks to rank 0 for Pass 2
+        # Gather candidates and read indices from all ranks to rank 0 for Pass 2
         packed = pack_candidates(all_candidates)
         packed = gather_candidates(packed, rank, world_size, belief_dim)
+        all_read_indices = gather_read_indices(all_read_indices, rank, world_size, device)
 
         # Pass 2: cognitive update on rank 0 only (state is sequential)
         base_model.detach_state()
 
         if is_main:
             gathered_candidates = unpack_candidates(packed, belief_dim)
-            read_indices = list(set(
-                c.matched_slot for c in gathered_candidates if c.matched_slot >= 0
-            ))
+            # Use actual read path retrieval indices for Hebbian learning,
+            # gathered from all ranks (not just rank 0's local retrievals)
+            read_indices = list(set(all_read_indices))
 
             pass2_stats = run_pass2(
                 state=base_model.state,

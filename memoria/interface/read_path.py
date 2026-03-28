@@ -93,7 +93,7 @@ class ReadPath(nn.Module):
         active_mask = state.get_active_mask()
         if not active_mask.any():
             # No beliefs → return zeros (model degrades to pure transformer)
-            return torch.zeros_like(hidden), torch.zeros_like(hidden)
+            return torch.zeros_like(hidden), torch.zeros_like(hidden), []
 
         active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
         active_beliefs = state.beliefs.data[active_indices]  # [N_active, D]
@@ -154,6 +154,8 @@ class ReadPath(nn.Module):
             attended = (mean_attn > 1.0 / max(N_active, 1)).nonzero(as_tuple=False).squeeze(-1)
             if len(attended) > 0:
                 state.touch_beliefs(active_indices[attended], max(current_step, 0))
+            # Collect global indices of actually-retrieved beliefs for Hebbian learning
+            read_belief_indices = active_indices[attended].tolist() if len(attended) > 0 else []
 
         # Retrieve: weighted sum of values
         # values: [N_active, D] → retrieved: [B, T, H_n, D]
@@ -166,7 +168,7 @@ class ReadPath(nn.Module):
         # Utility prediction: can the retrieved beliefs predict the next token?
         utility_logits = self.utility_head(retrieved)  # [B, T, hidden_dim]
 
-        return output, utility_logits
+        return output, utility_logits, read_belief_indices
 
     def _compute_goal_bias(
         self,

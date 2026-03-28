@@ -132,6 +132,7 @@ class MemoriaModel(nn.Module):
 
         all_candidates: list[WriteCandidate] = []
         all_utility_logits: list[Tensor] = []
+        all_read_indices: list[int] = []
         interface_idx = 0
 
         for i, block in enumerate(self.transformer.blocks):
@@ -143,13 +144,15 @@ class MemoriaModel(nn.Module):
 
             # Insert state interface after designated blocks
             if interface_idx < len(self.interfaces) and i == self.interface_positions[interface_idx]:
-                x, candidates, utility_logits = self.interfaces[interface_idx](x, self.state)
+                x, candidates, utility_logits, read_indices = self.interfaces[interface_idx](x, self.state)
                 all_candidates.extend(candidates)
                 all_utility_logits.append(utility_logits)
+                all_read_indices.extend(read_indices)
                 interface_idx += 1
 
         result = {
             'candidates': all_candidates,
+            'read_indices': all_read_indices,
         }
 
         if targets is not None:

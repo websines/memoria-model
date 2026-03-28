@@ -97,6 +97,8 @@ def spsa_step(
         # Clamp to valid ranges
         new_values[0] = new_values[0].clamp(0.1, 0.9)   # reconsolidation_threshold
         new_values[1] = new_values[1].clamp(0.3, 0.95)   # match_threshold
+        if n > 2:
+            new_values[2] = new_values[2].clamp(0.2, 0.9)   # goal_dedup_threshold
 
         state.meta.data[tunable_start:tunable_end] = new_values
 

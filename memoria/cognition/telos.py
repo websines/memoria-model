@@ -103,8 +103,8 @@ def generate_intrinsic_goals(
             # Goal embedding = the belief direction (investigate THIS)
             goal_embed = belief_vec.clone()
 
-            # Dedup: skip if too similar to existing goal
-            if _is_duplicate_goal(state, goal_embed, threshold=0.85):
+            # Dedup: skip if too similar to existing active goal
+            if _is_duplicate_goal(state, goal_embed):
                 continue
 
             # Allocate goal slot
@@ -261,11 +261,19 @@ def enforce_deadlines(state: CognitiveState, current_step: int):
 
 # ── Helpers ──
 
-def _is_duplicate_goal(state: CognitiveState, goal_embed: Tensor, threshold: float = 0.85) -> bool:
-    """Check if a goal is too similar to existing active goals."""
+def _is_duplicate_goal(state: CognitiveState, goal_embed: Tensor) -> bool:
+    """Check if a goal is too similar to existing active goals.
+
+    Only compares against truly active goals (proposed/active), not
+    completed/stalled/failed ones. Threshold is dynamic — stored in
+    meta[6] and tuned by SPSA, so the model learns its own dedup sensitivity.
+    """
     goal_indices, existing_embeds, _ = state.get_active_goals()
     if len(goal_indices) == 0:
         return False
+
+    # Dynamic threshold from meta region (SPSA-tunable, default 0.5)
+    threshold = state.meta.data[6].item() if state.meta.data[6].item() > 0 else 0.5
 
     goal_angle = F.normalize(goal_embed, dim=0, eps=EPSILON)
     existing_angles = F.normalize(existing_embeds, dim=-1, eps=EPSILON)
@@ -277,7 +285,8 @@ def _is_duplicate_goal(state: CognitiveState, goal_embed: Tensor, threshold: flo
 def _allocate_goal_slot(state: CognitiveState) -> int:
     """Find an empty goal slot.
 
-    Returns slot index or -1 if all occupied.
+    Eviction priority: empty > completed/failed > stalled (oldest first).
+    Returns slot index or -1 if all occupied by active/proposed goals.
     """
     for i in range(state.config.max_goals):
         if state.immutable_goals[i]:
@@ -295,5 +304,23 @@ def _allocate_goal_slot(state: CognitiveState) -> int:
             state.goal_metadata.data[i].zero_()
             state.goal_embeddings.data[i].zero_()
             return i
+
+    # Still no slots — evict the oldest stalled goal
+    oldest_stalled = -1
+    oldest_step = float('inf')
+    for i in range(state.config.max_goals):
+        if state.immutable_goals[i]:
+            continue
+        status = state.goal_metadata.data[i, STATUS].item()
+        if abs(status - STATUS_STALLED) < 0.05:
+            created = state.goal_metadata.data[i, CREATED_STEP].item()
+            if created < oldest_step:
+                oldest_step = created
+                oldest_stalled = i
+
+    if oldest_stalled >= 0:
+        state.goal_metadata.data[oldest_stalled].zero_()
+        state.goal_embeddings.data[oldest_stalled].zero_()
+        return oldest_stalled
 
     return -1
