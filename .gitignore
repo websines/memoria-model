@@ -1,6 +1,47 @@
+# Rust (prototype)
 /target
 Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# PyTorch
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+runs/
+wandb/
+
+# Data
+data/
+*.bin
+*.npy
+*.npz
+*.safetensors
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
 *.swp
 *.swo
 .DS_Store
-.env
+.idea/
+.vscode/
+
+# Logs
+*.log
+run.log
+results.tsv
+
+# Prototype Memoria code (reference only, not tracked)
+prototype-research/
