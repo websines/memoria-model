@@ -28,6 +28,32 @@ from ..interface.layer import StateInterfaceLayer
 from ..interface.write_path import WriteCandidate
 
 
+def chunked_cross_entropy(logits: Tensor, targets: Tensor, chunk_size: int = 4096, ignore_index: int = -1) -> Tensor:
+    """Cross-entropy computed in chunks to avoid materializing [B*T, vocab] in memory.
+
+    Standard for large-vocab models (151K vocab × 8K tokens = 9+ GiB in float32).
+    Chunks along the sequence dimension to keep peak memory bounded.
+    """
+    BT, V = logits.shape
+    if BT <= chunk_size:
+        return F.cross_entropy(logits, targets, ignore_index=ignore_index)
+
+    total_loss = 0.0
+    n_tokens = 0
+    for start in range(0, BT, chunk_size):
+        end = min(start + chunk_size, BT)
+        chunk_logits = logits[start:end]
+        chunk_targets = targets[start:end]
+        valid = (chunk_targets != ignore_index).sum().item()
+        if valid > 0:
+            total_loss = total_loss + F.cross_entropy(
+                chunk_logits, chunk_targets, ignore_index=ignore_index, reduction='sum'
+            )
+            n_tokens += valid
+
+    return total_loss / max(n_tokens, 1)
+
+
 class MemoriaModel(nn.Module):
     """Full Memoria architecture: language backbone + cognitive state.
 
@@ -131,10 +157,9 @@ class MemoriaModel(nn.Module):
         }
 
         if targets is not None:
-            result['loss_token'] = F.cross_entropy(
+            result['loss_token'] = chunked_cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
-                ignore_index=-1,
             )
 
         return result
@@ -176,12 +201,10 @@ class MemoriaModel(nn.Module):
         if alpha > 0 and fwd['utility_logits']:
             lm_head = self.transformer.lm_head
             for util_hidden in fwd['utility_logits']:
-                # Project utility hidden through LM head to get token predictions
                 util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
-                loss_utility = loss_utility + F.cross_entropy(
+                loss_utility = loss_utility + chunked_cross_entropy(
                     util_logits.view(-1, util_logits.size(-1)),
                     targets.view(-1),
-                    ignore_index=-1,
                 )
             loss_utility = loss_utility / len(fwd['utility_logits'])
         result['loss_utility'] = loss_utility
@@ -230,10 +253,9 @@ class MemoriaModel(nn.Module):
             lm_head = self.transformer.lm_head
             for util_hidden in fwd['utility_logits']:
                 util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
-                loss_utility = loss_utility + F.cross_entropy(
+                loss_utility = loss_utility + chunked_cross_entropy(
                     util_logits.view(-1, util_logits.size(-1)),
                     targets.view(-1),
-                    ignore_index=-1,
                 )
             loss_utility = loss_utility / len(fwd['utility_logits'])
         result['loss_utility'] = loss_utility

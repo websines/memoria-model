@@ -206,17 +206,22 @@ def train(
     if is_main:
         print(f"Prefetcher ready. Batch size: {tc.device_batch_size}")
 
-    # torch.compile for fused kernels (skip if not available)
+    # torch.compile for fused kernels (skip if not available or if DDP)
+    # Note: torch.compile with DDP requires careful handling; compile the base model
     use_compile = hasattr(torch, 'compile') and torch.cuda.is_available()
     if use_compile:
         try:
-            model = torch.compile(model)
+            if world_size > 1:
+                # With DDP, compile the inner model before wrapping
+                # Since we already wrapped, compile the forward of the base model
+                base_model.transformer = torch.compile(base_model.transformer)
+            else:
+                model = torch.compile(model)
             if is_main:
                 print("torch.compile enabled")
         except Exception as e:
             if is_main:
-                print(f"torch.compile not available: {e}")
-            use_compile = False
+                print(f"torch.compile skipped: {e}")
 
     # DDP no_sync context for gradient accumulation
     has_no_sync = hasattr(model, 'no_sync')
