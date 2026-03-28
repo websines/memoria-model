@@ -156,7 +156,7 @@ class PretrainedMemoriaModel(nn.Module):
         backbone_model = self.backbone.model  # the inner transformer
         lm_head = self.backbone.lm_head
 
-        # Embedding
+        # Embedding (no trainable params before first interface, safe to no_grad)
         with torch.no_grad():
             hidden = backbone_model.embed_tokens(idx)
 
@@ -168,35 +168,48 @@ class PretrainedMemoriaModel(nn.Module):
             if hasattr(backbone_model, 'rotary_emb'):
                 position_embeddings = backbone_model.rotary_emb(hidden, position_ids)
 
+        # First interface position — layers before this can use no_grad
+        first_interface = self.interface_positions[0] if self.interface_positions else self._n_layers
+
         all_candidates: list[WriteCandidate] = []
         all_utility_logits: list[Tensor] = []
         all_read_indices: list[int] = []
         interface_idx = 0
+        # Track if we've passed any interface (gradient chain must be maintained after)
+        grad_active = False
+
+        # Build layer kwargs once
+        layer_kwargs = {'use_cache': False}
+        if position_embeddings is not None:
+            layer_kwargs['position_embeddings'] = position_embeddings
+        layer_kwargs['position_ids'] = position_ids
 
         # Run through transformer layers with interface injection
         for i, layer in enumerate(backbone_model.layers):
-            with torch.no_grad():
-                # Run the frozen transformer layer
-                # Build kwargs based on what the layer expects
-                layer_kwargs = {'use_cache': False}
-                if position_embeddings is not None:
-                    layer_kwargs['position_embeddings'] = position_embeddings
-                layer_kwargs['position_ids'] = position_ids
-
+            if not grad_active and i <= first_interface:
+                # Before first interface: no trainable path yet, save memory
+                with torch.no_grad():
+                    layer_output = layer(hidden, **layer_kwargs)
+                    hidden = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+            else:
+                # After first interface: gradients must flow through frozen layers
+                # to reach interface params. Frozen weights (requires_grad=False) won't
+                # accumulate grads, but the computation graph is preserved for inputs.
                 layer_output = layer(hidden, **layer_kwargs)
-                # Handle both tuple and tensor returns
                 hidden = layer_output[0] if isinstance(layer_output, tuple) else layer_output
 
             # Insert state interface after designated layers
             if interface_idx < len(self.interfaces) and i == self.interface_positions[interface_idx]:
-                # Interface layers ARE trainable — no torch.no_grad here
+                # Cast to float32 for interface layers (backbone outputs bfloat16)
+                hidden_f32 = hidden.float()
+
                 interface_out, candidates, utility_logits, read_indices = self.interfaces[interface_idx](
-                    hidden, self.state
+                    hidden_f32, self.state
                 )
 
                 # Gated residual: read_gate controls how much belief info is injected
                 gate = torch.sigmoid(self.read_gate[interface_idx])
-                hidden = hidden + gate * (interface_out - hidden)
+                hidden = (hidden_f32 + gate * (interface_out - hidden_f32)).to(hidden.dtype)
                 # Note: interface_out = hidden + belief_info (from layer.py),
                 # so (interface_out - hidden) = belief_info. This applies gate to just the belief signal.
 
@@ -204,10 +217,10 @@ class PretrainedMemoriaModel(nn.Module):
                 all_utility_logits.append(utility_logits)
                 all_read_indices.extend(read_indices)
                 interface_idx += 1
+                grad_active = True  # from here on, gradients must flow
 
-        # Final norm
-        with torch.no_grad():
-            hidden = backbone_model.norm(hidden)
+        # Final norm — must preserve grad chain
+        hidden = backbone_model.norm(hidden)
 
         result = {
             'candidates': all_candidates,
