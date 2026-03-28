@@ -94,7 +94,7 @@ def small_config() -> MemoriaConfig:
             max_goals=64, relation_dim=64,
         ),
         training=TrainingConfig(
-            device_batch_size=4,  # 151K vocab → logits are huge. B=4 fits in 24GB.
+            device_batch_size=2,  # 151K vocab → logits gradient is [B*T, 151K]. B=2 fits in 24GB.
         ),
     )
 
