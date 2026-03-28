@@ -94,11 +94,11 @@ def train(
     print("Building model...")
     model = MemoriaModel(config)
     model.init_weights()
-    model, is_parallel = setup_data_parallel(model)
-    base_model = unwrap_model(model, is_parallel)  # unwrapped for state access + pass 2
-    print(base_model.summary())
-    if is_parallel:
-        print(f"  DataParallel across {torch.cuda.device_count()} GPUs")
+    model = model.to(device)
+    base_model = model  # no DataParallel for v1 — candidates are non-tensor, state is shared
+    print(model.summary())
+    if torch.cuda.device_count() > 1:
+        print(f"  Note: {torch.cuda.device_count()} GPUs detected. Using single GPU for v1 (DataParallel needs non-tensor output handling).")
 
     # Optimizer (always on the base model, not the DataParallel wrapper)
     optimizer = setup_optimizer(base_model, config)
