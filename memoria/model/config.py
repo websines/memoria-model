@@ -76,6 +76,10 @@ class MemoriaConfig:
     state: StateConfig = field(default_factory=StateConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
+    # Backbone mode: "scratch" trains transformer from scratch, "pretrained" bolts onto HF model
+    backbone: str = "scratch"
+    pretrained_model: str = ""  # HuggingFace model name (only used when backbone="pretrained")
+
 
 # ── Preset Configurations ──
 
@@ -135,5 +139,49 @@ def large_config() -> MemoriaConfig:
         training=TrainingConfig(
             device_batch_size=2,  # large model on B200 can use bigger batch
             alpha_max=0.1,
+        ),
+    )
+
+
+def qwen_config() -> MemoriaConfig:
+    """Qwen3.5-2B-Base with cognitive state bolted on.
+
+    Backbone is frozen. Only interface layers (~25M params) are trained.
+    Qwen3.5-2B: 24 layers, 2048 hidden, 8 heads, 2 KV heads, 248320 vocab.
+    Hybrid architecture: linear_attention + full_attention (every 4th layer).
+    Interface layers inserted after layers 5, 11, 17, 23 (every 6 layers).
+
+    Much faster training: only adapters + pass 2. Should work on a single 24GB GPU
+    with small batch since the backbone runs in eval mode with no grad.
+    """
+    return MemoriaConfig(
+        backbone="pretrained",
+        pretrained_model="Qwen/Qwen3.5-2B-Base",
+        transformer=TransformerConfig(
+            # These must match Qwen3.5-2B architecture for interface layer dims
+            vocab_size=248320,
+            sequence_len=2048,
+            n_layer=24,
+            n_head=8,
+            n_kv_head=2,
+            n_embd=2048,
+            interface_every=6,  # 4 interface layers at positions 5, 11, 17, 23
+            interface_num_heads=4,
+            interface_top_k=64,  # more beliefs since the model is more capable
+        ),
+        state=StateConfig(
+            belief_dim=512,  # larger to match richer representations from 2B model
+            max_beliefs=8192,
+            max_edges=32768,
+            max_goals=64,
+            relation_dim=64,
+        ),
+        training=TrainingConfig(
+            device_batch_size=2,  # conservative: frozen 2B + interface grads
+            interface_lr=0.001,  # lower LR for adapters on pretrained backbone
+            phase1_steps=500,    # shorter phase 1: backbone already knows language
+            alpha_warmup_steps=500,
+            alpha_max=0.1,
+            fe_temperature=5.0,
         ),
     )

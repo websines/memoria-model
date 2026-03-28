@@ -28,6 +28,7 @@ from pathlib import Path
 
 from ..model.config import MemoriaConfig
 from ..model.memoria_model import MemoriaModel
+from ..model.pretrained_model import PretrainedMemoriaModel
 from ..cognition.pass2 import run_pass2
 from ..data.tokenizer import get_tokenizer
 from ..data.interleave import interleaved_stream
@@ -139,9 +140,14 @@ def train(
     # Model
     if is_main:
         print("Building model...")
-    model = MemoriaModel(config)
-    model.init_weights()
-    model, base_model = wrap_ddp(model, device, rank, world_size)
+    if config.backbone == "pretrained":
+        model = PretrainedMemoriaModel(config)
+        model.init_weights()
+        model, base_model = wrap_ddp(model, device, rank, world_size)
+    else:
+        model = MemoriaModel(config)
+        model.init_weights()
+        model, base_model = wrap_ddp(model, device, rank, world_size)
     if is_main:
         print(base_model.summary())
         if world_size > 1:

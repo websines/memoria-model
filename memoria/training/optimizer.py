@@ -13,16 +13,22 @@ from ..model.config import MemoriaConfig
 
 
 def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Optimizer:
-    """Set up Muon + AdamW optimizer with per-group learning rates.
+    """Set up optimizer with per-group learning rates.
 
-    - Matrix params in transformer blocks → Muon (orthogonalized SGD)
+    Scratch mode (MemoriaModel):
+    - Matrix params in transformer blocks → AdamW (TODO: Muon)
     - Embedding / unembedding → AdamW
     - Scalar params (lambdas) → AdamW with higher LR
     - State interface params → AdamW
     - Cognitive state params → NOT optimized (updated by pass 2)
 
+    Pretrained mode (PretrainedMemoriaModel):
+    - Backbone → frozen (not in optimizer at all)
+    - State interface params + read gates → AdamW
+    - Cognitive state params → NOT optimized (updated by pass 2)
+
     Args:
-        model: MemoriaModel instance
+        model: MemoriaModel or PretrainedMemoriaModel instance
         config: full configuration
 
     Returns:
@@ -31,7 +37,10 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     tc = config.training
     betas = tc.adam_betas
 
-    # Collect parameter groups
+    if config.backbone == "pretrained":
+        return _setup_pretrained_optimizer(model, config)
+
+    # ── Scratch mode ──
     param_groups = []
 
     # 1. Transformer embedding
@@ -99,6 +108,35 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     optimizer = torch.optim.AdamW(param_groups)
 
     # Store initial LRs for scheduling
+    for group in optimizer.param_groups:
+        group['initial_lr'] = group['lr']
+
+    return optimizer
+
+
+def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Optimizer:
+    """Optimizer for pretrained mode: only interface layers + read gates are trained."""
+    tc = config.training
+    betas = tc.adam_betas
+
+    param_groups = [
+        {
+            'params': list(model.interfaces.parameters()),
+            'lr': tc.interface_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        },
+        {
+            'params': [model.read_gate],
+            'lr': tc.interface_lr * 10,  # gates learn faster
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        },
+    ]
+
+    optimizer = torch.optim.AdamW(param_groups)
     for group in optimizer.param_groups:
         group['initial_lr'] = group['lr']
 

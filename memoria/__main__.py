@@ -10,7 +10,7 @@ def main():
 
     # Train
     train_parser = subparsers.add_parser("train", help="Train a Memoria model")
-    train_parser.add_argument("--config", choices=["small", "medium", "large"], default="small")
+    train_parser.add_argument("--config", choices=["small", "medium", "large", "qwen"], default="small")
     train_parser.add_argument("--max-steps", type=int, default=5000)
     train_parser.add_argument("--time-budget", type=float, default=None, help="Max training time in seconds")
     train_parser.add_argument("--checkpoint-dir", default="checkpoints")
@@ -23,21 +23,21 @@ def main():
 
     # Info
     info_parser = subparsers.add_parser("info", help="Show model info for a config")
-    info_parser.add_argument("--config", choices=["small", "medium", "large"], default="small")
+    info_parser.add_argument("--config", choices=["small", "medium", "large", "qwen"], default="small")
 
     # Eval
     eval_parser = subparsers.add_parser("eval", help="Run evaluation")
     eval_parser.add_argument("checkpoint", help="Path to checkpoint")
-    eval_parser.add_argument("--config", choices=["small", "medium", "large"], default="small")
+    eval_parser.add_argument("--config", choices=["small", "medium", "large", "qwen"], default="small")
     eval_parser.add_argument("--suite", choices=["all", "perplexity", "belief", "causal", "telos", "improvement", "crossover"], default="all")
 
     args = parser.parse_args()
 
     if args.command == "train":
-        from .model.config import small_config, medium_config, large_config
+        from .model.config import small_config, medium_config, large_config, qwen_config
         from .training.train import train
 
-        configs = {"small": small_config, "medium": medium_config, "large": large_config}
+        configs = {"small": small_config, "medium": medium_config, "large": large_config, "qwen": qwen_config}
         config = configs[args.config]()
 
         print(f"Training with {args.config} config, max_steps={args.max_steps}")
@@ -52,12 +52,16 @@ def main():
         )
 
     elif args.command == "info":
-        from .model.config import small_config, medium_config, large_config
+        from .model.config import small_config, medium_config, large_config, qwen_config
         from .model.memoria_model import MemoriaModel
+        from .model.pretrained_model import PretrainedMemoriaModel
 
-        configs = {"small": small_config, "medium": medium_config, "large": large_config}
+        configs = {"small": small_config, "medium": medium_config, "large": large_config, "qwen": qwen_config}
         config = configs[args.config]()
-        model = MemoriaModel(config)
+        if config.backbone == "pretrained":
+            model = PretrainedMemoriaModel(config)
+        else:
+            model = MemoriaModel(config)
         print(model.summary())
 
     elif args.command == "test":
@@ -73,14 +77,18 @@ def main():
 
 def _run_eval(args):
     import torch
-    from .model.config import small_config, medium_config, large_config
+    from .model.config import small_config, medium_config, large_config, qwen_config
     from .model.memoria_model import MemoriaModel
+    from .model.pretrained_model import PretrainedMemoriaModel
 
-    configs = {"small": small_config, "medium": medium_config, "large": large_config}
+    configs = {"small": small_config, "medium": medium_config, "large": large_config, "qwen": qwen_config}
     config = configs[args.config]()
 
     print(f"Loading checkpoint: {args.checkpoint}")
-    model = MemoriaModel(config)
+    if config.backbone == "pretrained":
+        model = PretrainedMemoriaModel(config)
+    else:
+        model = MemoriaModel(config)
     ckpt = torch.load(args.checkpoint, map_location="cuda" if torch.cuda.is_available() else "cpu")
     model.load_state_dict(ckpt['model_state'], strict=False)
     model.state.load_state_cognitive(ckpt['cognitive_state'])
