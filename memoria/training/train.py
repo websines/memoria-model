@@ -213,16 +213,25 @@ def train(
     if is_main:
         print(f"Prefetcher ready. Batch size: {tc.device_batch_size}")
 
-    # torch.compile: disabled by default — state interface uses .item() which
-    # causes graph breaks, adding overhead instead of helping. Enable via env var.
-    if os.environ.get('MEMORIA_COMPILE', '') == '1':
+    # torch.compile: compile only the backbone (not interface layers, which use .item()).
+    # Pretrained mode: auto-enabled (frozen backbone is pure tensor ops, big speedup).
+    # Scratch mode: opt-in via MEMORIA_COMPILE=1.
+    should_compile = (
+        config.backbone == "pretrained"
+        or os.environ.get('MEMORIA_COMPILE', '') == '1'
+    )
+    if should_compile:
         try:
-            if world_size > 1:
+            if config.backbone == "pretrained":
+                # Compile each frozen backbone layer individually for best results
+                for i, layer in enumerate(base_model.backbone.model.layers):
+                    base_model.backbone.model.layers[i] = torch.compile(layer)
+            elif world_size > 1:
                 base_model.transformer = torch.compile(base_model.transformer)
             else:
                 model = torch.compile(model)
             if is_main:
-                print("torch.compile enabled (MEMORIA_COMPILE=1)")
+                print("torch.compile enabled (backbone layers compiled)")
         except Exception as e:
             if is_main:
                 print(f"torch.compile skipped: {e}")
