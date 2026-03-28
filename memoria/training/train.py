@@ -146,6 +146,12 @@ def train(
     print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
     print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
 
+    # Prefetch first batch (this can take a while on first stream access)
+    print("Prefetching first batch (downloading initial data shard)...", flush=True)
+    first_batch = next(data_stream)
+    print(f"First batch ready. input_ids shape: {first_batch['input_ids'].shape}")
+    prefetched = first_batch
+
     # GC management (from autoresearch — prevents Python GC stalls)
     gc.collect()
     gc.freeze()
@@ -167,8 +173,12 @@ def train(
         total_loss_fe = 0.0
 
         for micro_step in range(grad_accum):
-            # Get batch
-            batch = next(data_stream)
+            # Get batch (use prefetched if available)
+            if prefetched is not None:
+                batch = prefetched
+                prefetched = None
+            else:
+                batch = next(data_stream)
             input_ids = batch['input_ids'].unsqueeze(0).to(device)  # [1, T]
             labels = batch['labels'].unsqueeze(0).to(device)
 
