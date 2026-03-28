@@ -29,3 +29,7 @@ include = ["memoria*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:torch_geometric",
+    "ignore::DeprecationWarning:torch.jit",
+]
