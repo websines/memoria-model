@@ -1,9 +1,6 @@
 #!/bin/bash
 # Quick training on single 3090 — small config (~125M params)
-# Expected time: 2-4 hours
+# Expected: 1B tokens ≈ 6 hours on 2x 3090
 
-python -m memoria.training.train \
-    --config configs/small.yaml \
-    --max-steps 5000 \
-    --checkpoint-dir checkpoints/small \
-    --log-to-wandb
+source .venv/bin/activate
+python -m memoria train --config small --max-steps 5000

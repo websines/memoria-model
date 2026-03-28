@@ -24,6 +24,7 @@ from torch import Tensor
 
 from .polar import angular_similarity, belief_is_active, EPSILON
 from .state import CognitiveState
+from .message_passing import FactorGraphMessagePassing, compute_energy_from_messages
 
 
 def compute_energy(state: CognitiveState, temperature: float = 5.0) -> Tensor:
@@ -94,10 +95,13 @@ def compute_energy(state: CognitiveState, temperature: float = 5.0) -> Tensor:
 def compute_entropy(state: CognitiveState) -> Tensor:
     """Compute the entropy term H over all active beliefs.
 
-    H_i = -log(r_i + ε)
+    H_i = 1 / (r_i + 1)
 
     High precision (large radius) → low entropy → confident belief.
-    Low precision (small radius) → high entropy → uncertain belief.
+    Low precision (small radius) → high entropy (approaching 1) → uncertain belief.
+
+    Always positive. Range: (0, 1] per belief.
+    r=0 → H=1 (max uncertainty), r=10 → H≈0.09 (low uncertainty).
 
     Only computed over active beliefs (radius > threshold).
 
@@ -105,7 +109,7 @@ def compute_entropy(state: CognitiveState) -> Tensor:
         state: The cognitive state
 
     Returns:
-        Scalar entropy tensor (differentiable)
+        Scalar entropy tensor (differentiable, always positive)
     """
     radii = state.beliefs.norm(dim=-1)  # [N_beliefs]
     active = belief_is_active(radii)
@@ -114,7 +118,7 @@ def compute_entropy(state: CognitiveState) -> Tensor:
         return torch.tensor(0.0, device=state.beliefs.device)
 
     active_radii = radii[active]
-    entropy_per_belief = -torch.log(active_radii + EPSILON)
+    entropy_per_belief = 1.0 / (active_radii + 1.0)
 
     return entropy_per_belief.sum()
 

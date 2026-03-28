@@ -9,6 +9,7 @@ dependencies = [
     "tokenizers>=0.20",
     "transformers>=4.51",
     "huggingface-hub>=0.25",
+    "torch-geometric>=2.6",
     "wandb",
     "numpy",
     "pyyaml",
@@ -16,9 +17,15 @@ dependencies = [
     "python-dotenv",
 ]
 
+[project.optional-dependencies]
+bp = ["torch-bp @ git+https://github.com/janapavlasek/torch-bp.git"]
+
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["memoria*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

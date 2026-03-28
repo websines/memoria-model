@@ -74,6 +74,14 @@ def test_model_loss_with_fe(model):
 
 def test_backward(model):
     """Gradients flow through the full model."""
+    # Add beliefs so the read path actually does computation
+    for _ in range(5):
+        model.state.allocate_belief(torch.randn(model.config.state.belief_dim))
+    # Set output_proj to non-zero so gradients flow through read path
+    with torch.no_grad():
+        for iface in model.interfaces:
+            iface.read_path.output_proj.weight.normal_(std=0.1)
+
     idx = torch.randint(0, 256, (1, 16))
     targets = torch.randint(0, 256, (1, 16))
     result = model.compute_loss(idx, targets, alpha=0.0)
@@ -81,7 +89,7 @@ def test_backward(model):
 
     # Transformer params should have gradients
     assert model.transformer.wte.weight.grad is not None
-    # Interface params should have gradients
+    # Interface read path should have gradients (beliefs exist, output_proj non-zero)
     for iface in model.interfaces:
         assert iface.read_path.query_proj.weight.grad is not None
 

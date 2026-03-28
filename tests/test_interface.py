@@ -61,8 +61,12 @@ def test_read_retrieves_relevant_beliefs(config, state):
 
 
 def test_read_with_goal_modulation(config, state):
-    """Goal modulation should bias retrieval toward goal-relevant beliefs."""
+    """Goal modulation should change attention weights (even if output_proj is zero-init)."""
     read_path = ReadPath(hidden_dim=128, belief_dim=config.belief_dim, num_heads=1, top_k=16)
+
+    # Manually set output_proj to non-zero so we can see differences
+    with torch.no_grad():
+        read_path.output_proj.weight.normal_(std=0.1)
 
     # Add two beliefs in different directions
     b1 = torch.zeros(config.belief_dim)
