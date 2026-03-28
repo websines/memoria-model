@@ -67,14 +67,17 @@ def spsa_step(
     if tunable_end <= tunable_start:
         return
 
+    device = state.meta.device
+
     with torch.no_grad():
         original_values = state.meta.data[tunable_start:tunable_end].clone()
 
-        # Random perturbation direction (Bernoulli ±1)
+        # Random perturbation direction (Bernoulli ±1) — on correct device
+        n = tunable_end - tunable_start
         delta = torch.where(
-            torch.rand(tunable_end - tunable_start) > 0.5,
-            torch.ones(tunable_end - tunable_start),
-            -torch.ones(tunable_end - tunable_start),
+            torch.rand(n, device=device) > 0.5,
+            torch.ones(n, device=device),
+            -torch.ones(n, device=device),
         ) * perturbation_scale
 
         # Evaluate at +Δ
@@ -101,34 +104,27 @@ def spsa_step(
 def apply_sequence_boundary_decay(state: CognitiveState, decay_factor: float = 0.95):
     """Apply exponential decay to belief precision at sequence boundaries.
 
+    Vectorized: applies decay to all active non-immutable beliefs in one op.
     Beliefs not reinforced fade over ~20 sequences (0.95^20 ≈ 0.36).
-    Immutable beliefs skip decay.
 
     Args:
         state: cognitive state
         decay_factor: multiplicative decay per sequence boundary
     """
     with torch.no_grad():
-        radii = state.get_belief_radii()
         active = state.get_active_mask()
+        mutable = active & ~state.immutable_beliefs
 
-        for i in range(state.config.max_beliefs):
-            if not active[i]:
-                continue
-            if state.immutable_beliefs[i]:
-                continue
+        if mutable.any():
+            # Scale all mutable belief vectors by decay_factor (shrinks radius, preserves angle)
+            state.beliefs.data[mutable] *= decay_factor
 
-            current = state.beliefs.data[i]
-            current_radius = current.norm().item()
-            if current_radius < EPSILON:
-                continue
-
-            new_radius = current_radius * decay_factor
-            if new_radius < EPSILON:
-                state.beliefs.data[i].zero_()
-            else:
-                angle = current / current_radius
-                state.beliefs.data[i] = angle * new_radius
+            # Zero out beliefs that decayed below epsilon
+            decayed_radii = state.beliefs.data[mutable].norm(dim=-1)
+            dead = decayed_radii < EPSILON
+            if dead.any():
+                mutable_indices = mutable.nonzero(as_tuple=False).squeeze(-1)
+                state.beliefs.data[mutable_indices[dead]] = 0.0
 
         # Increment consolidation timer
         state.meta.data[2] += 1.0

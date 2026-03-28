@@ -201,7 +201,8 @@ class ReadPath(nn.Module):
         max_goal_sim = sim.max(dim=-1).values  # [N_active]
 
         # Project through goal gate to get per-head bias
-        # Use max_goal_sim as a scalar bias expanded per head
-        bias = max_goal_sim.unsqueeze(0).expand(self.num_heads, -1)  # [num_heads, N_active]
+        # goal_gate: [D] → [num_heads], applied as a learned scaling per head
+        gate_weights = torch.sigmoid(self.goal_gate(goal_angles.mean(dim=0)))  # [num_heads]
+        bias = gate_weights.unsqueeze(-1) * max_goal_sim.unsqueeze(0)  # [num_heads, N_active]
 
         return bias

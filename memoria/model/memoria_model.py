@@ -160,12 +160,11 @@ class MemoriaModel(nn.Module):
                 targets.view(-1),
             )
 
-            # Utility loss
+            # Utility loss — use self.transformer.head() for consistent norm + softcap
             loss_utility = torch.tensor(0.0, device=idx.device)
             if alpha > 0 and all_utility_logits:
-                lm_head = self.transformer.lm_head
                 for util_hidden in all_utility_logits:
-                    util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
+                    util_logits = self.transformer.head(util_hidden)
                     loss_utility = loss_utility + chunked_cross_entropy(
                         util_logits.view(-1, util_logits.size(-1)),
                         targets.view(-1),

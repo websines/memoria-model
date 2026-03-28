@@ -181,7 +181,8 @@ def train(
     ckpt_path.mkdir(parents=True, exist_ok=True)
 
     # Training state
-    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
     smooth_loss = 0.0
     smooth_loss_token = 0.0
     smooth_loss_fe = 0.0

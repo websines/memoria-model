@@ -122,7 +122,7 @@ def generate_intrinsic_goals(
             state.goal_metadata.data[slot, PRIORITY] = priority
             state.goal_metadata.data[slot, URGENCY] = 0.0
             state.goal_metadata.data[slot, PROGRESS] = 0.0
-            state.goal_metadata.data[slot, STATUS] = STATUS_PROPOSED if beta > 0.5 else STATUS_ACTIVE
+            state.goal_metadata.data[slot, STATUS] = STATUS_ACTIVE
             state.goal_metadata.data[slot, DEPTH] = 3.0  # operational level
             state.goal_metadata.data[slot, SURPRISE_ACCUM] = 0.0
             state.goal_metadata.data[slot, CREATED_STEP] = float(current_step)
@@ -130,8 +130,9 @@ def generate_intrinsic_goals(
 
             generated += 1
 
-        # Reset accumulated surprise after generation
-        state.meta.data[1] = 0.0
+        # Only reset accumulated surprise if we actually generated goals
+        if generated > 0:
+            state.meta.data[1] = 0.0
 
     return generated
 
