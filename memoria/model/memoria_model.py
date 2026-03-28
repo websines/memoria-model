@@ -107,19 +107,20 @@ class MemoriaModel(nn.Module):
         self,
         idx: Tensor,
         targets: Tensor | None = None,
+        alpha: float = 0.0,
     ) -> dict:
-        """Forward pass through transformer + state interfaces.
+        """Forward pass through transformer + state interfaces + loss computation.
+
+        Loss is computed inside forward() so that the large logits tensor
+        [B, T, vocab_size] is never returned through DDP (which would clone it).
 
         Args:
             idx: [B, T] token indices
             targets: [B, T] target indices (optional, for loss computation)
+            alpha: weight for L_fe (0 during phase 1)
 
         Returns:
-            dict with:
-                logits: [B, T, vocab_size]
-                loss_token: scalar (if targets provided)
-                candidates: list of WriteCandidate from all interface layers
-                hidden_final: [B, T, n_embd] final hidden state
+            dict with scalars + candidates (no large tensors to avoid DDP OOM)
         """
         B, T = idx.size()
         cos = self.transformer.cos[:, :T]
@@ -147,20 +148,43 @@ class MemoriaModel(nn.Module):
                 all_utility_logits.append(utility_logits)
                 interface_idx += 1
 
-        logits = self.transformer.head(x)
-
         result = {
-            'logits': logits,
             'candidates': all_candidates,
-            'utility_logits': all_utility_logits,
-            'hidden_final': x,
         }
 
         if targets is not None:
+            # Compute loss_token inside forward — logits never leave this scope
+            logits = self.transformer.head(x)
             result['loss_token'] = chunked_cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
             )
+
+            # Utility loss
+            loss_utility = torch.tensor(0.0, device=idx.device)
+            if alpha > 0 and all_utility_logits:
+                lm_head = self.transformer.lm_head
+                for util_hidden in all_utility_logits:
+                    util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
+                    loss_utility = loss_utility + chunked_cross_entropy(
+                        util_logits.view(-1, util_logits.size(-1)),
+                        targets.view(-1),
+                    )
+                loss_utility = loss_utility / len(all_utility_logits)
+            result['loss_utility'] = loss_utility
+
+            # Free energy loss
+            if alpha > 0:
+                fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
+                result['loss_fe'] = fe_stats['free_energy']
+                result['free_energy_stats'] = fe_stats
+                result['loss'] = result['loss_token'] + alpha * result['loss_fe'] + alpha * 0.1 * loss_utility
+            else:
+                result['loss_fe'] = torch.tensor(0.0, device=idx.device)
+                result['loss'] = result['loss_token']
+        else:
+            logits = self.transformer.head(x)
+            result['logits'] = logits
 
         return result
 
@@ -172,106 +196,9 @@ class MemoriaModel(nn.Module):
     ) -> dict:
         """Compute combined loss: L_token + α * L_fe.
 
-        Args:
-            idx: [B, T] token indices
-            targets: [B, T] target indices
-            alpha: weight for L_fe (0 during phase 1, ramps up in phase 2)
-
-        Returns:
-            dict with:
-                loss: combined scalar loss for backward()
-                loss_token: L_token scalar
-                loss_fe: L_fe scalar (0 if alpha=0)
-                free_energy_stats: dict from compute_free_energy
-                candidates: write candidates for pass 2
-                logits: [B, T, vocab_size]
+        Convenience wrapper around forward() for non-DDP usage and tests.
         """
-        fwd = self.forward(idx, targets)
-
-        loss_token = fwd['loss_token']
-        result = {
-            'loss_token': loss_token,
-            'candidates': fwd['candidates'],
-            'logits': fwd['logits'],
-        }
-
-        # Utility loss: do retrieved beliefs help predict next tokens?
-        # This provides gradient signal to the read/write paths about state quality.
-        loss_utility = torch.tensor(0.0, device=idx.device)
-        if alpha > 0 and fwd['utility_logits']:
-            lm_head = self.transformer.lm_head
-            for util_hidden in fwd['utility_logits']:
-                util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
-                loss_utility = loss_utility + chunked_cross_entropy(
-                    util_logits.view(-1, util_logits.size(-1)),
-                    targets.view(-1),
-                )
-            loss_utility = loss_utility / len(fwd['utility_logits'])
-        result['loss_utility'] = loss_utility
-
-        if alpha > 0:
-            fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
-            loss_fe = fe_stats['free_energy']
-            result['loss_fe'] = loss_fe
-            result['free_energy_stats'] = fe_stats
-            # Utility loss weighted at 0.1× alpha — gentle signal, doesn't dominate
-            result['loss'] = loss_token + alpha * loss_fe + alpha * 0.1 * loss_utility
-        else:
-            result['loss_fe'] = torch.tensor(0.0, device=idx.device)
-            result['free_energy_stats'] = {}
-            result['loss'] = loss_token
-
-        return result
-
-    def compute_loss_from_forward(
-        self,
-        fwd: dict,
-        idx: Tensor,
-        targets: Tensor,
-        alpha: float = 0.0,
-    ) -> dict:
-        """Compute loss from pre-computed forward pass results.
-
-        Use this with DDP: call model(idx, targets) through the DDP wrapper
-        for gradient sync, then pass the result here for loss computation.
-
-        Args:
-            fwd: dict from forward()
-            idx: [B, T] token indices (for device)
-            targets: [B, T] target indices
-            alpha: weight for L_fe
-        """
-        loss_token = fwd['loss_token']
-        result = {
-            'loss_token': loss_token,
-            'candidates': fwd['candidates'],
-            'logits': fwd['logits'],
-        }
-
-        loss_utility = torch.tensor(0.0, device=idx.device)
-        if alpha > 0 and fwd['utility_logits']:
-            lm_head = self.transformer.lm_head
-            for util_hidden in fwd['utility_logits']:
-                util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
-                loss_utility = loss_utility + chunked_cross_entropy(
-                    util_logits.view(-1, util_logits.size(-1)),
-                    targets.view(-1),
-                )
-            loss_utility = loss_utility / len(fwd['utility_logits'])
-        result['loss_utility'] = loss_utility
-
-        if alpha > 0:
-            fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
-            loss_fe = fe_stats['free_energy']
-            result['loss_fe'] = loss_fe
-            result['free_energy_stats'] = fe_stats
-            result['loss'] = loss_token + alpha * loss_fe + alpha * 0.1 * loss_utility
-        else:
-            result['loss_fe'] = torch.tensor(0.0, device=idx.device)
-            result['free_energy_stats'] = {}
-            result['loss'] = loss_token
-
-        return result
+        return self.forward(idx, targets, alpha=alpha)
 
     def detach_state(self):
         """Detach cognitive state from computation graph.

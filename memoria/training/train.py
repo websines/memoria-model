@@ -264,8 +264,7 @@ def train(
 
             with sync_ctx:
                 with autocast_ctx:
-                    fwd = model(input_ids, targets=labels)
-                    result = base_model.compute_loss_from_forward(fwd, input_ids, labels, alpha=alpha)
+                    result = model(input_ids, targets=labels, alpha=alpha)
 
                 loss = result['loss'] / grad_accum
                 loss.backward()
