@@ -101,6 +101,15 @@ class CognitiveState(nn.Module):
             self.meta[4] = 0.3    # reconsolidation threshold
             self.meta[5] = 0.7    # match threshold
 
+        # ── Recency Tracking ──
+        # Track when beliefs were last accessed (read or written) and how often
+        self.register_buffer(
+            'belief_last_accessed', torch.zeros(config.max_beliefs)
+        )
+        self.register_buffer(
+            'belief_access_count', torch.zeros(config.max_beliefs)
+        )
+
         # ── Kernel Rules (immutability masks) ──
         self.register_buffer(
             'immutable_beliefs', torch.zeros(config.max_beliefs, dtype=torch.bool)
@@ -160,12 +169,27 @@ class CognitiveState(nn.Module):
             self.beliefs.data[slot] = belief_vector
         return slot
 
+    def touch_beliefs(self, indices: Tensor, step: int):
+        """Update recency tracking for accessed beliefs.
+
+        Args:
+            indices: [N] long tensor of belief indices that were accessed
+            step: current step number
+        """
+        if len(indices) == 0:
+            return
+        with torch.no_grad():
+            self.belief_last_accessed[indices] = float(step)
+            self.belief_access_count[indices] += 1
+
     def deallocate_belief(self, index: int):
         """Free a belief slot (set to zero)."""
         if self.immutable_beliefs[index]:
             return  # kernel rule: cannot deallocate
         with torch.no_grad():
             self.beliefs.data[index].zero_()
+            self.belief_last_accessed[index] = 0.0
+            self.belief_access_count[index] = 0.0
 
     # ── Relation Region Accessors ──
 
@@ -277,6 +301,8 @@ class CognitiveState(nn.Module):
             'immutable_beliefs': self.immutable_beliefs.clone(),
             'immutable_edges': self.immutable_edges.clone(),
             'immutable_goals': self.immutable_goals.clone(),
+            'belief_last_accessed': self.belief_last_accessed.clone(),
+            'belief_access_count': self.belief_access_count.clone(),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -294,6 +320,9 @@ class CognitiveState(nn.Module):
             self.immutable_beliefs.copy_(state['immutable_beliefs'])
             self.immutable_edges.copy_(state['immutable_edges'])
             self.immutable_goals.copy_(state['immutable_goals'])
+            if 'belief_last_accessed' in state:
+                self.belief_last_accessed.copy_(state['belief_last_accessed'])
+                self.belief_access_count.copy_(state['belief_access_count'])
 
     # ── Summary ──
 

@@ -54,13 +54,23 @@ class WritePath(nn.Module):
         # Project hidden → observation in belief space
         self.obs_proj = nn.Linear(hidden_dim, belief_dim, bias=False)
 
-        # Learned precision estimator: estimates how confident this observation is
-        # Maps hidden state to a scalar precision (radius) for the observation
+        # Write gate: learned binary decision "is this worth storing?"
+        # Initialized with negative bias so gate starts mostly closed (~12% open),
+        # preventing state flooding before the model learns what's useful.
+        self.write_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+        # Init gate bias negative so sigmoid starts near 0
+        nn.init.constant_(self.write_gate[-1].bias, -2.0)
+
+        # Precision estimator (only used when gate is open)
         self.precision_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 4),
             nn.ReLU(),
             nn.Linear(hidden_dim // 4, 1),
-            nn.Softplus(),  # precision must be positive
+            nn.Softplus(),
         )
 
     def forward(
@@ -88,16 +98,20 @@ class WritePath(nn.Module):
         # Project to belief space: [B, T, D]
         obs_vectors = self.obs_proj(hidden)
 
-        # Estimate observation precision: [B, T, 1]
-        obs_precision = self.precision_head(hidden)
+        # Write gate: should this position produce a candidate at all?
+        gate = torch.sigmoid(self.write_gate(hidden))  # [B, T, 1]
+
+        # Precision (only meaningful where gate is open)
+        obs_precision = self.precision_head(hidden)     # [B, T, 1]
+        gated_precision = gate * obs_precision           # [B, T, 1]
 
         # Mean over batch for state updates (state is shared across batch)
-        obs_mean = obs_vectors.mean(dim=0)       # [T, D]
-        prec_mean = obs_precision.mean(dim=0)     # [T, 1]
+        obs_mean = obs_vectors.mean(dim=0)           # [T, D]
+        prec_mean = gated_precision.mean(dim=0)      # [T, 1]
 
-        # Scale observation vectors by estimated precision (set radius)
+        # Scale observation vectors by gated precision (set radius)
         obs_angles = F.normalize(obs_mean, dim=-1, eps=EPSILON)  # [T, D]
-        obs_beliefs = obs_angles * prec_mean                      # [T, D] (radius = precision)
+        obs_beliefs = obs_angles * prec_mean                      # [T, D] (radius = gated precision)
 
         # Match against existing beliefs
         candidates = self._match_and_buffer(obs_beliefs, state, layer_idx)
@@ -146,9 +160,9 @@ class WritePath(nn.Module):
             best_sims = torch.zeros(T, device=observations.device)
             best_global = torch.full((T,), -1, dtype=torch.long, device=observations.device)
 
-        # Only keep observations with meaningful precision (filter noise)
+        # Only keep observations where the gate produced meaningful precision
         obs_radii = observations.norm(dim=-1)
-        meaningful = obs_radii > 0.01  # threshold for "this observation has content"
+        meaningful = obs_radii > 0.05  # gate-filtered: higher threshold since gate does heavy lifting
 
         for t in range(T):
             if not meaningful[t]:

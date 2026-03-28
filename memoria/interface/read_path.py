@@ -58,8 +58,14 @@ class ReadPath(nn.Module):
         # Learnable temperature for Hopfield attention (per head)
         self.log_temperature = nn.Parameter(torch.zeros(num_heads))
 
+        # Utility head: predicts next-token logits from retrieved beliefs alone.
+        # Provides gradient signal for "are the retrieved beliefs useful for prediction?"
+        # This indirectly trains the write path to store useful information.
+        self.utility_head = nn.Linear(belief_dim * num_heads, hidden_dim, bias=False)
+
         # Initialize output projection to zero (residual-friendly, from nanogpt speedrun)
         nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.utility_head.weight)
 
     def forward(
         self,
@@ -67,6 +73,7 @@ class ReadPath(nn.Module):
         state: CognitiveState,
         goal_embeddings: Tensor | None = None,
         goal_priorities: Tensor | None = None,
+        current_step: int = -1,
     ) -> Tensor:
         """Retrieve relevant beliefs and project into hidden space.
 
@@ -86,7 +93,7 @@ class ReadPath(nn.Module):
         active_mask = state.get_active_mask()
         if not active_mask.any():
             # No beliefs → return zeros (model degrades to pure transformer)
-            return torch.zeros_like(hidden)
+            return torch.zeros_like(hidden), torch.zeros_like(hidden)
 
         active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
         active_beliefs = state.beliefs.data[active_indices]  # [N_active, D]
@@ -139,6 +146,16 @@ class ReadPath(nn.Module):
         # Softmax attention
         attn = F.softmax(scores, dim=-1)  # [B, T, H_n, N_active]
 
+        # Track which beliefs were attended to (recency update)
+        if current_step >= 0:
+            with torch.no_grad():
+                # Mean attention across batch, time, heads → per-belief attention mass
+                mean_attn = attn.mean(dim=(0, 1, 2))  # [N_active]
+                # Touch beliefs that received significant attention
+                attended = (mean_attn > 1.0 / max(N_active, 1)).nonzero(as_tuple=False).squeeze(-1)
+                if len(attended) > 0:
+                    state.touch_beliefs(active_indices[attended], current_step)
+
         # Retrieve: weighted sum of values
         # values: [N_active, D] → retrieved: [B, T, H_n, D]
         retrieved = torch.einsum('bthn,nd->bthd', attn, values)
@@ -147,7 +164,10 @@ class ReadPath(nn.Module):
         retrieved = retrieved.reshape(B, T, self.num_heads * self.belief_dim)
         output = self.output_proj(retrieved)  # [B, T, hidden_dim]
 
-        return output
+        # Utility prediction: can the retrieved beliefs predict the next token?
+        utility_logits = self.utility_head(retrieved)  # [B, T, hidden_dim]
+
+        return output, utility_logits
 
     def _compute_goal_bias(
         self,

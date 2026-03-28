@@ -104,6 +104,7 @@ class MemoriaModel(nn.Module):
         x0 = x
 
         all_candidates: list[WriteCandidate] = []
+        all_utility_logits: list[Tensor] = []
         interface_idx = 0
 
         for i, block in enumerate(self.transformer.blocks):
@@ -115,8 +116,9 @@ class MemoriaModel(nn.Module):
 
             # Insert state interface after designated blocks
             if interface_idx < len(self.interfaces) and i == self.interface_positions[interface_idx]:
-                x, candidates = self.interfaces[interface_idx](x, self.state)
+                x, candidates, utility_logits = self.interfaces[interface_idx](x, self.state)
                 all_candidates.extend(candidates)
+                all_utility_logits.append(utility_logits)
                 interface_idx += 1
 
         logits = self.transformer.head(x)
@@ -124,6 +126,7 @@ class MemoriaModel(nn.Module):
         result = {
             'logits': logits,
             'candidates': all_candidates,
+            'utility_logits': all_utility_logits,
             'hidden_final': x,
         }
 
@@ -167,12 +170,29 @@ class MemoriaModel(nn.Module):
             'logits': fwd['logits'],
         }
 
+        # Utility loss: do retrieved beliefs help predict next tokens?
+        # This provides gradient signal to the read/write paths about state quality.
+        loss_utility = torch.tensor(0.0, device=idx.device)
+        if alpha > 0 and fwd['utility_logits']:
+            lm_head = self.transformer.lm_head
+            for util_hidden in fwd['utility_logits']:
+                # Project utility hidden through LM head to get token predictions
+                util_logits = lm_head(F.rms_norm(util_hidden, (util_hidden.size(-1),))).float()
+                loss_utility = loss_utility + F.cross_entropy(
+                    util_logits.view(-1, util_logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                )
+            loss_utility = loss_utility / len(fwd['utility_logits'])
+        result['loss_utility'] = loss_utility
+
         if alpha > 0:
             fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
             loss_fe = fe_stats['free_energy']
             result['loss_fe'] = loss_fe
             result['free_energy_stats'] = fe_stats
-            result['loss'] = loss_token + alpha * loss_fe
+            # Utility loss weighted at 0.1× alpha — gentle signal, doesn't dominate
+            result['loss'] = loss_token + alpha * loss_fe + alpha * 0.1 * loss_utility
         else:
             result['loss_fe'] = torch.tensor(0.0, device=idx.device)
             result['free_energy_stats'] = {}

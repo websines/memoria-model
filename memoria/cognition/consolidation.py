@@ -108,6 +108,7 @@ def periodic_hard_cleanup(
         return 0
 
     radii = state.get_belief_radii()
+    access_counts = state.belief_access_count
     removed = 0
 
     with torch.no_grad():
@@ -116,7 +117,8 @@ def periodic_hard_cleanup(
                 continue
             if state.immutable_beliefs[i]:
                 continue
-            if radii[i].item() < low_precision_threshold:
+            # Low precision AND never/rarely accessed → remove
+            if radii[i].item() < low_precision_threshold and access_counts[i].item() < 3:
                 state.deallocate_belief(i)
                 removed += 1
 

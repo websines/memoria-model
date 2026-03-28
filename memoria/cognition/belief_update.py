@@ -118,8 +118,8 @@ def apply_belief_updates(
 def _evict_weakest(state: CognitiveState) -> int:
     """Find and evict the lowest-priority belief.
 
-    Eviction score = radius × recency_proxy × (1 - is_immutable)
-    We don't track recency yet, so just use radius (precision).
+    Eviction score = radius × recency_factor.
+    Stale beliefs (not accessed recently) are evicted first.
 
     Returns:
         slot index of evicted belief, or -1 if all immutable
@@ -127,10 +127,15 @@ def _evict_weakest(state: CognitiveState) -> int:
     radii = state.get_belief_radii()
     active = state.get_active_mask()
 
-    # Score: low radius = evict first. Immutable = never evict.
-    scores = radii.clone()
-    scores[~active] = float('inf')  # don't evict empty slots
-    scores[state.immutable_beliefs] = float('inf')  # don't evict immutable
+    # Recency factor: beliefs accessed recently get a survival boost
+    # access_count of 0 → factor 1.0 (no boost), higher count → higher factor
+    recency = state.belief_access_count.clamp(min=0)
+    recency_factor = 1.0 + 0.1 * recency  # each access adds 10% survival bonus
+
+    # Score: higher = more worth keeping. Low radius + stale = evict first.
+    scores = radii * recency_factor
+    scores[~active] = float('inf')
+    scores[state.immutable_beliefs] = float('inf')
 
     if (scores == float('inf')).all():
         return -1
