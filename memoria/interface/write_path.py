@@ -34,6 +34,41 @@ class WriteCandidate:
     source_layer: int              # which state interface layer produced this
 
 
+def pack_candidates(candidates: list[WriteCandidate]) -> Tensor:
+    """Pack candidates into a single tensor for distributed gather.
+
+    Returns:
+        [N, D+3] tensor where last 3 cols are (matched_slot, match_similarity, source_layer).
+        Returns empty [0, 0] tensor if no candidates.
+    """
+    if not candidates:
+        return torch.zeros(0, 0)
+    D = candidates[0].belief_vector.shape[0]
+    packed = torch.zeros(len(candidates), D + 3, device=candidates[0].belief_vector.device)
+    for i, c in enumerate(candidates):
+        packed[i, :D] = c.belief_vector
+        packed[i, D] = c.matched_slot
+        packed[i, D + 1] = c.match_similarity
+        packed[i, D + 2] = c.source_layer
+    return packed
+
+
+def unpack_candidates(packed: Tensor, belief_dim: int) -> list[WriteCandidate]:
+    """Unpack tensor back into WriteCandidate list."""
+    if packed.numel() == 0:
+        return []
+    candidates = []
+    for i in range(packed.shape[0]):
+        candidates.append(WriteCandidate(
+            belief_vector=packed[i, :belief_dim],
+            matched_slot=int(packed[i, belief_dim].item()),
+            match_similarity=packed[i, belief_dim + 1].item(),
+            source_position=i,  # position lost in packing, use index
+            source_layer=int(packed[i, belief_dim + 2].item()),
+        ))
+    return candidates
+
+
 class WritePath(nn.Module):
     """Project hidden states into belief space and match against existing beliefs.
 

@@ -69,6 +69,9 @@ def hebbian_update(
                 state.edge_weights.data[idx] = min(w_new, 1.0)
                 co_active_set.discard(pair)  # handled
             else:
+                # Skip causal edges — they have their own decay in causal_edge_learning
+                if state.edge_causal_obs[idx].item() > 0:
+                    continue
                 # Decay: not co-activated this step
                 w_new = w * (1.0 - decay_rate)
                 if w_new < 0.01:

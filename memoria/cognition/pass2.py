@@ -3,12 +3,13 @@
 Order:
 1. Surprise computation
 2. Belief updates (precision-weighted revision)
-3. Hebbian edge strengthening
-4. Goal progress tracking
-5. Intrinsic goal generation (from surprise)
-6. Stall detection + deadline enforcement
-7. Meta update (β computation, periodic SPSA)
-8. Consolidation (periodic)
+3. Causal edge learning (temporal surprise precedence → directed edges)
+4. Hebbian edge strengthening (co-activation → undirected edges)
+5. Goal progress tracking
+6. Intrinsic goal generation (from surprise)
+7. Stall detection + deadline enforcement
+8. Meta update (β computation, periodic SPSA)
+9. Consolidation (periodic)
 
 This runs ONCE per sequence (training) or per response (inference).
 The cognitive state is modified in-place.
@@ -19,6 +20,7 @@ from ..interface.write_path import WriteCandidate
 from .surprise import compute_surprise_batch
 from .belief_update import apply_belief_updates
 from .hebbian import hebbian_update, extract_co_activations
+from .causal import causal_edge_learning
 from .telos import (
     generate_intrinsic_goals, update_goal_progress,
     detect_stalls, enforce_deadlines,
@@ -92,24 +94,29 @@ def run_pass2(
                 surprise_values.append(sr.surprise)
                 new_alloc_count += 1
 
-    # 3. Hebbian edge strengthening
+    # 3. Causal edge learning (temporal surprise precedence → directed edges)
+    causal_stats = causal_edge_learning(state, updated_indices, surprise_values)
+    stats['causal_edges_created'] = causal_stats['edges_created']
+    stats['causal_edges_strengthened'] = causal_stats['edges_strengthened']
+
+    # 4. Hebbian edge strengthening (co-activation → undirected edges)
     co_activations = extract_co_activations(state, read_belief_indices)
     hebbian_update(state, co_activations)
     stats['co_activation_pairs'] = len(co_activations)
 
-    # 4. Goal progress
+    # 5. Goal progress
     update_goal_progress(state, updated_indices, surprise_values)
     stats['active_goals'] = state.num_active_goals()
 
-    # 5. Intrinsic goal generation
+    # 6. Intrinsic goal generation
     new_goals = generate_intrinsic_goals(state, current_step)
     stats['goals_generated'] = new_goals
 
-    # 6. Stall detection + deadline enforcement
+    # 7. Stall detection + deadline enforcement
     detect_stalls(state, current_step)
     enforce_deadlines(state, current_step)
 
-    # 7. Meta update: β + periodic SPSA
+    # 8. Meta update: β + periodic SPSA
     beta = compute_beta(state, temperature)
     stats['beta'] = beta
 
@@ -119,7 +126,7 @@ def run_pass2(
     else:
         stats['spsa_step'] = False
 
-    # 8. Consolidation
+    # 9. Consolidation
     merged = soft_consolidation(state)
     stats['soft_merges'] = merged
 

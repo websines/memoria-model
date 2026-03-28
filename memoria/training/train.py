@@ -31,7 +31,11 @@ from ..data.interleave import interleaved_stream
 from ..data.synthetic import generate_all_synthetic
 from .optimizer import setup_optimizer
 from .schedule import get_lr_multiplier, get_alpha
-from .distributed import setup_device, setup_data_parallel, unwrap_model, get_batch_to_device
+from .distributed import (
+    setup_distributed, cleanup_distributed, wrap_ddp,
+    broadcast_state, gather_candidates, setup_device, get_batch_to_device,
+)
+from ..interface.write_path import pack_candidates, unpack_candidates
 
 
 def _load_env():
@@ -64,10 +68,13 @@ def train(
         resume_from: checkpoint path to resume from
     """
     _load_env()
-    device = setup_device()
+    rank, world_size, device = setup_distributed()
     tc = config.training
+    is_main = (rank == 0)
 
-    # Weights & Biases
+    # Weights & Biases (rank 0 only)
+    if log_to_wandb and not is_main:
+        log_to_wandb = False
     if log_to_wandb:
         import wandb
         wandb.init(
@@ -76,39 +83,43 @@ def train(
                 'transformer': config.transformer.__dict__,
                 'state': config.state.__dict__,
                 'training': tc.__dict__,
+                'world_size': world_size,
             },
             save_code=True,
         )
 
-    # HuggingFace Hub
+    # HuggingFace Hub (rank 0 only)
     hf_repo = os.environ.get("HF_REPO", None)
     hf_token = os.environ.get("HF_TOKEN", None)
-    if push_to_hub and (not hf_repo or not hf_token):
-        print("WARNING: push_to_hub=True but HF_REPO or HF_TOKEN not set. Disabling hub push.")
+    if push_to_hub and (not hf_repo or not hf_token or not is_main):
+        if is_main and (not hf_repo or not hf_token):
+            print("WARNING: push_to_hub=True but HF_REPO or HF_TOKEN not set. Disabling hub push.")
         push_to_hub = False
 
     # Tokenizer
     tokenizer = get_tokenizer(vocab_size=config.transformer.vocab_size)
 
     # Model
-    print("Building model...")
+    if is_main:
+        print("Building model...")
     model = MemoriaModel(config)
     model.init_weights()
-    model = model.to(device)
-    base_model = model  # no DataParallel for v1 — candidates are non-tensor, state is shared
-    print(model.summary())
-    if torch.cuda.device_count() > 1:
-        print(f"  Note: {torch.cuda.device_count()} GPUs detected. Using single GPU for v1 (DataParallel needs non-tensor output handling).")
+    model, base_model = wrap_ddp(model, device, rank, world_size)
+    if is_main:
+        print(base_model.summary())
+        if world_size > 1:
+            print(f"  DDP: {world_size} GPUs, state on rank 0")
 
     # Optimizer (always on the base model, not the DataParallel wrapper)
     optimizer = setup_optimizer(base_model, config)
 
     # Data
-    print("Generating synthetic data...")
+    if is_main:
+        print("Generating synthetic data...")
     synthetic_data = generate_all_synthetic()
-    print(f"Generated {len(synthetic_data)} synthetic sequences")
-
-    print("Starting data stream...")
+    if is_main:
+        print(f"Generated {len(synthetic_data)} synthetic sequences")
+        print("Starting data stream...")
     data_stream = interleaved_stream(
         tokenizer,
         seq_len=config.transformer.sequence_len,
@@ -121,11 +132,12 @@ def train(
     start_step = 0
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
-        model.load_state_dict(checkpoint['model_state'], strict=False)
+        base_model.load_state_dict(checkpoint['model_state'], strict=False)
         base_model.state.load_state_cognitive(checkpoint['cognitive_state'])
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_step = checkpoint['step']
-        print(f"Resumed from step {start_step}")
+        if is_main:
+            print(f"Resumed from step {start_step}")
 
     # Checkpoint dir
     ckpt_path = Path(checkpoint_dir)
@@ -143,16 +155,19 @@ def train(
     tokens_per_step = tc.device_batch_size * config.transformer.sequence_len
     grad_accum = max(1, tc.total_batch_size // tokens_per_step)
 
-    print(f"Training: {max_steps} steps, grad_accum={grad_accum}, "
-          f"batch_size={tc.device_batch_size}, seq_len={config.transformer.sequence_len}")
-    print(f"Phase 1 (α=0): steps 0-{tc.phase1_steps}")
-    print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
-    print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
+    if is_main:
+        print(f"Training: {max_steps} steps, grad_accum={grad_accum}, "
+              f"batch_size={tc.device_batch_size}, seq_len={config.transformer.sequence_len}")
+        print(f"Phase 1 (α=0): steps 0-{tc.phase1_steps}")
+        print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
+        print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
 
     # Prefetch first batch (this can take a while on first stream access)
-    print("Prefetching first batch (downloading initial data shard)...", flush=True)
+    if is_main:
+        print("Prefetching first batch (downloading initial data shard)...", flush=True)
     first_batch = next(data_stream)
-    print(f"First batch ready. input_ids shape: {first_batch['input_ids'].shape}")
+    if is_main:
+        print(f"First batch ready. input_ids shape: {first_batch['input_ids'].shape}")
     prefetched = first_batch
 
     # GC management (from autoresearch — prevents Python GC stalls)
@@ -160,8 +175,13 @@ def train(
     gc.freeze()
     gc.disable()
 
+    belief_dim = config.state.belief_dim
+
     for step in range(start_step, max_steps):
         t0 = time.time()
+
+        # Broadcast cognitive state to all ranks before forward pass
+        broadcast_state(base_model.state, rank, world_size)
 
         # Schedule
         alpha = get_alpha(step, tc)
@@ -176,7 +196,7 @@ def train(
         total_loss_fe = 0.0
 
         for micro_step in range(grad_accum):
-            if step == 0:
+            if step == 0 and is_main:
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
             # Get batch (use prefetched if available)
@@ -200,34 +220,45 @@ def train(
             total_loss_fe += result['loss_fe'].item() / grad_accum
             all_candidates.extend(result['candidates'])
 
-        if step == 0:
+        if step == 0 and is_main:
             print(f"\r  Step 0 complete.{' ' * 30}", flush=True)
 
-        # Optimizer step
+        # Optimizer step (DDP syncs gradients automatically)
         optimizer.step()
         model.zero_grad(set_to_none=True)
 
         # Fast fail
         if math.isnan(total_loss) or total_loss > 100:
-            print(f"\nFAIL: loss exploded at step {step}: {total_loss}")
+            if is_main:
+                print(f"\nFAIL: loss exploded at step {step}: {total_loss}")
             break
 
-        # Pass 2: cognitive update (detached from optimizer graph)
+        # Gather candidates from all ranks to rank 0 for Pass 2
+        packed = pack_candidates(all_candidates)
+        packed = gather_candidates(packed, rank, world_size, belief_dim)
+
+        # Pass 2: cognitive update on rank 0 only (state is sequential)
         base_model.detach_state()
 
-        # Collect read indices from candidates (which beliefs were accessed)
-        read_indices = list(set(
-            c.matched_slot for c in all_candidates if c.matched_slot >= 0
-        ))
+        if is_main:
+            gathered_candidates = unpack_candidates(packed, belief_dim)
+            read_indices = list(set(
+                c.matched_slot for c in gathered_candidates if c.matched_slot >= 0
+            ))
 
-        pass2_stats = run_pass2(
-            state=base_model.state,
-            candidates=all_candidates,
-            read_belief_indices=read_indices,
-            current_step=step,
-            is_sequence_boundary=True,
-            temperature=tc.fe_temperature,
-        )
+            pass2_stats = run_pass2(
+                state=base_model.state,
+                candidates=gathered_candidates,
+                read_belief_indices=read_indices,
+                current_step=step,
+                is_sequence_boundary=True,
+                temperature=tc.fe_temperature,
+            )
+        else:
+            pass2_stats = {
+                'beta': 1.0, 'active_beliefs': 0, 'active_edges': 0,
+                'active_goals': 0, 'total_surprise': 0.0,
+            }
 
         # Timing
         t1 = time.time()
@@ -242,7 +273,7 @@ def train(
         smooth_loss_fe = ema * smooth_loss_fe + (1 - ema) * total_loss_fe
         debiased = smooth_loss / (1 - ema ** (step - start_step + 1))
 
-        if step % tc.log_interval == 0:
+        if step % tc.log_interval == 0 and is_main:
             phase = "P1" if alpha == 0 else ("P2" if alpha < tc.alpha_max else "P3")
             print(
                 f"\rstep {step:05d} [{phase}] | "
@@ -276,17 +307,18 @@ def train(
                 'dt_ms': dt * 1000,
             })
 
-        # Checkpoint
-        if step > 0 and step % tc.checkpoint_interval == 0:
+        # Checkpoint (rank 0 only)
+        if is_main and step > 0 and step % tc.checkpoint_interval == 0:
             save_checkpoint(base_model, optimizer, step, ckpt_path / f"step_{step}.pt")
 
-        # Push to HuggingFace Hub
+        # Push to HuggingFace Hub (rank 0 only)
         if push_to_hub and step > 0 and step % hub_push_every == 0:
             _push_to_hub(base_model, step, ckpt_path, hf_repo, hf_token)
 
         # Time budget
         if time_budget and total_training_time >= time_budget:
-            print(f"\nTime budget reached ({time_budget}s) at step {step}")
+            if is_main:
+                print(f"\nTime budget reached ({time_budget}s) at step {step}")
             break
 
         # Periodic GC
@@ -296,20 +328,22 @@ def train(
     # Re-enable GC after training loop
     gc.enable()
 
-    print(f"\nTraining complete. {step + 1} steps, {total_training_time:.1f}s training time.")
+    if is_main:
+        print(f"\nTraining complete. {step + 1} steps, {total_training_time:.1f}s training time.")
 
-    # Final checkpoint
-    save_checkpoint(base_model, optimizer, step, ckpt_path / "final.pt")
+        # Final checkpoint
+        save_checkpoint(base_model, optimizer, step, ckpt_path / "final.pt")
 
-    # Final push to hub
-    if push_to_hub:
-        _push_to_hub(base_model, step, ckpt_path, hf_repo, hf_token, is_final=True)
+        # Final push to hub
+        if push_to_hub:
+            _push_to_hub(base_model, step, ckpt_path, hf_repo, hf_token, is_final=True)
 
     if log_to_wandb:
         import wandb
         wandb.finish()
 
-    return model
+    cleanup_distributed()
+    return base_model
 
 
 def save_checkpoint(model, optimizer, step: int, path: Path):

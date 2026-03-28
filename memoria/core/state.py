@@ -67,6 +67,8 @@ class CognitiveState(nn.Module):
         )
         # Track which edges are active (allocated)
         self.register_buffer('edge_active', torch.zeros(config.max_edges, dtype=torch.bool))
+        # Causal edge observation counts (0 = Hebbian/associative, >0 = causal with N observations)
+        self.register_buffer('edge_causal_obs', torch.zeros(config.max_edges))
 
         # ── Goal Region (Telos) ──
         # Goal embedding (same space as beliefs) + metadata
@@ -108,6 +110,12 @@ class CognitiveState(nn.Module):
         )
         self.register_buffer(
             'belief_access_count', torch.zeros(config.max_beliefs)
+        )
+
+        # ── Causal Learning ──
+        # Previous step's per-belief surprise (for temporal precedence detection)
+        self.register_buffer(
+            'belief_prev_surprise', torch.zeros(config.max_beliefs)
         )
 
         # ── Kernel Rules (immutability masks) ──
@@ -242,6 +250,7 @@ class CognitiveState(nn.Module):
         with torch.no_grad():
             self.edge_active[index] = False
             self.edge_weights.data[index] = 0.0
+            self.edge_causal_obs[index] = 0.0
 
     def num_active_edges(self) -> int:
         return self.edge_active.sum().item()
@@ -295,6 +304,7 @@ class CognitiveState(nn.Module):
             'edge_relations': self.edge_relations.data.clone(),
             'edge_weights': self.edge_weights.data.clone(),
             'edge_active': self.edge_active.clone(),
+            'edge_causal_obs': self.edge_causal_obs.clone(),
             'goal_embeddings': self.goal_embeddings.data.clone(),
             'goal_metadata': self.goal_metadata.data.clone(),
             'meta': self.meta.data.clone(),
@@ -303,6 +313,7 @@ class CognitiveState(nn.Module):
             'immutable_goals': self.immutable_goals.clone(),
             'belief_last_accessed': self.belief_last_accessed.clone(),
             'belief_access_count': self.belief_access_count.clone(),
+            'belief_prev_surprise': self.belief_prev_surprise.clone(),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -314,6 +325,8 @@ class CognitiveState(nn.Module):
             self.edge_relations.data.copy_(state['edge_relations'])
             self.edge_weights.data.copy_(state['edge_weights'])
             self.edge_active.copy_(state['edge_active'])
+            if 'edge_causal_obs' in state:
+                self.edge_causal_obs.copy_(state['edge_causal_obs'])
             self.goal_embeddings.data.copy_(state['goal_embeddings'])
             self.goal_metadata.data.copy_(state['goal_metadata'])
             self.meta.data.copy_(state['meta'])
@@ -323,6 +336,8 @@ class CognitiveState(nn.Module):
             if 'belief_last_accessed' in state:
                 self.belief_last_accessed.copy_(state['belief_last_accessed'])
                 self.belief_access_count.copy_(state['belief_access_count'])
+            if 'belief_prev_surprise' in state:
+                self.belief_prev_surprise.copy_(state['belief_prev_surprise'])
 
     # ── Summary ──
 

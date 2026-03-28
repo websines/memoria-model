@@ -172,3 +172,141 @@ def intervene(
             break
 
     return results
+
+
+# ── Causal Edge Learning from Experience ──
+# Learns directed edges from temporal surprise patterns:
+# If belief A is updated with surprise at step t, and belief B is updated
+# with surprise at step t+1, the signal A→B accumulates via Bayesian averaging.
+#
+# Ported from: prototype-research/src/causal/notears.rs (Bayesian edge accumulation)
+# Distinct from Hebbian: Hebbian is undirected co-activation, causal is directed temporal precedence.
+
+
+def _find_directed_edge(state: CognitiveState, src: int, tgt: int) -> int:
+    """Find a directed edge from src to tgt. Returns edge index or -1."""
+    if not state.edge_active.any():
+        return -1
+    active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
+    for eidx in active_idx.tolist():
+        if state.edge_src[eidx].item() == src and state.edge_tgt[eidx].item() == tgt:
+            return eidx
+    return -1
+
+
+def causal_edge_learning(
+    state: CognitiveState,
+    updated_indices: list[int],
+    surprise_values: list[float],
+    min_signal: float = 0.1,
+    decay_rate: float = 0.005,
+) -> dict:
+    """Learn directed causal edges from temporal surprise patterns.
+
+    When belief A is updated with surprise at step t and belief B at step t+1,
+    this suggests A→B causation. Edge strength accumulates via Bayesian posterior
+    averaging over repeated observations.
+
+    Uses belief_prev_surprise buffer to track the previous step's surprises.
+
+    Args:
+        state: cognitive state (modified in-place)
+        updated_indices: belief indices updated THIS step (from surprise computation)
+        surprise_values: corresponding surprise values
+        min_signal: minimum geometric-mean surprise to create/strengthen an edge
+        decay_rate: per-step decay for unreinforced causal edges (slower than Hebbian)
+
+    Returns:
+        dict with statistics
+    """
+    stats = {'edges_created': 0, 'edges_strengthened': 0, 'edges_decayed': 0}
+
+    with torch.no_grad():
+        prev_surprise = state.belief_prev_surprise  # [max_beliefs]
+        prev_updated = (prev_surprise > EPSILON).nonzero(as_tuple=False).squeeze(-1)
+
+        if len(prev_updated) > 0 and len(updated_indices) > 0:
+            # Build current update map
+            curr_map = {}
+            for idx, s in zip(updated_indices, surprise_values):
+                if s > EPSILON:
+                    curr_map[idx] = s
+
+            reinforced = set()
+
+            for prev_idx in prev_updated.tolist():
+                prev_s = prev_surprise[prev_idx].item()
+
+                for curr_idx, curr_s in curr_map.items():
+                    if prev_idx == curr_idx:
+                        continue
+
+                    # Causal signal: geometric mean of consecutive surprises
+                    signal = (prev_s * curr_s) ** 0.5
+                    if signal < min_signal:
+                        continue
+
+                    edge_idx = _find_directed_edge(state, prev_idx, curr_idx)
+
+                    if edge_idx >= 0:
+                        # Bayesian posterior update: running average weighted by observation count
+                        obs = state.edge_causal_obs[edge_idx].item()
+                        obs = max(obs, 1.0)
+                        old_w = state.edge_weights.data[edge_idx].item()
+                        new_w = (old_w * obs + signal) / (obs + 1.0)
+
+                        state.edge_weights.data[edge_idx] = min(new_w, 1.0)
+                        state.edge_causal_obs[edge_idx] = obs + 1.0
+
+                        # Update relation vector: running average of cause→effect delta
+                        K = state.config.relation_dim
+                        D = min(K, state.config.belief_dim)
+                        cause_angle = state.get_belief_angles()[prev_idx]
+                        effect_angle = state.get_belief_angles()[curr_idx]
+                        new_rel = torch.zeros(K, device=state.beliefs.device)
+                        new_rel[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
+                        alpha = 1.0 / (obs + 1.0)
+                        state.edge_relations.data[edge_idx] = (
+                            (1.0 - alpha) * state.edge_relations.data[edge_idx] + alpha * new_rel
+                        )
+
+                        reinforced.add(edge_idx)
+                        stats['edges_strengthened'] += 1
+                    else:
+                        # Create new directed causal edge
+                        K = state.config.relation_dim
+                        D = min(K, state.config.belief_dim)
+                        cause_angle = state.get_belief_angles()[prev_idx]
+                        effect_angle = state.get_belief_angles()[curr_idx]
+                        relation = torch.zeros(K, device=state.beliefs.device)
+                        relation[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
+
+                        new_idx = state.allocate_edge(
+                            prev_idx, curr_idx, relation, weight=signal * 0.3,
+                        )
+                        if new_idx >= 0:
+                            state.edge_causal_obs[new_idx] = 1.0
+                            reinforced.add(new_idx)
+                            stats['edges_created'] += 1
+
+            # Decay unreinforced causal edges
+            if state.edge_active.any():
+                active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
+                for eidx in active_idx.tolist():
+                    if eidx in reinforced or state.immutable_edges[eidx]:
+                        continue
+                    if state.edge_causal_obs[eidx].item() > 0:
+                        w = state.edge_weights.data[eidx].item()
+                        w *= (1.0 - decay_rate)
+                        if w < 0.01:
+                            state.deallocate_edge(eidx)
+                        else:
+                            state.edge_weights.data[eidx] = w
+                        stats['edges_decayed'] += 1
+
+        # Store current step's surprises for next step
+        state.belief_prev_surprise.zero_()
+        for idx, s in zip(updated_indices, surprise_values):
+            state.belief_prev_surprise[idx] = s
+
+    return stats
