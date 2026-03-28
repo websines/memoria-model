@@ -1,0 +1,22 @@
+[
+  ["TechCorp was founded in 2010", "TechCorp was founded in 2012"],
+  ["TechCorp is headquartered in San Francisco", "TechCorp is headquartered in New York"],
+  ["Alice works_at Google", "Alice works_at Microsoft"],
+  ["Python is used by TechCorp for backend", "Go is used by TechCorp for backend"],
+  ["The project deadline is March 15", "The project deadline is April 30"],
+  ["TechCorp runs on AWS us-east-1", "TechCorp runs on GCP europe-west1"],
+  ["TechCorp has 12 engineers", "TechCorp has 8 engineers"],
+  ["TechCorp revenue grew 40% year over year", "TechCorp revenue grew 15% year over year"],
+  ["TechCorp uses PostgreSQL 14 for its database", "TechCorp uses MySQL 8 for its database"],
+  ["TechCorp launched in January 2024", "TechCorp launched in September 2023"],
+  ["Alice manages the data science team", "Alice manages the marketing team"],
+  ["TechCorp headquarters is in Austin", "TechCorp headquarters is in Seattle"],
+  ["TechCorp handles 10000 requests per second", "TechCorp handles 500 requests per second"],
+  ["TechCorp annual budget is $5 million", "TechCorp annual budget is $2 million"],
+  ["TechCorp board meeting is on Friday", "TechCorp board meeting is on Monday"],
+  ["TechCorp deployment uses Kubernetes", "TechCorp deployment uses bare metal servers"],
+  ["TechCorp customer satisfaction score is 92%", "TechCorp customer satisfaction score is 78%"],
+  ["TechCorp has 500 employees", "TechCorp has 200 employees"],
+  ["TechCorp main office is on the 15th floor", "TechCorp main office is on the 3rd floor"],
+  ["TechCorp quarterly report shows a profit of $1.2M", "TechCorp quarterly report shows a loss of $800K"]
+]

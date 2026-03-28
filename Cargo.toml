@@ -1,0 +1,66 @@
+[package]
+name = "memoria"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+description = "A self-evolving memory runtime for AI agents — Active Inference, CozoDB, vector search, Datalog"
+repository = "https://github.com/axiom-labs/memoria-research"
+
+[features]
+default = []
+local-embeddings = ["fastembed"]
+
+[dependencies]
+# Embedded DB: relations, HNSW, Datalog, time-travel, graph algos
+cozo = { version = "0.7", default-features = false, features = ["storage-rocksdb", "graph-algo", "requests"] }
+rayon = "=1.10.0"
+
+# Concurrent hot cache
+dashmap = "6"
+parking_lot = "0.12"
+
+# IDs
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# HTTP client for API services (GLiNER2, LLM, embedder, reranker)
+ureq = { version = "2", features = ["json"] }
+
+# Semantic text chunking
+text-splitter = "0.18"
+
+# ndarray — must match cozo's version for Vector compatibility
+ndarray = "0.15"
+
+# Hash-chained audit log
+sha2 = "0.10"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+
+# Lock-free config hot-reload for meta-learning
+arc-swap = "1"
+
+# Predictive generation: ETS forecasting + BOCPD changepoint detection
+augurs = { version = "0.10", features = ["ets"] }
+changepoint = "0.15"
+
+# Structural causal models: DAG operations, Bayes-Ball d-separation
+petgraph = "0.8"
+
+# Local ONNX embeddings/reranking (optional — heavy)
+fastembed = { version = "5", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
