@@ -109,6 +109,7 @@ def train(
     data_stream = interleaved_stream(
         tokenizer,
         seq_len=config.transformer.sequence_len,
+        weights=(0.7, 0.2, 0.1),  # FineWeb 70% + code 20% (starcoderdata, ungated) + synthetic 10%
         synthetic_data=synthetic_data,
         stack_languages=["python", "javascript", "rust", "go"],
     )

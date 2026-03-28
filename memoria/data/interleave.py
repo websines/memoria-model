@@ -10,7 +10,7 @@ from torch import Tensor
 from typing import Iterator
 from transformers import PreTrainedTokenizer
 
-from .streaming import stream_fineweb_edu, stream_stack_v2
+from .streaming import stream_fineweb_edu, stream_code
 from .synthetic import generate_all_synthetic
 
 
@@ -43,7 +43,16 @@ def interleaved_stream(
 
     # Initialize streams
     fineweb_iter = stream_fineweb_edu(tokenizer, seq_len) if w_fineweb > 0 else iter([])
-    stack_iter = stream_stack_v2(tokenizer, seq_len, languages=stack_languages) if w_stack > 0 else iter([])
+
+    # Code dataset: starcoderdata (ungated) → fallback to Stack v2
+    code_iter = iter([])
+    if w_stack > 0:
+        try:
+            code_iter = stream_code(tokenizer, seq_len, languages=stack_languages)
+        except Exception as e:
+            print(f"WARNING: Code dataset unavailable ({e}). Redistributing weight to FineWeb.")
+            w_fineweb += w_stack
+            w_stack = 0
 
     # Synthetic: tokenize from pre-generated list
     if synthetic_data is None:
@@ -64,11 +73,19 @@ def interleaved_stream(
 
         elif r < w_fineweb + w_stack:
             try:
-                batch = next(stack_iter)
-                batch['source'] = 'stack'
+                batch = next(code_iter)
+                batch['source'] = 'code'
                 yield batch
             except StopIteration:
-                stack_iter = stream_stack_v2(tokenizer, seq_len, languages=stack_languages)
+                try:
+                    code_iter = stream_code(tokenizer, seq_len, languages=stack_languages)
+                except Exception:
+                    w_fineweb += w_stack
+                    w_stack = 0
+                continue
+            except Exception:
+                w_fineweb += w_stack
+                w_stack = 0
                 continue
 
         else:

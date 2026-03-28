@@ -33,13 +33,15 @@ def stream_fineweb_edu(
     yield from _tokenize_stream(ds, tokenizer, seq_len, text_key="text")
 
 
-def stream_stack_v2(
+def stream_code(
     tokenizer: PreTrainedTokenizer,
     seq_len: int = 2048,
     languages: list[str] | None = None,
     split: str = "train",
 ) -> Iterator[dict[str, Tensor]]:
-    """Stream tokenized sequences from The Stack v2 dedup.
+    """Stream tokenized code from starcoderdata (ungated, 250B tokens, 86 languages).
+
+    Falls back to The Stack v2 dedup if starcoderdata fails.
 
     Args:
         tokenizer: tokenizer to use
@@ -50,19 +52,38 @@ def stream_stack_v2(
     Yields:
         dict with 'input_ids' and 'labels' tensors
     """
-    # The Stack v2 uses language-specific configs
-    # For streaming, we load with data_dir filter if available
-    ds = load_dataset(
-        "bigcode/the-stack-v2-dedup",
-        split=split,
-        streaming=True,
-    )
+    # Try starcoderdata first (ungated, always accessible)
+    for dataset_name, text_key in [
+        ("bigcode/starcoderdata", "content"),
+        ("bigcode/the-stack-v2-dedup", "content"),
+    ]:
+        try:
+            if languages and dataset_name == "bigcode/starcoderdata":
+                # starcoderdata uses data_dir for language filtering
+                for lang in languages:
+                    try:
+                        ds = load_dataset(
+                            dataset_name,
+                            data_dir=lang,
+                            split=split,
+                            streaming=True,
+                        )
+                        yield from _tokenize_stream(ds, tokenizer, seq_len, text_key=text_key)
+                    except Exception:
+                        continue
+                return
+            else:
+                ds = load_dataset(dataset_name, split=split, streaming=True)
+                if languages:
+                    lang_set = set(l.lower() for l in languages)
+                    ds = ds.filter(lambda x: x.get("lang", "").lower() in lang_set)
+                yield from _tokenize_stream(ds, tokenizer, seq_len, text_key=text_key)
+                return
+        except Exception as e:
+            print(f"WARNING: {dataset_name} failed ({e}), trying next...")
+            continue
 
-    if languages:
-        lang_set = set(l.lower() for l in languages)
-        ds = ds.filter(lambda x: x.get("lang", "").lower() in lang_set)
-
-    yield from _tokenize_stream(ds, tokenizer, seq_len, text_key="content")
+    raise RuntimeError("No code dataset available")
 
 
 def _tokenize_stream(
