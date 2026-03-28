@@ -147,14 +147,13 @@ class ReadPath(nn.Module):
         attn = F.softmax(scores, dim=-1)  # [B, T, H_n, N_active]
 
         # Track which beliefs were attended to (recency update)
-        if current_step >= 0:
-            with torch.no_grad():
-                # Mean attention across batch, time, heads → per-belief attention mass
-                mean_attn = attn.mean(dim=(0, 1, 2))  # [N_active]
-                # Touch beliefs that received significant attention
-                attended = (mean_attn > 1.0 / max(N_active, 1)).nonzero(as_tuple=False).squeeze(-1)
-                if len(attended) > 0:
-                    state.touch_beliefs(active_indices[attended], current_step)
+        with torch.no_grad():
+            # Mean attention across batch, time, heads → per-belief attention mass
+            mean_attn = attn.mean(dim=(0, 1, 2))  # [N_active]
+            # Touch beliefs that received significant attention
+            attended = (mean_attn > 1.0 / max(N_active, 1)).nonzero(as_tuple=False).squeeze(-1)
+            if len(attended) > 0:
+                state.touch_beliefs(active_indices[attended], max(current_step, 0))
 
         # Retrieve: weighted sum of values
         # values: [N_active, D] → retrieved: [B, T, H_n, D]
