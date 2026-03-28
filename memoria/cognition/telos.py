@@ -60,7 +60,7 @@ def generate_intrinsic_goals(
     accumulated = state.accumulated_surprise
 
     # Adaptive threshold: higher β (uncertainty) → lower threshold (more goals)
-    threshold = 2.0 * (1.0 + beta)
+    threshold = 2.0 / (1.0 + beta)
 
     if accumulated < threshold:
         return 0
@@ -122,7 +122,7 @@ def generate_intrinsic_goals(
             state.goal_metadata.data[slot, PRIORITY] = priority
             state.goal_metadata.data[slot, URGENCY] = 0.0
             state.goal_metadata.data[slot, PROGRESS] = 0.0
-            state.goal_metadata.data[slot, STATUS] = STATUS_ACTIVE if beta > 0.5 else STATUS_PROPOSED
+            state.goal_metadata.data[slot, STATUS] = STATUS_PROPOSED if beta > 0.5 else STATUS_ACTIVE
             state.goal_metadata.data[slot, DEPTH] = 3.0  # operational level
             state.goal_metadata.data[slot, SURPRISE_ACCUM] = 0.0
             state.goal_metadata.data[slot, CREATED_STEP] = float(current_step)

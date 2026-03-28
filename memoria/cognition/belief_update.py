@@ -97,8 +97,9 @@ def apply_belief_updates(
                 # Radius update: consistent updates increase precision,
                 # contradictory updates decrease it
                 if sr.surprise < 0.5:
-                    # Low surprise (agreement) → precision increases slightly
-                    new_radius = existing_radius + 0.1 * obs_radius * (1.0 - sr.surprise)
+                    # Low surprise (agreement) → precision increases (diminishing returns)
+                    headroom = max(0.0, 1.0 - existing_radius / 10.0)  # saturate near 10
+                    new_radius = existing_radius + 0.1 * obs_radius * (1.0 - sr.surprise) * headroom
                 else:
                     # High surprise (disagreement) → precision decreases
                     new_radius = existing_radius * (1.0 - gain * 0.5)

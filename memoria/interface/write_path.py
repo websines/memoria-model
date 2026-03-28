@@ -143,8 +143,8 @@ class WritePath(nn.Module):
             best_sims, best_local = similarities.max(dim=-1)  # [T], [T]
             best_global = active_indices[best_local]           # map to global slot indices
         else:
-            best_sims = torch.zeros(T)
-            best_global = torch.full((T,), -1, dtype=torch.long)
+            best_sims = torch.zeros(T, device=observations.device)
+            best_global = torch.full((T,), -1, dtype=torch.long, device=observations.device)
 
         # Only keep observations with meaningful precision (filter noise)
         obs_radii = observations.norm(dim=-1)

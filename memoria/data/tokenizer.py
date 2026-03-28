@@ -50,7 +50,9 @@ def _load_tokenizer(name: str, vocab_size: int | None):
         tokenizer.pad_token = tokenizer.eos_token
 
     if vocab_size is not None and len(tokenizer) > vocab_size:
-        print(f"WARNING: Tokenizer {name} vocab ({len(tokenizer)}) exceeds config vocab_size ({vocab_size}). "
-              f"Update TransformerConfig.vocab_size to match.")
+        raise ValueError(
+            f"Tokenizer {name} vocab ({len(tokenizer)}) exceeds config vocab_size ({vocab_size}). "
+            f"Update TransformerConfig.vocab_size to match."
+        )
 
     return tokenizer

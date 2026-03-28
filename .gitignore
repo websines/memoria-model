@@ -19,8 +19,8 @@ checkpoints/
 runs/
 wandb/
 
-# Data
-data/
+# Data (top-level only, not memoria/data/ source code)
+/data/
 *.bin
 *.npy
 *.npz

@@ -41,7 +41,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'params': embedding_params,
             'lr': tc.embedding_lr,
             'betas': betas,
-            'eps': 1e-10,
+            'eps': 1e-8,
             'weight_decay': 0.0,
         })
 
@@ -52,7 +52,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'params': lm_head_params,
             'lr': tc.unembedding_lr,
             'betas': betas,
-            'eps': 1e-10,
+            'eps': 1e-8,
             'weight_decay': 0.0,
         })
 
@@ -62,7 +62,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
         'params': scalar_params,
         'lr': tc.scalar_lr,
         'betas': betas,
-        'eps': 1e-10,
+        'eps': 1e-8,
         'weight_decay': 0.0,
     })
 
@@ -78,7 +78,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'params': matrix_params,
             'lr': tc.matrix_lr,
             'betas': betas,
-            'eps': 1e-10,
+            'eps': 1e-8,
             'weight_decay': tc.weight_decay,
         })
 
@@ -89,7 +89,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'params': interface_params,
             'lr': tc.interface_lr,
             'betas': betas,
-            'eps': 1e-10,
+            'eps': 1e-8,
             'weight_decay': 0.0,
         })
 

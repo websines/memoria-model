@@ -102,6 +102,8 @@ def _tokenize_stream(
     """
     buffer = []
     eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        eos_id = tokenizer.vocab_size - 1
 
     for example in dataset:
         text = example.get(text_key, "")

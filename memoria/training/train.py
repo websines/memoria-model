@@ -195,9 +195,9 @@ def train(
             loss = result['loss'] / grad_accum
             loss.backward()
 
-            total_loss += result['loss'].item()
-            total_loss_token += result['loss_token'].item()
-            total_loss_fe += result['loss_fe'].item()
+            total_loss += loss.item()
+            total_loss_token += result['loss_token'].item() / grad_accum
+            total_loss_fe += result['loss_fe'].item() / grad_accum
             all_candidates.extend(result['candidates'])
 
         if step == 0:
@@ -208,7 +208,7 @@ def train(
         model.zero_grad(set_to_none=True)
 
         # Fast fail
-        if math.isnan(total_loss) or total_loss > 100 * grad_accum:
+        if math.isnan(total_loss) or total_loss > 100:
             print(f"\nFAIL: loss exploded at step {step}: {total_loss}")
             break
 
@@ -237,17 +237,17 @@ def train(
 
         # Logging
         ema = 0.9
-        smooth_loss = ema * smooth_loss + (1 - ema) * (total_loss / grad_accum)
-        smooth_loss_token = ema * smooth_loss_token + (1 - ema) * (total_loss_token / grad_accum)
-        smooth_loss_fe = ema * smooth_loss_fe + (1 - ema) * (total_loss_fe / grad_accum)
+        smooth_loss = ema * smooth_loss + (1 - ema) * total_loss
+        smooth_loss_token = ema * smooth_loss_token + (1 - ema) * total_loss_token
+        smooth_loss_fe = ema * smooth_loss_fe + (1 - ema) * total_loss_fe
         debiased = smooth_loss / (1 - ema ** (step - start_step + 1))
 
         if step % tc.log_interval == 0:
             phase = "P1" if alpha == 0 else ("P2" if alpha < tc.alpha_max else "P3")
             print(
                 f"\rstep {step:05d} [{phase}] | "
-                f"loss: {debiased:.4f} (tok: {smooth_loss_token / (1 - ema ** (step + 1)):.4f}, "
-                f"fe: {smooth_loss_fe / (1 - ema ** (step + 1)):.4f}) | "
+                f"loss: {debiased:.4f} (tok: {smooth_loss_token / (1 - ema ** (step - start_step + 1)):.4f}, "
+                f"fe: {smooth_loss_fe / (1 - ema ** (step - start_step + 1)):.4f}) | "
                 f"α: {alpha:.4f} | β: {pass2_stats['beta']:.3f} | "
                 f"beliefs: {pass2_stats['active_beliefs']} | "
                 f"edges: {pass2_stats['active_edges']} | "
@@ -260,9 +260,9 @@ def train(
             import wandb
             wandb.log({
                 'step': step,
-                'loss': total_loss / grad_accum,
-                'loss_token': total_loss_token / grad_accum,
-                'loss_fe': total_loss_fe / grad_accum,
+                'loss': total_loss,
+                'loss_token': total_loss_token,
+                'loss_fe': total_loss_fe,
                 'alpha': alpha,
                 'beta': pass2_stats['beta'],
                 'lr_mult': lr_mult,
@@ -292,6 +292,9 @@ def train(
         # Periodic GC
         if (step + 1) % 5000 == 0:
             gc.collect()
+
+    # Re-enable GC after training loop
+    gc.enable()
 
     print(f"\nTraining complete. {step + 1} steps, {total_training_time:.1f}s training time.")
 

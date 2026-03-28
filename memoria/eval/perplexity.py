@@ -66,7 +66,7 @@ def evaluate_perplexity(
 
     avg_loss = total_loss / max(total_tokens, 1)
     perplexity = math.exp(min(avg_loss, 100))  # cap to avoid overflow
-    bits_per_byte = avg_loss / math.log(2) * 0.29  # approximate BPB
+    bits_per_byte = avg_loss / (8 * math.log(2))  # nats-per-token → bits-per-byte
 
     return {
         'perplexity': perplexity,

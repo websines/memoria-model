@@ -55,8 +55,8 @@ class CognitiveState(nn.Module):
 
         # ── Relation Region ──
         # Hard indices (source, target) + soft relation vector + soft weight
-        self.edge_src = torch.zeros(config.max_edges, dtype=torch.long)
-        self.edge_tgt = torch.zeros(config.max_edges, dtype=torch.long)
+        self.register_buffer('edge_src', torch.zeros(config.max_edges, dtype=torch.long))
+        self.register_buffer('edge_tgt', torch.zeros(config.max_edges, dtype=torch.long))
         self.edge_relations = nn.Parameter(
             torch.zeros(config.max_edges, config.relation_dim),
             requires_grad=False,
@@ -66,7 +66,7 @@ class CognitiveState(nn.Module):
             requires_grad=False,
         )
         # Track which edges are active (allocated)
-        self.edge_active = torch.zeros(config.max_edges, dtype=torch.bool)
+        self.register_buffer('edge_active', torch.zeros(config.max_edges, dtype=torch.bool))
 
         # ── Goal Region (Telos) ──
         # Goal embedding (same space as beliefs) + metadata

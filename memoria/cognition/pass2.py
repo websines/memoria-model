@@ -67,16 +67,30 @@ def run_pass2(
     stats.update({f'belief_{k}': v for k, v in update_stats.items()})
 
     # Collect indices and surprises of updated beliefs (for goal progress + Hebbian)
+    # For new allocations, find the slot that was just assigned by scanning active beliefs
     updated_indices = []
     surprise_values = []
+    new_alloc_count = 0
     for sr in surprise_results:
         if sr.slot >= 0:
             updated_indices.append(sr.slot)
             surprise_values.append(sr.surprise)
-        elif sr.is_new and update_stats['new_allocations'] > 0:
-            # New allocation — the slot was just assigned
-            # We don't track the exact slot here, but the belief is in the state
-            pass
+        elif sr.is_new and new_alloc_count < update_stats['new_allocations']:
+            # New allocation — find the most recently allocated slot matching this observation
+            active_mask = state.get_active_mask()
+            active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
+            if len(active_indices) > 0:
+                import torch
+                sims = torch.nn.functional.cosine_similarity(
+                    state.beliefs.data[active_indices],
+                    sr.observation.unsqueeze(0),
+                    dim=-1,
+                )
+                best_local = sims.argmax().item()
+                slot = active_indices[best_local].item()
+                updated_indices.append(slot)
+                surprise_values.append(sr.surprise)
+                new_alloc_count += 1
 
     # 3. Hebbian edge strengthening
     co_activations = extract_co_activations(state, read_belief_indices)

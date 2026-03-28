@@ -143,5 +143,30 @@ def _redirect_edges(state: CognitiveState, from_idx: int, to_idx: int):
         elif tgt == from_idx:
             state.edge_tgt[eidx] = to_idx
 
-    # TODO: deduplicate edges that now connect the same pair
-    # For now, duplicates just both contribute to message passing (harmless)
+    # Deduplicate edges that now connect the same pair
+    _deduplicate_edges(state)
+
+
+def _deduplicate_edges(state: CognitiveState):
+    """Remove duplicate edges (same src-tgt pair), keeping the stronger one."""
+    if not state.edge_active.any():
+        return
+
+    active_edges = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
+    seen = {}  # (min_idx, max_idx) → edge_slot with highest weight
+
+    for eidx in active_edges.tolist():
+        src = state.edge_src[eidx].item()
+        tgt = state.edge_tgt[eidx].item()
+        key = (min(src, tgt), max(src, tgt))
+        weight = state.edge_weights.data[eidx].item()
+
+        if key in seen:
+            prev_eidx, prev_weight = seen[key]
+            if weight > prev_weight:
+                state.deallocate_edge(prev_eidx)
+                seen[key] = (eidx, weight)
+            else:
+                state.deallocate_edge(eidx)
+        else:
+            seen[key] = (eidx, weight)
