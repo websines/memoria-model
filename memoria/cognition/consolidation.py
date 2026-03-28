@@ -22,9 +22,8 @@ def soft_consolidation(
 ) -> int:
     """Merge very similar active beliefs (differentiable-friendly).
 
-    For each pair of active beliefs with cosine_sim > threshold:
-    - Merge into the higher-precision one using precision_weighted_average
-    - Zero the lower-precision one (free the slot)
+    Vectorized: computes full similarity matrix and extracts merge pairs with
+    torch.nonzero instead of nested Python loops.
 
     Args:
         state: cognitive state
@@ -47,43 +46,54 @@ def soft_consolidation(
     # Pairwise cosine similarity
     sim_matrix = angles @ angles.T  # [N, N]
 
+    # Mask: upper triangle only, above threshold, neither immutable
+    immutable_local = state.immutable_beliefs[active_indices]
+    # Zero out pairs involving immutable beliefs
+    immutable_row = immutable_local.unsqueeze(1).expand_as(sim_matrix)
+    immutable_col = immutable_local.unsqueeze(0).expand_as(sim_matrix)
+    eligible = ~(immutable_row | immutable_col)
+
+    # Upper triangle + threshold + eligible
+    upper = torch.triu(torch.ones(n, n, dtype=torch.bool, device=sim_matrix.device), diagonal=1)
+    merge_mask = upper & (sim_matrix > similarity_threshold) & eligible
+
+    if not merge_mask.any():
+        return 0
+
+    # Get all merge pairs at once
+    pairs = merge_mask.nonzero(as_tuple=False)  # [P, 2] local indices
+
     merged = 0
     merged_set = set()
 
     with torch.no_grad():
-        for i in range(n):
-            if i in merged_set:
+        for p in range(pairs.shape[0]):
+            i = pairs[p, 0].item()
+            j = pairs[p, 1].item()
+
+            if i in merged_set or j in merged_set:
                 continue
+
             idx_i = active_indices[i].item()
-            if state.immutable_beliefs[idx_i]:
-                continue
+            idx_j = active_indices[j].item()
 
-            for j in range(i + 1, n):
-                if j in merged_set:
-                    continue
-                idx_j = active_indices[j].item()
-                if state.immutable_beliefs[idx_j]:
-                    continue
+            # Merge j into i (keep i, free j)
+            pair_angles = torch.stack([angles[i], angles[j]])
+            pair_radii = torch.stack([radii[i], radii[j]])
+            new_angle, new_radius = precision_weighted_average(pair_angles, pair_radii, dim=0)
 
-                if sim_matrix[i, j] > similarity_threshold:
-                    # Merge j into i (keep i, free j)
-                    pair_angles = torch.stack([angles[i], angles[j]])
-                    pair_radii = torch.stack([radii[i], radii[j]])
-                    new_angle, new_radius = precision_weighted_average(pair_angles, pair_radii, dim=0)
+            state.beliefs.data[idx_i] = new_angle * new_radius
+            state.beliefs.data[idx_j].zero_()  # free slot
 
-                    state.beliefs.data[idx_i] = new_angle * new_radius
-                    state.beliefs.data[idx_j].zero_()  # free slot
+            # Redirect edges from j to i
+            _redirect_edges(state, from_idx=idx_j, to_idx=idx_i)
 
-                    # Redirect edges from j to i
-                    _redirect_edges(state, from_idx=idx_j, to_idx=idx_i)
+            merged_set.add(j)
+            merged += 1
 
-                    merged_set.add(j)
-                    merged += 1
-
-                    # Update local tracking
-                    radii[i] = new_radius
-                    angles[i] = new_angle
-                    break  # only merge one partner per belief per pass
+            # Update local tracking
+            radii[i] = new_radius
+            angles[i] = new_angle
 
     return merged
 
@@ -94,7 +104,7 @@ def periodic_hard_cleanup(
 ) -> int:
     """Periodic hard consolidation: remove very low-precision beliefs.
 
-    Non-differentiable. Run every N sequences. Frees slots for new knowledge.
+    Vectorized: uses tensor masks instead of per-belief Python loop.
 
     Args:
         state: cognitive state
@@ -109,43 +119,46 @@ def periodic_hard_cleanup(
 
     radii = state.get_belief_radii()
     access_counts = state.belief_access_count
-    removed = 0
+
+    # Vectorized: find all removable beliefs at once
+    removable = (
+        active_mask
+        & ~state.immutable_beliefs
+        & (radii < low_precision_threshold)
+        & (access_counts < 3)
+    )
+
+    if not removable.any():
+        return 0
+
+    remove_indices = removable.nonzero(as_tuple=False).squeeze(-1)
+    removed = len(remove_indices)
 
     with torch.no_grad():
-        for i in range(state.config.max_beliefs):
-            if not active_mask[i]:
-                continue
-            if state.immutable_beliefs[i]:
-                continue
-            # Low precision AND never/rarely accessed → remove
-            if radii[i].item() < low_precision_threshold and access_counts[i].item() < 3:
-                state.deallocate_belief(i)
-                removed += 1
+        for idx in remove_indices.tolist():
+            state.deallocate_belief(idx)
 
     return removed
 
 
 def _redirect_edges(state: CognitiveState, from_idx: int, to_idx: int):
-    """Redirect all edges pointing to from_idx to point to to_idx instead.
-
-    If an edge would create a duplicate (to_idx already connected to the same
-    neighbor), keep the stronger edge and drop the weaker one.
-    """
+    """Redirect all edges pointing to from_idx to point to to_idx instead."""
     if not state.edge_active.any():
         return
 
     active_edges = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
+    srcs = state.edge_src[active_edges]
+    tgts = state.edge_tgt[active_edges]
 
-    for eidx in active_edges.tolist():
-        src = state.edge_src[eidx].item()
-        tgt = state.edge_tgt[eidx].item()
+    # Vectorized redirect
+    src_match = srcs == from_idx
+    tgt_match = tgts == from_idx
+    if src_match.any():
+        state.edge_src[active_edges[src_match]] = to_idx
+    if tgt_match.any():
+        state.edge_tgt[active_edges[tgt_match]] = to_idx
 
-        if src == from_idx:
-            state.edge_src[eidx] = to_idx
-        elif tgt == from_idx:
-            state.edge_tgt[eidx] = to_idx
-
-    # Deduplicate edges that now connect the same pair
+    # Deduplicate
     _deduplicate_edges(state)
 
 
@@ -155,20 +168,29 @@ def _deduplicate_edges(state: CognitiveState):
         return
 
     active_edges = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
-    seen = {}  # (min_idx, max_idx) → edge_slot with highest weight
+    if len(active_edges) <= 1:
+        return
 
-    for eidx in active_edges.tolist():
-        src = state.edge_src[eidx].item()
-        tgt = state.edge_tgt[eidx].item()
-        key = (min(src, tgt), max(src, tgt))
-        weight = state.edge_weights.data[eidx].item()
+    srcs = state.edge_src[active_edges]
+    tgts = state.edge_tgt[active_edges]
+    weights = state.edge_weights.data[active_edges]
+
+    # Canonical key: (min, max) for undirected dedup
+    mins = torch.min(srcs, tgts)
+    maxs = torch.max(srcs, tgts)
+
+    seen: dict[tuple[int, int], tuple[int, float]] = {}
+    for i in range(len(active_edges)):
+        key = (mins[i].item(), maxs[i].item())
+        eidx = active_edges[i].item()
+        w = weights[i].item()
 
         if key in seen:
-            prev_eidx, prev_weight = seen[key]
-            if weight > prev_weight:
+            prev_eidx, prev_w = seen[key]
+            if w > prev_w:
                 state.deallocate_edge(prev_eidx)
-                seen[key] = (eidx, weight)
+                seen[key] = (eidx, w)
             else:
                 state.deallocate_edge(eidx)
         else:
-            seen[key] = (eidx, weight)
+            seen[key] = (eidx, w)

@@ -29,6 +29,9 @@ from .consolidation import soft_consolidation, periodic_hard_cleanup
 from .meta_learning import compute_beta, spsa_step, apply_sequence_boundary_decay
 
 
+MAX_CANDIDATES = 1024  # safety valve: subsample if too many candidates
+
+
 def run_pass2(
     state: CognitiveState,
     candidates: list[WriteCandidate],
@@ -38,6 +41,7 @@ def run_pass2(
     consolidation_interval: int = 50,
     spsa_interval: int = 100,
     temperature: float = 5.0,
+    max_candidates: int = MAX_CANDIDATES,
 ) -> dict:
     """Run the full pass 2 cognitive update loop.
 
@@ -50,6 +54,7 @@ def run_pass2(
         consolidation_interval: run consolidation every N steps
         spsa_interval: run SPSA every N steps
         temperature: for free energy computation
+        max_candidates: subsample candidates if exceeding this count
 
     Returns:
         dict with statistics from all sub-operations
@@ -57,6 +62,11 @@ def run_pass2(
     stats = {
         'step': current_step,
     }
+
+    # Subsample candidates if too many (safety valve)
+    if len(candidates) > max_candidates:
+        import random
+        candidates = random.sample(candidates, max_candidates)
 
     # 1. Surprise computation
     surprise_results = compute_surprise_batch(candidates, state)
@@ -69,30 +79,41 @@ def run_pass2(
     stats.update({f'belief_{k}': v for k, v in update_stats.items()})
 
     # Collect indices and surprises of updated beliefs (for goal progress + Hebbian)
-    # For new allocations, find the slot that was just assigned by scanning active beliefs
+    # For existing slots: direct from surprise results
+    # For new allocations: batch cosine similarity search
     updated_indices = []
     surprise_values = []
-    new_alloc_count = 0
+    new_observations = []
+    new_surprises = []
+
     for sr in surprise_results:
         if sr.slot >= 0:
             updated_indices.append(sr.slot)
             surprise_values.append(sr.surprise)
-        elif sr.is_new and new_alloc_count < update_stats['new_allocations']:
-            # New allocation — find the most recently allocated slot matching this observation
-            active_mask = state.get_active_mask()
-            active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
-            if len(active_indices) > 0:
-                import torch
-                sims = torch.nn.functional.cosine_similarity(
-                    state.beliefs.data[active_indices],
-                    sr.observation.unsqueeze(0),
-                    dim=-1,
-                )
-                best_local = sims.argmax().item()
-                slot = active_indices[best_local].item()
-                updated_indices.append(slot)
-                surprise_values.append(sr.surprise)
-                new_alloc_count += 1
+        elif sr.is_new:
+            new_observations.append(sr.observation)
+            new_surprises.append(sr.surprise)
+
+    # Batch-find slots for newly allocated beliefs
+    n_new = min(len(new_observations), update_stats['new_allocations'])
+    if n_new > 0:
+        import torch
+        active_mask = state.get_active_mask()
+        active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
+        if len(active_indices) > 0:
+            active_beliefs = state.beliefs.data[active_indices]  # [A, D]
+            new_obs_t = torch.stack(new_observations[:n_new])    # [K, D]
+            # Batch cosine similarity: [K, A]
+            sims = torch.nn.functional.cosine_similarity(
+                new_obs_t.unsqueeze(1),       # [K, 1, D]
+                active_beliefs.unsqueeze(0),  # [1, A, D]
+                dim=-1,
+            )
+            best_local = sims.argmax(dim=-1)  # [K]
+            best_slots = active_indices[best_local]  # [K]
+            for i in range(n_new):
+                updated_indices.append(best_slots[i].item())
+                surprise_values.append(new_surprises[i])
 
     # 3. Causal edge learning (temporal surprise precedence → directed edges)
     causal_stats = causal_edge_learning(state, updated_indices, surprise_values)

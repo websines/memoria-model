@@ -19,8 +19,11 @@ import gc
 import math
 import os
 import time
+import threading
+import queue
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext
 from pathlib import Path
 
 from ..model.config import MemoriaConfig
@@ -36,6 +39,40 @@ from .distributed import (
     broadcast_state, gather_candidates, sync_ranks, setup_device, get_batch_to_device,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
+
+
+class DataPrefetcher:
+    """Background thread that prefetches batches from a data stream.
+
+    Keeps a queue of ready-to-go batches so the training loop never waits
+    on data loading. Batches are stacked to [B, T] and moved to the target device.
+    """
+
+    def __init__(self, data_stream, batch_size: int, device: torch.device, prefetch_count: int = 2):
+        self.stream = data_stream
+        self.batch_size = batch_size
+        self.device = device
+        self.queue = queue.Queue(maxsize=prefetch_count)
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        try:
+            while not self.stop_event.is_set():
+                seqs = [next(self.stream) for _ in range(self.batch_size)]
+                input_ids = torch.stack([s['input_ids'] for s in seqs])
+                labels = torch.stack([s['labels'] for s in seqs])
+                self.queue.put((input_ids, labels))
+        except StopIteration:
+            pass
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        input_ids, labels = self.queue.get()
+        return input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
+
+    def stop(self):
+        self.stop_event.set()
 
 
 def _load_env():
@@ -152,8 +189,8 @@ def train(
     total_training_time = 0.0
 
     # Gradient accumulation
-    tokens_per_step = tc.device_batch_size * config.transformer.sequence_len
-    grad_accum = max(1, tc.total_batch_size // tokens_per_step)
+    tokens_per_micro = tc.device_batch_size * config.transformer.sequence_len
+    grad_accum = max(1, tc.total_batch_size // tokens_per_micro)
 
     if is_main:
         print(f"Training: {max_steps} steps, grad_accum={grad_accum}, "
@@ -162,13 +199,27 @@ def train(
         print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
         print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
 
-    # Prefetch first batch (this can take a while on first stream access)
+    # Background data prefetcher (loads + stacks batches in a separate thread)
     if is_main:
-        print("Prefetching first batch (downloading initial data shard)...", flush=True)
-    first_batch = next(data_stream)
+        print("Starting data prefetcher (downloading initial data shard)...", flush=True)
+    prefetcher = DataPrefetcher(data_stream, tc.device_batch_size, device, prefetch_count=3)
     if is_main:
-        print(f"First batch ready. input_ids shape: {first_batch['input_ids'].shape}")
-    prefetched = first_batch
+        print(f"Prefetcher ready. Batch size: {tc.device_batch_size}")
+
+    # torch.compile for fused kernels (skip if not available)
+    use_compile = hasattr(torch, 'compile') and torch.cuda.is_available()
+    if use_compile:
+        try:
+            model = torch.compile(model)
+            if is_main:
+                print("torch.compile enabled")
+        except Exception as e:
+            if is_main:
+                print(f"torch.compile not available: {e}")
+            use_compile = False
+
+    # DDP no_sync context for gradient accumulation
+    has_no_sync = hasattr(model, 'no_sync')
 
     # GC management (from autoresearch — prevents Python GC stalls)
     gc.collect()
@@ -199,22 +250,20 @@ def train(
             if step == 0 and is_main:
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
-            # Get batch (use prefetched if available)
-            if prefetched is not None:
-                batch = prefetched
-                prefetched = None
-            else:
-                batch = next(data_stream)
-            input_ids = batch['input_ids'].unsqueeze(0).to(device)  # [1, T]
-            labels = batch['labels'].unsqueeze(0).to(device)
+            # Get pre-stacked, pre-transferred batch from prefetcher
+            input_ids, labels = prefetcher.next_batch()
 
-            # Forward through DDP wrapper (syncs gradients), loss on base model
-            with autocast_ctx:
-                fwd = model(input_ids, targets=labels)  # DDP-wrapped forward()
-                result = base_model.compute_loss_from_forward(fwd, input_ids, labels, alpha=alpha)
+            # DDP no_sync for all but last micro-step (avoids redundant allreduce)
+            is_last_micro = (micro_step == grad_accum - 1)
+            sync_ctx = nullcontext() if (is_last_micro or not has_no_sync) else model.no_sync()
 
-            loss = result['loss'] / grad_accum
-            loss.backward()
+            with sync_ctx:
+                with autocast_ctx:
+                    fwd = model(input_ids, targets=labels)
+                    result = base_model.compute_loss_from_forward(fwd, input_ids, labels, alpha=alpha)
+
+                loss = result['loss'] / grad_accum
+                loss.backward()
 
             total_loss += loss.item()
             total_loss_token += result['loss_token'].item() / grad_accum
@@ -329,7 +378,8 @@ def train(
         if (step + 1) % 5000 == 0:
             gc.collect()
 
-    # Re-enable GC after training loop
+    # Cleanup
+    prefetcher.stop()
     gc.enable()
 
     if is_main:

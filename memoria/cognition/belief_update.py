@@ -26,11 +26,8 @@ def apply_belief_updates(
 ) -> dict:
     """Apply all belief updates from surprise results.
 
-    For each result:
-    - If reconsolidate: fully rewrite the belief to the observation
-    - If incremental: shift belief angle toward observation by gain, adjust radius
-    - If new: allocate a new belief slot
-    - Kernel rules respected: immutable beliefs skip updates
+    Vectorized: groups updates by type (new/reconsolidate/incremental) and
+    applies them as batched tensor operations.
 
     Args:
         surprise_results: computed surprise for each write candidate
@@ -48,69 +45,111 @@ def apply_belief_updates(
         'total_surprise': 0.0,
     }
 
+    if not surprise_results:
+        return stats
+
+    device = state.beliefs.device
+
+    # Classify all results into groups
+    new_obs = []
+    recon_slots = []
+    recon_obs = []
+    incr_slots = []
+    incr_obs = []
+    incr_gains = []
+    incr_surprises = []
+
+    total_surprise = 0.0
+    for sr in surprise_results:
+        total_surprise += sr.surprise
+        if sr.is_new:
+            new_obs.append(sr.observation)
+        elif sr.should_reconsolidate:
+            recon_slots.append(sr.slot)
+            recon_obs.append(sr.observation)
+        else:
+            incr_slots.append(sr.slot)
+            incr_obs.append(sr.observation)
+            incr_gains.append(sr.gain)
+            incr_surprises.append(sr.surprise)
+
+    stats['total_surprise'] = total_surprise
+
     with torch.no_grad():
-        for sr in surprise_results:
-            stats['total_surprise'] += sr.surprise
+        # ── Batch reconsolidations ──
+        if recon_slots:
+            slots_t = torch.tensor(recon_slots, dtype=torch.long, device=device)
+            obs_t = torch.stack(recon_obs).to(device)
 
-            if sr.is_new:
-                # Allocate new belief
-                slot = state.allocate_belief(sr.observation)
-                if slot == -1:
-                    # Full — evict lowest-precision non-immutable belief
-                    slot = _evict_weakest(state)
-                    if slot >= 0:
-                        state.beliefs.data[slot] = sr.observation
-                        stats['evictions'] += 1
-                    # If still -1, we can't allocate (all immutable). Skip.
-                else:
-                    stats['new_allocations'] += 1
+            # Filter out immutable beliefs
+            immutable = state.immutable_beliefs[slots_t]
+            mutable = ~immutable
+            n_blocked = immutable.sum().item()
+            stats['blocked_by_kernel'] += n_blocked
 
-            elif sr.should_reconsolidate:
-                # Full reconsolidation: rewrite belief to observation
-                if state.immutable_beliefs[sr.slot]:
-                    stats['blocked_by_kernel'] += 1
-                    continue
+            if mutable.any():
+                m_slots = slots_t[mutable]
+                m_obs = obs_t[mutable]
+                state.beliefs.data[m_slots] = m_obs
+                stats['reconsolidations'] = mutable.sum().item()
 
-                state.beliefs.data[sr.slot] = sr.observation
-                stats['reconsolidations'] += 1
+        # ── Batch incremental updates ──
+        if incr_slots:
+            slots_t = torch.tensor(incr_slots, dtype=torch.long, device=device)
+            obs_t = torch.stack(incr_obs).to(device)
+            gains_t = torch.tensor(incr_gains, device=device)
+            surprises_t = torch.tensor(incr_surprises, device=device)
 
-            else:
-                # Incremental update: shift angle by gain, adjust radius
-                if state.immutable_beliefs[sr.slot]:
-                    stats['blocked_by_kernel'] += 1
-                    continue
+            # Filter out immutable
+            immutable = state.immutable_beliefs[slots_t]
+            mutable = ~immutable
+            stats['blocked_by_kernel'] += immutable.sum().item()
 
-                existing = state.beliefs.data[sr.slot]
-                existing_radius = existing.norm().clamp(min=EPSILON)
-                existing_angle = existing / existing_radius
+            if mutable.any():
+                m_slots = slots_t[mutable]
+                m_obs = obs_t[mutable]
+                m_gains = gains_t[mutable]
+                m_surprises = surprises_t[mutable]
 
-                obs = sr.observation
-                obs_radius = obs.norm().clamp(min=EPSILON)
-                obs_angle = obs / obs_radius
+                existing = state.beliefs.data[m_slots]  # [K, D]
+                existing_radii = existing.norm(dim=-1).clamp(min=EPSILON)  # [K]
+                existing_angles = existing / existing_radii.unsqueeze(-1)  # [K, D]
 
-                gain = sr.gain
+                obs_radii = m_obs.norm(dim=-1).clamp(min=EPSILON)
+                obs_angles = m_obs / obs_radii.unsqueeze(-1)
 
                 # Angle update: interpolate toward observation
-                new_angle = (1.0 - gain) * existing_angle + gain * obs_angle
-                new_angle = torch.nn.functional.normalize(new_angle, dim=0, eps=EPSILON)
+                g = m_gains.unsqueeze(-1)  # [K, 1]
+                new_angles = (1.0 - g) * existing_angles + g * obs_angles
+                new_angles = torch.nn.functional.normalize(new_angles, dim=-1, eps=EPSILON)
 
-                # Radius update: consistent updates increase precision,
-                # contradictory updates decrease it
-                if sr.surprise < 0.5:
-                    # Low surprise (agreement) → precision increases (diminishing returns)
-                    headroom = max(0.0, 1.0 - existing_radius / 10.0)  # saturate near 10
-                    new_radius = existing_radius + 0.1 * obs_radius * (1.0 - sr.surprise) * headroom
-                else:
-                    # High surprise (disagreement) → precision decreases
-                    new_radius = existing_radius * (1.0 - gain * 0.5)
+                # Radius update
+                low_surprise = m_surprises < 0.5
+                headroom = (1.0 - existing_radii / 10.0).clamp(min=0.0)
+                # Agreement: precision increases (diminishing returns)
+                r_agree = existing_radii + 0.1 * obs_radii * (1.0 - m_surprises) * headroom
+                # Disagreement: precision decreases
+                r_disagree = existing_radii * (1.0 - m_gains * 0.5)
 
-                new_radius = new_radius.clamp(min=EPSILON, max=100.0)
+                new_radii = torch.where(low_surprise, r_agree, r_disagree)
+                new_radii = new_radii.clamp(min=EPSILON, max=100.0)
 
-                state.beliefs.data[sr.slot] = new_angle * new_radius
-                stats['incremental_updates'] += 1
+                state.beliefs.data[m_slots] = new_angles * new_radii.unsqueeze(-1)
+                stats['incremental_updates'] = mutable.sum().item()
+
+        # ── New belief allocations ──
+        for obs in new_obs:
+            slot = state.allocate_belief(obs)
+            if slot == -1:
+                slot = _evict_weakest(state)
+                if slot >= 0:
+                    state.beliefs.data[slot] = obs
+                    stats['evictions'] += 1
+            else:
+                stats['new_allocations'] += 1
 
         # Update accumulated surprise in meta region
-        state.meta.data[1] += stats['total_surprise']
+        state.meta.data[1] += total_surprise
 
     return stats
 
@@ -127,12 +166,9 @@ def _evict_weakest(state: CognitiveState) -> int:
     radii = state.get_belief_radii()
     active = state.get_active_mask()
 
-    # Recency factor: beliefs accessed recently get a survival boost
-    # access_count of 0 → factor 1.0 (no boost), higher count → higher factor
     recency = state.belief_access_count.clamp(min=0)
-    recency_factor = 1.0 + 0.1 * recency  # each access adds 10% survival bonus
+    recency_factor = 1.0 + 0.1 * recency
 
-    # Score: higher = more worth keeping. Low radius + stale = evict first.
     scores = radii * recency_factor
     scores[~active] = float('inf')
     scores[state.immutable_beliefs] = float('inf')

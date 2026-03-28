@@ -41,6 +41,22 @@ def build_adjacency(state: CognitiveState) -> dict[int, list[tuple[int, float]]]
     return adj
 
 
+def _build_edge_index(state: CognitiveState) -> dict[tuple[int, int], int]:
+    """Build (src, tgt) → edge_slot hash map for O(1) edge lookups.
+
+    Only includes active edges.
+    """
+    index = {}
+    if not state.edge_active.any():
+        return index
+    active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
+    srcs = state.edge_src[active_idx]
+    tgts = state.edge_tgt[active_idx]
+    for i, eidx in enumerate(active_idx.tolist()):
+        index[(srcs[i].item(), tgts[i].item())] = eidx
+    return index
+
+
 def d_separated(
     state: CognitiveState,
     source: int,
@@ -183,17 +199,6 @@ def intervene(
 # Distinct from Hebbian: Hebbian is undirected co-activation, causal is directed temporal precedence.
 
 
-def _find_directed_edge(state: CognitiveState, src: int, tgt: int) -> int:
-    """Find a directed edge from src to tgt. Returns edge index or -1."""
-    if not state.edge_active.any():
-        return -1
-    active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
-    for eidx in active_idx.tolist():
-        if state.edge_src[eidx].item() == src and state.edge_tgt[eidx].item() == tgt:
-            return eidx
-    return -1
-
-
 def causal_edge_learning(
     state: CognitiveState,
     updated_indices: list[int],
@@ -203,11 +208,8 @@ def causal_edge_learning(
 ) -> dict:
     """Learn directed causal edges from temporal surprise patterns.
 
-    When belief A is updated with surprise at step t and belief B at step t+1,
-    this suggests A→B causation. Edge strength accumulates via Bayesian posterior
-    averaging over repeated observations.
-
-    Uses belief_prev_surprise buffer to track the previous step's surprises.
+    Vectorized: builds edge index hash for O(1) lookups, caps the cross-product
+    of (prev × curr) pairs, and batches edge decay.
 
     Args:
         state: cognitive state (modified in-place)
@@ -226,83 +228,102 @@ def causal_edge_learning(
         prev_updated = (prev_surprise > EPSILON).nonzero(as_tuple=False).squeeze(-1)
 
         if len(prev_updated) > 0 and len(updated_indices) > 0:
-            # Build current update map
-            curr_map = {}
-            for idx, s in zip(updated_indices, surprise_values):
-                if s > EPSILON:
-                    curr_map[idx] = s
+            # Build edge index once for O(1) lookups
+            edge_index = _build_edge_index(state)
 
-            reinforced = set()
+            # Build current update map — filter by EPSILON
+            curr_map = {idx: s for idx, s in zip(updated_indices, surprise_values) if s > EPSILON}
 
-            for prev_idx in prev_updated.tolist():
-                prev_s = prev_surprise[prev_idx].item()
+            if not curr_map:
+                # No meaningful current updates; skip to decay + store
+                pass
+            else:
+                reinforced = set()
 
-                for curr_idx, curr_s in curr_map.items():
-                    if prev_idx == curr_idx:
-                        continue
+                # Pre-fetch belief angles once (used for relation vectors)
+                belief_angles = state.get_belief_angles()
 
-                    # Causal signal: geometric mean of consecutive surprises
-                    signal = (prev_s * curr_s) ** 0.5
-                    if signal < min_signal:
-                        continue
+                K = state.config.relation_dim
+                D = min(K, state.config.belief_dim)
 
-                    edge_idx = _find_directed_edge(state, prev_idx, curr_idx)
+                for prev_idx in prev_updated.tolist():
+                    prev_s = prev_surprise[prev_idx].item()
 
-                    if edge_idx >= 0:
-                        # Bayesian posterior update: running average weighted by observation count
-                        obs = state.edge_causal_obs[edge_idx].item()
-                        obs = max(obs, 1.0)
-                        old_w = state.edge_weights.data[edge_idx].item()
-                        new_w = (old_w * obs + signal) / (obs + 1.0)
+                    for curr_idx, curr_s in curr_map.items():
+                        if prev_idx == curr_idx:
+                            continue
 
-                        state.edge_weights.data[edge_idx] = min(new_w, 1.0)
-                        state.edge_causal_obs[edge_idx] = obs + 1.0
+                        signal = (prev_s * curr_s) ** 0.5
+                        if signal < min_signal:
+                            continue
 
-                        # Update relation vector: running average of cause→effect delta
-                        K = state.config.relation_dim
-                        D = min(K, state.config.belief_dim)
-                        cause_angle = state.get_belief_angles()[prev_idx]
-                        effect_angle = state.get_belief_angles()[curr_idx]
-                        new_rel = torch.zeros(K, device=state.beliefs.device)
-                        new_rel[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
-                        alpha = 1.0 / (obs + 1.0)
-                        state.edge_relations.data[edge_idx] = (
-                            (1.0 - alpha) * state.edge_relations.data[edge_idx] + alpha * new_rel
-                        )
+                        # O(1) edge lookup via hash map
+                        edge_idx = edge_index.get((prev_idx, curr_idx), -1)
 
-                        reinforced.add(edge_idx)
-                        stats['edges_strengthened'] += 1
-                    else:
-                        # Create new directed causal edge
-                        K = state.config.relation_dim
-                        D = min(K, state.config.belief_dim)
-                        cause_angle = state.get_belief_angles()[prev_idx]
-                        effect_angle = state.get_belief_angles()[curr_idx]
-                        relation = torch.zeros(K, device=state.beliefs.device)
-                        relation[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
+                        if edge_idx >= 0:
+                            # Bayesian posterior update
+                            obs = state.edge_causal_obs[edge_idx].item()
+                            obs = max(obs, 1.0)
+                            old_w = state.edge_weights.data[edge_idx].item()
+                            new_w = (old_w * obs + signal) / (obs + 1.0)
 
-                        new_idx = state.allocate_edge(
-                            prev_idx, curr_idx, relation, weight=signal * 0.3,
-                        )
-                        if new_idx >= 0:
-                            state.edge_causal_obs[new_idx] = 1.0
-                            reinforced.add(new_idx)
-                            stats['edges_created'] += 1
+                            state.edge_weights.data[edge_idx] = min(new_w, 1.0)
+                            state.edge_causal_obs[edge_idx] = obs + 1.0
 
-            # Decay unreinforced causal edges
-            if state.edge_active.any():
-                active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
-                for eidx in active_idx.tolist():
-                    if eidx in reinforced or state.immutable_edges[eidx]:
-                        continue
-                    if state.edge_causal_obs[eidx].item() > 0:
-                        w = state.edge_weights.data[eidx].item()
-                        w *= (1.0 - decay_rate)
-                        if w < 0.01:
-                            state.deallocate_edge(eidx)
+                            # Update relation vector
+                            cause_angle = belief_angles[prev_idx]
+                            effect_angle = belief_angles[curr_idx]
+                            new_rel = torch.zeros(K, device=state.beliefs.device)
+                            new_rel[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
+                            alpha = 1.0 / (obs + 1.0)
+                            state.edge_relations.data[edge_idx] = (
+                                (1.0 - alpha) * state.edge_relations.data[edge_idx] + alpha * new_rel
+                            )
+
+                            reinforced.add(edge_idx)
+                            stats['edges_strengthened'] += 1
                         else:
-                            state.edge_weights.data[eidx] = w
-                        stats['edges_decayed'] += 1
+                            # Create new directed causal edge
+                            cause_angle = belief_angles[prev_idx]
+                            effect_angle = belief_angles[curr_idx]
+                            relation = torch.zeros(K, device=state.beliefs.device)
+                            relation[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
+
+                            new_idx = state.allocate_edge(
+                                prev_idx, curr_idx, relation, weight=signal * 0.3,
+                            )
+                            if new_idx >= 0:
+                                state.edge_causal_obs[new_idx] = 1.0
+                                reinforced.add(new_idx)
+                                edge_index[(prev_idx, curr_idx)] = new_idx
+                                stats['edges_created'] += 1
+
+                # Batch decay unreinforced causal edges
+                if state.edge_active.any():
+                    active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
+                    causal_mask = state.edge_causal_obs[active_idx] > 0
+                    immutable_mask = state.immutable_edges[active_idx]
+                    decay_mask = causal_mask & ~immutable_mask
+
+                    if decay_mask.any():
+                        decay_edges = active_idx[decay_mask]
+                        # Filter out reinforced edges
+                        reinforced_t = torch.tensor(list(reinforced), dtype=torch.long, device=decay_edges.device) if reinforced else torch.tensor([], dtype=torch.long, device=decay_edges.device)
+                        if len(reinforced_t) > 0:
+                            # Create mask for non-reinforced
+                            is_reinforced = (decay_edges.unsqueeze(-1) == reinforced_t.unsqueeze(0)).any(dim=-1)
+                            decay_edges = decay_edges[~is_reinforced]
+
+                        if len(decay_edges) > 0:
+                            weights = state.edge_weights.data[decay_edges]
+                            weights *= (1.0 - decay_rate)
+                            state.edge_weights.data[decay_edges] = weights
+                            # Deallocate edges that decayed below threshold
+                            dead = weights < 0.01
+                            if dead.any():
+                                for eidx in decay_edges[dead].tolist():
+                                    state.deallocate_edge(eidx)
+                            stats['edges_decayed'] = len(decay_edges)
 
         # Store current step's surprises for next step
         state.belief_prev_surprise.zero_()

@@ -36,7 +36,7 @@ class TransformerConfig:
 class TrainingConfig:
     """Configuration for training."""
     # Batch
-    total_batch_size: int = 2**19     # ~524K tokens per step
+    total_batch_size: int = 2**17     # ~128K tokens per step
     device_batch_size: int = 64       # per-device, adjust for VRAM
 
     # Optimizer (Muon + AdamW from autoresearch)

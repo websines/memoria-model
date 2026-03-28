@@ -14,7 +14,7 @@ from torch import Tensor
 from dataclasses import dataclass
 
 from ..core.state import CognitiveState
-from ..core.polar import angular_distance, angular_similarity, EPSILON
+from ..core.polar import EPSILON
 from ..interface.write_path import WriteCandidate
 
 
@@ -35,8 +35,8 @@ def compute_surprise_batch(
 ) -> list[SurpriseResult]:
     """Compute surprise for all write candidates against existing beliefs.
 
-    For matched candidates: surprise = angular_distance × obs_precision
-    For new candidates: surprise = obs_precision (everything is new → maximum prediction error)
+    Vectorized: batches all matched candidates into a single tensor op,
+    avoiding per-candidate Python loops and CPU-GPU syncs.
 
     Args:
         candidates: write candidates from state interface layers
@@ -48,63 +48,82 @@ def compute_surprise_batch(
     if not candidates:
         return []
 
+    N = len(candidates)
+    device = state.beliefs.device
     reconsolidation_threshold = state.reconsolidation_threshold
-    results = []
 
-    for c in candidates:
-        obs_radius = c.belief_vector.norm().item()
+    # Stack all candidate data into tensors
+    obs_all = torch.stack([c.belief_vector for c in candidates]).to(device)  # [N, D]
+    slots = torch.tensor([c.matched_slot for c in candidates], device=device)  # [N]
 
-        if c.matched_slot >= 0:
-            # Matched an existing belief — compute surprise from disagreement
-            existing = state.beliefs.data[c.matched_slot]
-            existing_radius = existing.norm().item()
+    matched_mask = slots >= 0
+    n_matched = matched_mask.sum().item()
 
-            if existing_radius < EPSILON:
-                # Slot was deallocated between write and now — treat as new
-                results.append(SurpriseResult(
-                    slot=-1, surprise=obs_radius, gain=1.0,
-                    should_reconsolidate=True, observation=c.belief_vector,
-                    is_new=True,
-                ))
-                continue
+    # Pre-allocate result arrays on CPU
+    surprise_out = torch.zeros(N)
+    gain_out = torch.full((N,), 1.0)
+    recon_out = torch.ones(N, dtype=torch.bool)  # default True (for new)
+    is_new_out = torch.ones(N, dtype=torch.bool)  # default True
+    slot_out = slots.cpu().clone()
 
-            # Angular distance between observation and existing belief
-            existing_angle = existing / max(existing_radius, EPSILON)
-            obs_angle = c.belief_vector / max(obs_radius, EPSILON)
-            pred_error = angular_distance(
-                existing_angle.unsqueeze(0), obs_angle.unsqueeze(0)
-            ).item()
-            # pred_error ∈ [0, 2]: 0 = identical, 1 = orthogonal, 2 = opposite
+    if n_matched > 0:
+        matched_idx = matched_mask.nonzero(as_tuple=False).squeeze(-1)
+        matched_slots = slots[matched_idx]  # [M]
+        matched_obs = obs_all[matched_idx]  # [M, D]
+
+        existing = state.beliefs.data[matched_slots]  # [M, D]
+        existing_radii = existing.norm(dim=-1)  # [M]
+        obs_radii = matched_obs.norm(dim=-1).clamp(min=EPSILON)  # [M]
+
+        # Deallocated slots (radius ≈ 0) → treat as new
+        deallocated = existing_radii < EPSILON
+        valid = ~deallocated
+        n_valid = valid.sum().item()
+
+        # Handle deallocated slots → mark as new
+        if deallocated.any():
+            dealloc_global = matched_idx[deallocated].cpu()
+            slot_out[dealloc_global] = -1
+            surprise_out[dealloc_global] = obs_radii[deallocated].cpu()
+            # gain and recon already defaulted to 1.0 and True
+
+        if n_valid > 0:
+            v_idx = valid.nonzero(as_tuple=False).squeeze(-1)
+            v_existing = existing[v_idx]
+            v_existing_radii = existing_radii[v_idx].clamp(min=EPSILON)
+            v_obs = matched_obs[v_idx]
+            v_obs_radii = obs_radii[v_idx]
+
+            # Angular distance (vectorized)
+            existing_angles = v_existing / v_existing_radii.unsqueeze(-1)
+            obs_angles = v_obs / v_obs_radii.unsqueeze(-1)
+            cos_sim = (existing_angles * obs_angles).sum(dim=-1).clamp(-1.0, 1.0)
+            pred_error = 1.0 - cos_sim  # [V], range [0, 2]
 
             # Kalman-like gain
-            # belief_precision = existing_radius (in polar form, radius IS precision)
-            # obs_precision = obs_radius
-            belief_precision = existing_radius
-            obs_precision = obs_radius
-            total_precision = belief_precision + obs_precision
-            gain = obs_precision / total_precision if total_precision > EPSILON else 0.5
+            total_precision = v_existing_radii + v_obs_radii
+            gain = v_obs_radii / total_precision  # [V]
 
-            # Surprise = prediction error × observation precision
-            surprise = pred_error * obs_precision
+            # Surprise
+            surprise = pred_error * v_obs_radii  # [V]
 
-            results.append(SurpriseResult(
-                slot=c.matched_slot,
-                surprise=surprise,
-                gain=gain,
-                should_reconsolidate=gain > reconsolidation_threshold,
-                observation=c.belief_vector,
-                is_new=False,
-            ))
-        else:
-            # New observation — no matching belief
-            # Everything is surprising (prediction error = 1.0)
-            results.append(SurpriseResult(
-                slot=-1,
-                surprise=obs_radius,  # surprise = 1.0 × obs_precision
-                gain=1.0,             # no prior → full acceptance
-                should_reconsolidate=True,
-                observation=c.belief_vector,
-                is_new=True,
-            ))
+            # Write back to output arrays
+            global_idx = matched_idx[v_idx].cpu()
+            surprise_out[global_idx] = surprise.cpu()
+            gain_out[global_idx] = gain.cpu()
+            recon_out[global_idx] = (gain > reconsolidation_threshold).cpu()
+            is_new_out[global_idx] = False
+
+    # Build result list (cheap — just reads from pre-computed tensors)
+    results = []
+    for i in range(N):
+        results.append(SurpriseResult(
+            slot=slot_out[i].item(),
+            surprise=surprise_out[i].item(),
+            gain=gain_out[i].item(),
+            should_reconsolidate=recon_out[i].item(),
+            observation=obs_all[i],
+            is_new=is_new_out[i].item(),
+        ))
 
     return results

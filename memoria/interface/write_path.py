@@ -37,6 +37,8 @@ class WriteCandidate:
 def pack_candidates(candidates: list[WriteCandidate]) -> Tensor:
     """Pack candidates into a single tensor for distributed gather.
 
+    Vectorized: stacks belief vectors and metadata in one shot.
+
     Returns:
         [N, D+3] tensor where last 3 cols are (matched_slot, match_similarity, source_layer).
         Returns empty [0, 0] tensor if no candidates.
@@ -44,27 +46,47 @@ def pack_candidates(candidates: list[WriteCandidate]) -> Tensor:
     if not candidates:
         return torch.zeros(0, 0)
     D = candidates[0].belief_vector.shape[0]
-    packed = torch.zeros(len(candidates), D + 3, device=candidates[0].belief_vector.device)
-    for i, c in enumerate(candidates):
-        packed[i, :D] = c.belief_vector
-        packed[i, D] = c.matched_slot
-        packed[i, D + 1] = c.match_similarity
-        packed[i, D + 2] = c.source_layer
-    return packed
+    device = candidates[0].belief_vector.device
+    N = len(candidates)
+
+    # Stack belief vectors
+    beliefs = torch.stack([c.belief_vector for c in candidates])  # [N, D]
+
+    # Build metadata columns
+    meta = torch.tensor(
+        [[c.matched_slot, c.match_similarity, c.source_layer] for c in candidates],
+        dtype=beliefs.dtype, device=device,
+    )  # [N, 3]
+
+    return torch.cat([beliefs, meta], dim=-1)  # [N, D+3]
 
 
 def unpack_candidates(packed: Tensor, belief_dim: int) -> list[WriteCandidate]:
-    """Unpack tensor back into WriteCandidate list."""
+    """Unpack tensor back into WriteCandidate list.
+
+    Vectorized: slices tensor columns then builds objects.
+    """
     if packed.numel() == 0:
         return []
+
+    beliefs = packed[:, :belief_dim]               # [N, D]
+    slots = packed[:, belief_dim].long()            # [N]
+    sims = packed[:, belief_dim + 1]                # [N]
+    layers = packed[:, belief_dim + 2].long()       # [N]
+
+    # Move to CPU once for all .item() calls
+    slots_cpu = slots.cpu()
+    sims_cpu = sims.cpu()
+    layers_cpu = layers.cpu()
+
     candidates = []
     for i in range(packed.shape[0]):
         candidates.append(WriteCandidate(
-            belief_vector=packed[i, :belief_dim],
-            matched_slot=int(packed[i, belief_dim].item()),
-            match_similarity=packed[i, belief_dim + 1].item(),
-            source_position=i,  # position lost in packing, use index
-            source_layer=int(packed[i, belief_dim + 2].item()),
+            belief_vector=beliefs[i],
+            matched_slot=slots_cpu[i].item(),
+            match_similarity=sims_cpu[i].item(),
+            source_position=i,
+            source_layer=layers_cpu[i].item(),
         ))
     return candidates
 
@@ -161,6 +183,9 @@ class WritePath(nn.Module):
     ) -> list[WriteCandidate]:
         """Match observations against existing beliefs, produce candidates.
 
+        Vectorized: computes matches for all T positions in one matmul,
+        then filters by gate threshold and constructs candidates from tensors.
+
         Args:
             observations: [T, D] observation vectors (radius = precision)
             state: cognitive state
@@ -170,7 +195,6 @@ class WritePath(nn.Module):
             List of WriteCandidates
         """
         T, D = observations.shape
-        candidates = []
 
         active_mask = state.get_active_mask()
         match_threshold = state.match_threshold
@@ -181,47 +205,51 @@ class WritePath(nn.Module):
             active_radii = active_beliefs.norm(dim=-1).clamp(min=EPSILON)
             active_angles = active_beliefs / active_radii.unsqueeze(-1)  # [N_active, D]
 
-            # Observation angles
             obs_radii = observations.norm(dim=-1).clamp(min=EPSILON)
             obs_angles = observations / obs_radii.unsqueeze(-1)  # [T, D]
 
             # Cosine similarity: [T, N_active]
             similarities = obs_angles @ active_angles.T
-
-            # Best match per observation
             best_sims, best_local = similarities.max(dim=-1)  # [T], [T]
-            best_global = active_indices[best_local]           # map to global slot indices
+            best_global = active_indices[best_local]           # [T]
         else:
             best_sims = torch.zeros(T, device=observations.device)
             best_global = torch.full((T,), -1, dtype=torch.long, device=observations.device)
 
-        # Only keep observations where the gate produced meaningful precision
+        # Gate filter: only positions with meaningful precision
         obs_radii = observations.norm(dim=-1)
-        meaningful = obs_radii > 0.05  # gate-filtered: higher threshold since gate does heavy lifting
+        meaningful = obs_radii > 0.05
 
-        for t in range(T):
-            if not meaningful[t]:
-                continue
+        # Vectorized: find which meaningful positions match vs are new
+        matched = meaningful & (best_sims > match_threshold) if active_mask.any() else torch.zeros(T, dtype=torch.bool, device=observations.device)
+        new = meaningful & ~matched
 
-            sim = best_sims[t].item() if active_mask.any() else 0.0
+        # Gather all meaningful indices
+        meaningful_idx = meaningful.nonzero(as_tuple=False).squeeze(-1)
+        if len(meaningful_idx) == 0:
+            return []
 
-            if sim > match_threshold:
-                # Match found → update candidate
-                candidates.append(WriteCandidate(
-                    belief_vector=observations[t].detach(),
-                    matched_slot=best_global[t].item(),
-                    match_similarity=sim,
-                    source_position=t,
-                    source_layer=layer_idx,
-                ))
-            else:
-                # No match → new belief candidate
-                candidates.append(WriteCandidate(
-                    belief_vector=observations[t].detach(),
-                    matched_slot=-1,
-                    match_similarity=0.0,
-                    source_position=t,
-                    source_layer=layer_idx,
-                ))
+        # Detach observations for candidates
+        obs_detached = observations.detach()
+
+        # Build slots and sims tensors for all meaningful positions
+        slots = torch.where(matched, best_global, torch.tensor(-1, dtype=torch.long, device=observations.device))
+        sims_out = torch.where(matched, best_sims, torch.zeros_like(best_sims))
+
+        # Extract only meaningful positions — move to CPU once
+        m_idx = meaningful_idx.cpu()
+        m_slots = slots[meaningful_idx].cpu()
+        m_sims = sims_out[meaningful_idx].cpu()
+
+        candidates = []
+        for i in range(len(m_idx)):
+            t = m_idx[i].item()
+            candidates.append(WriteCandidate(
+                belief_vector=obs_detached[t],
+                matched_slot=m_slots[i].item(),
+                match_similarity=m_sims[i].item(),
+                source_position=t,
+                source_layer=layer_idx,
+            ))
 
         return candidates
