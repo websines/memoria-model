@@ -69,7 +69,7 @@ def wrap_ddp(model: nn.Module, device: torch.device, rank: int, world_size: int)
     base_model = model
 
     if world_size > 1:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True, static_graph=True)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     return model, base_model
 
