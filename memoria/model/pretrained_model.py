@@ -195,8 +195,12 @@ class PretrainedMemoriaModel(nn.Module):
                 # After first interface: gradients must flow through frozen layers
                 # to reach interface params. Frozen weights (requires_grad=False) won't
                 # accumulate grads, but the computation graph is preserved for inputs.
-                layer_output = layer(hidden, **layer_kwargs)
-                hidden = layer_output[0] if isinstance(layer_output, tuple) else layer_output
+                # Use gradient checkpointing to trade compute for memory — recompute
+                # activations during backward instead of storing them (saves ~10GB).
+                hidden = torch.utils.checkpoint.checkpoint(
+                    self._run_layer, layer, hidden, layer_kwargs,
+                    use_reentrant=False,
+                )
 
             # Insert state interface after designated layers
             if interface_idx < len(self.interfaces) and i == self.interface_positions[interface_idx]:
@@ -262,6 +266,12 @@ class PretrainedMemoriaModel(nn.Module):
             result['logits'] = logits
 
         return result
+
+    @staticmethod
+    def _run_layer(layer, hidden, layer_kwargs):
+        """Run a single backbone layer. Wrapped for gradient checkpointing."""
+        output = layer(hidden, **layer_kwargs)
+        return output[0] if isinstance(output, tuple) else output
 
     def detach_state(self):
         """Detach cognitive state from computation graph."""

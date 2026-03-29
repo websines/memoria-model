@@ -177,7 +177,7 @@ def qwen_config() -> MemoriaConfig:
             relation_dim=64,
         ),
         training=TrainingConfig(
-            device_batch_size=2,  # conservative: frozen 2B + interface grads
+            device_batch_size=1,  # 2B model + grad checkpointing on 24GB GPU
             interface_lr=0.001,  # lower LR for adapters on pretrained backbone
             phase1_steps=500,    # shorter phase 1: backbone already knows language
             alpha_warmup_steps=500,
