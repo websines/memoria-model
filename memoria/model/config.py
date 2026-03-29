@@ -172,11 +172,12 @@ def qwen_config() -> MemoriaConfig:
         state=StateConfig(
             belief_dim=512,  # larger to match richer representations from 2B model
             max_beliefs=8192,
-            max_edges=32768,
+            max_edges=65536,  # 8× beliefs — 2B model creates edges fast
             max_goals=64,
             relation_dim=64,
         ),
         training=TrainingConfig(
+            total_batch_size=2**13,  # 8192 tokens/step — adapters don't need 131K
             device_batch_size=1,  # 2B model + grad checkpointing on 24GB GPU
             interface_lr=0.001,  # lower LR for adapters on pretrained backbone
             phase1_steps=500,    # shorter phase 1: backbone already knows language
