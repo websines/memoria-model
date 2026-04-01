@@ -167,7 +167,10 @@ class WritePath(nn.Module):
         # Batch matching across all B*T positions in one matmul
         candidates = self._match_and_buffer_batched(obs_beliefs, state, layer_idx, B, T)
 
-        return candidates, obs_vectors
+        # Return precision-gated observations for L_fe (not raw obs_vectors).
+        # This connects write_gate + precision_head to the computation graph
+        # so DDP doesn't flag them as unused parameters.
+        return candidates, obs_beliefs
 
     def _match_and_buffer_batched(
         self,

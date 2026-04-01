@@ -10,7 +10,7 @@ dist/
 build/
 .eggs/
 *.egg
-
+uv.lock
 # PyTorch
 *.pt
 *.pth

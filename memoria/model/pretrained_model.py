@@ -223,35 +223,35 @@ class PretrainedMemoriaModel(nn.Module):
                 targets.view(-1),
             )
 
-            # Free energy loss (differentiable — provides actual gradients to interfaces)
-            if alpha > 0:
-                loss_fe = compute_differentiable_free_energy(
-                    all_attn_weights, all_retrieved, all_obs_vectors,
-                    self.config.state.belief_dim,
-                )
-                result['loss_fe'] = loss_fe
+            # Always compute L_fe and L_utility so all interface parameters participate
+            # in the computation graph (required by DDP with dynamic cognitive state).
 
-                # State free energy for beta/stats only (no gradients)
+            # Differentiable free energy
+            loss_fe = compute_differentiable_free_energy(
+                all_attn_weights, all_retrieved, all_obs_vectors,
+                self.config.state.belief_dim,
+            )
+            result['loss_fe'] = loss_fe
+
+            # State free energy for beta/stats only (no gradients)
+            if alpha > 0:
                 with torch.no_grad():
                     fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
                     result['free_energy_stats'] = fe_stats
 
-                # Utility loss from interface layers
-                loss_utility = torch.tensor(0.0, device=idx.device)
-                if all_utility_logits:
-                    for util_hidden in all_utility_logits:
-                        util_logits = lm_head(util_hidden)
-                        loss_utility = loss_utility + chunked_cross_entropy(
-                            util_logits.view(-1, util_logits.size(-1)),
-                            targets.view(-1),
-                        )
-                    loss_utility = loss_utility / len(all_utility_logits)
-                result['loss_utility'] = loss_utility
+            # Utility loss from interface layers
+            loss_utility = torch.tensor(0.0, device=idx.device)
+            if all_utility_logits:
+                for util_hidden in all_utility_logits:
+                    util_logits = lm_head(util_hidden)
+                    loss_utility = loss_utility + chunked_cross_entropy(
+                        util_logits.view(-1, util_logits.size(-1)),
+                        targets.view(-1),
+                    )
+                loss_utility = loss_utility / len(all_utility_logits)
+            result['loss_utility'] = loss_utility
 
-                result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility
-            else:
-                result['loss_fe'] = torch.tensor(0.0, device=idx.device)
-                result['loss'] = result['loss_token']
+            result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility
         else:
             logits = lm_head(hidden)
             result['logits'] = logits

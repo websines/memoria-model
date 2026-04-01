@@ -119,8 +119,13 @@ def train(
     tc = config.training
 
     # ── Accelerate setup ──
-    from accelerate import Accelerator
-    accelerator = Accelerator(mixed_precision='bf16')
+    from accelerate import Accelerator, DistributedDataParallelKwargs
+
+    # find_unused_parameters=True is required: cognitive state is dynamic (beliefs
+    # appear/disappear, goals come and go), so the set of parameters that contribute
+    # to loss changes between steps. static_graph won't work either.
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(mixed_precision='bf16', kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     is_main = accelerator.is_main_process
     rank = accelerator.process_index

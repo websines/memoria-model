@@ -145,9 +145,13 @@ class MemoriaModel(nn.Module):
                 targets.view(-1),
             )
 
+            # Always compute L_fe and L_utility so all interface parameters participate
+            # in the computation graph (required by DDP). When α=0, these contribute
+            # zero to the loss but keep parameters in the graph for gradient reduction.
+
             # Utility loss — use self.transformer.head() for consistent norm + softcap
             loss_utility = torch.tensor(0.0, device=idx.device)
-            if alpha > 0 and all_utility_logits:
+            if all_utility_logits:
                 for util_hidden in all_utility_logits:
                     util_logits = self.transformer.head(util_hidden)
                     loss_utility = loss_utility + chunked_cross_entropy(
@@ -157,23 +161,20 @@ class MemoriaModel(nn.Module):
                 loss_utility = loss_utility / len(all_utility_logits)
             result['loss_utility'] = loss_utility
 
-            # Free energy loss (differentiable — provides actual gradients to interfaces)
-            if alpha > 0:
-                loss_fe = compute_differentiable_free_energy(
-                    all_attn_weights, all_retrieved, all_obs_vectors,
-                    self.config.state.belief_dim,
-                )
-                result['loss_fe'] = loss_fe
+            # Differentiable free energy (provides actual gradients to interfaces)
+            loss_fe = compute_differentiable_free_energy(
+                all_attn_weights, all_retrieved, all_obs_vectors,
+                self.config.state.belief_dim,
+            )
+            result['loss_fe'] = loss_fe
 
-                # State free energy for beta/stats only (no gradients — detached state)
+            # State free energy for beta/stats only (no gradients — detached state)
+            if alpha > 0:
                 with torch.no_grad():
                     fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
                     result['free_energy_stats'] = fe_stats
 
-                result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility
-            else:
-                result['loss_fe'] = torch.tensor(0.0, device=idx.device)
-                result['loss'] = result['loss_token']
+            result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility
         else:
             logits = self.transformer.head(x)
             result['logits'] = logits
