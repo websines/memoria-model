@@ -93,7 +93,9 @@ class ReadPath(nn.Module):
         active_mask = state.get_active_mask()
         if not active_mask.any():
             # No beliefs → return zeros (model degrades to pure transformer)
-            return torch.zeros_like(hidden), torch.zeros_like(hidden), []
+            zero_attn = torch.zeros(B, T, self.num_heads, 0, device=device)
+            zero_retrieved = torch.zeros(B, T, self.num_heads, self.belief_dim, device=device)
+            return torch.zeros_like(hidden), torch.zeros_like(hidden), [], zero_attn, zero_retrieved
 
         active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
         active_beliefs = state.beliefs.data[active_indices]  # [N_active, D]
@@ -159,16 +161,16 @@ class ReadPath(nn.Module):
 
         # Retrieve: weighted sum of values
         # values: [N_active, D] → retrieved: [B, T, H_n, D]
-        retrieved = torch.einsum('bthn,nd->bthd', attn, values)
+        retrieved_per_head = torch.einsum('bthn,nd->bthd', attn, values)
 
         # Concatenate heads and project to hidden space
-        retrieved = retrieved.reshape(B, T, self.num_heads * self.belief_dim)
-        output = self.output_proj(retrieved)  # [B, T, hidden_dim]
+        retrieved_flat = retrieved_per_head.reshape(B, T, self.num_heads * self.belief_dim)
+        output = self.output_proj(retrieved_flat)  # [B, T, hidden_dim]
 
         # Utility prediction: can the retrieved beliefs predict the next token?
-        utility_logits = self.utility_head(retrieved)  # [B, T, hidden_dim]
+        utility_logits = self.utility_head(retrieved_flat)  # [B, T, hidden_dim]
 
-        return output, utility_logits, read_belief_indices
+        return output, utility_logits, read_belief_indices, attn, retrieved_per_head
 
     def _compute_goal_bias(
         self,

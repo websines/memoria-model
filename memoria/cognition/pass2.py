@@ -26,7 +26,7 @@ from .telos import (
     detect_stalls, enforce_deadlines,
 )
 from .consolidation import soft_consolidation, periodic_hard_cleanup
-from .meta_learning import compute_beta, spsa_step, apply_sequence_boundary_decay
+from .meta_learning import compute_beta, SPSAController, apply_sequence_boundary_decay
 
 
 MAX_CANDIDATES = 1024  # safety valve: subsample if too many candidates
@@ -39,9 +39,9 @@ def run_pass2(
     current_step: int,
     is_sequence_boundary: bool = True,
     consolidation_interval: int = 50,
-    spsa_interval: int = 100,
     temperature: float = 5.0,
     max_candidates: int = MAX_CANDIDATES,
+    spsa_controller: SPSAController | None = None,
 ) -> dict:
     """Run the full pass 2 cognitive update loop.
 
@@ -52,9 +52,9 @@ def run_pass2(
         current_step: current training/inference step
         is_sequence_boundary: whether we're at a sequence boundary (apply decay)
         consolidation_interval: run consolidation every N steps
-        spsa_interval: run SPSA every N steps
         temperature: for free energy computation
         max_candidates: subsample candidates if exceeding this count
+        spsa_controller: multi-step SPSA controller (created by training loop, None to skip)
 
     Returns:
         dict with statistics from all sub-operations
@@ -137,15 +137,17 @@ def run_pass2(
     detect_stalls(state, current_step)
     enforce_deadlines(state, current_step)
 
-    # 8. Meta update: β + periodic SPSA
+    # 8. Meta update: β + multi-step SPSA
     beta = compute_beta(state, temperature)
     stats['beta'] = beta
 
-    if current_step > 0 and current_step % spsa_interval == 0:
-        spsa_step(state, temperature)
-        stats['spsa_step'] = True
+    if spsa_controller is not None:
+        did_update = spsa_controller.step(state, current_step, temperature)
+        stats['spsa_step'] = did_update
+        stats['spsa_phase'] = spsa_controller.phase
     else:
         stats['spsa_step'] = False
+        stats['spsa_phase'] = 'disabled'
 
     # 9. Consolidation
     merged = soft_consolidation(state)
@@ -159,8 +161,8 @@ def run_pass2(
     else:
         stats['hard_cleanup_removed'] = 0
 
-    # Sequence boundary: decay belief precision
-    if is_sequence_boundary:
+    # Sequence boundary: decay belief precision (every 10 steps, not every step)
+    if is_sequence_boundary and current_step % 10 == 0:
         apply_sequence_boundary_decay(state)
 
     # Final stats

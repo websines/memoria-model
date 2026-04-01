@@ -7,12 +7,12 @@ Three phases:
 
 Each step:
 - Forward pass (pass 1): tokens → transformer + state interfaces → logits + candidates
-- Compute loss: L_token + α·L_fe
+- Compute loss: L_token + α·L_fe (differentiable) + α·0.1·L_utility
 - Backward + optimizer step
 - Pass 2: surprise → belief update → Hebbian → Telos → consolidation → meta
 
-Reference: autoresearch/train.py (training loop structure)
-Reference: modded-nanogpt (training speed tricks)
+Uses HuggingFace Accelerate for DDP, mixed precision, and gradient clipping.
+Cognitive state broadcast/gather handled separately (not a DDP parameter).
 """
 
 import gc
@@ -22,7 +22,6 @@ import time
 import threading
 import queue
 import torch
-import torch.nn.functional as F
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -32,21 +31,22 @@ from ..model.pretrained_model import PretrainedMemoriaModel
 from ..cognition.pass2 import run_pass2
 from ..data.tokenizer import get_tokenizer
 from ..data.interleave import interleaved_stream
+from ..data.streaming import stream_fineweb_edu
 from ..data.synthetic import generate_all_synthetic
 from .optimizer import setup_optimizer
 from .schedule import get_lr_multiplier, get_alpha
 from .distributed import (
-    setup_distributed, cleanup_distributed, wrap_ddp,
-    broadcast_state, gather_candidates, gather_read_indices, sync_ranks, setup_device, get_batch_to_device,
+    broadcast_state, gather_candidates, gather_read_indices, sync_ranks,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
+from ..cognition.meta_learning import SPSAController
 
 
 class DataPrefetcher:
     """Background thread that prefetches batches from a data stream.
 
     Keeps a queue of ready-to-go batches so the training loop never waits
-    on data loading. Batches are stacked to [B, T] and moved to the target device.
+    on data loading. Propagates errors from the worker thread.
     """
 
     def __init__(self, data_stream, batch_size: int, device: torch.device, prefetch_count: int = 2):
@@ -55,6 +55,7 @@ class DataPrefetcher:
         self.device = device
         self.queue = queue.Queue(maxsize=prefetch_count)
         self.stop_event = threading.Event()
+        self._error = None
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
 
@@ -67,9 +68,18 @@ class DataPrefetcher:
                 self.queue.put((input_ids, labels))
         except StopIteration:
             pass
+        except Exception as e:
+            self._error = e
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        input_ids, labels = self.queue.get()
+        if self._error is not None:
+            raise RuntimeError(f"Data prefetcher failed: {self._error}")
+        try:
+            input_ids, labels = self.queue.get(timeout=120)
+        except queue.Empty:
+            if self._error is not None:
+                raise RuntimeError(f"Data prefetcher failed: {self._error}")
+            raise RuntimeError("Data prefetcher timed out after 120s — check data pipeline")
         return input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
 
     def stop(self):
@@ -106,11 +116,17 @@ def train(
         resume_from: checkpoint path to resume from
     """
     _load_env()
-    rank, world_size, device = setup_distributed()
     tc = config.training
-    is_main = (rank == 0)
 
-    # Weights & Biases (rank 0 only)
+    # ── Accelerate setup ──
+    from accelerate import Accelerator
+    accelerator = Accelerator(mixed_precision='bf16')
+    device = accelerator.device
+    is_main = accelerator.is_main_process
+    rank = accelerator.process_index
+    world_size = accelerator.num_processes
+
+    # Weights & Biases (main process only)
     if log_to_wandb and not is_main:
         log_to_wandb = False
     if log_to_wandb:
@@ -126,7 +142,7 @@ def train(
             save_code=True,
         )
 
-    # HuggingFace Hub (rank 0 only)
+    # HuggingFace Hub (main process only)
     hf_repo = os.environ.get("HF_REPO", None)
     hf_token = os.environ.get("HF_TOKEN", None)
     if push_to_hub and (not hf_repo or not hf_token or not is_main):
@@ -142,80 +158,93 @@ def train(
         print("Building model...")
     if config.backbone == "pretrained":
         model = PretrainedMemoriaModel(config)
-        model.init_weights()
-        model, base_model = wrap_ddp(model, device, rank, world_size)
     else:
         model = MemoriaModel(config)
-        model.init_weights()
-        model, base_model = wrap_ddp(model, device, rank, world_size)
+    model.init_weights()
+
+    # Optimizer
+    optimizer = setup_optimizer(model, config)
+
+    # Prepare with accelerate (handles DDP wrapping, device placement)
+    model, optimizer = accelerator.prepare(model, optimizer)
+    base_model = accelerator.unwrap_model(model)
+
     if is_main:
         print(base_model.summary())
         if world_size > 1:
-            print(f"  DDP: {world_size} GPUs, state on rank 0")
+            print(f"  DDP: {world_size} GPUs via Accelerate, state on rank 0")
 
-    # Optimizer (always on the base model, not the DataParallel wrapper)
-    optimizer = setup_optimizer(base_model, config)
-
-    # Data
+    # Data (synthetic only on main process, broadcast if needed)
     if is_main:
         print("Generating synthetic data...")
-    synthetic_data = generate_all_synthetic()
+    synthetic_data = generate_all_synthetic() if is_main else []
     if is_main:
         print(f"Generated {len(synthetic_data)} synthetic sequences")
         print("Starting data stream...")
     data_stream = interleaved_stream(
         tokenizer,
         seq_len=config.transformer.sequence_len,
-        weights=(0.7, 0.2, 0.1),  # FineWeb 70% + code 20% (starcoderdata, ungated) + synthetic 10%
-        synthetic_data=synthetic_data,
+        weights=(0.7, 0.2, 0.1),
+        synthetic_data=synthetic_data if synthetic_data else None,
         stack_languages=["python", "javascript", "rust", "go"],
     )
 
+    # SPSA controller (persists across steps, tracks multi-step evaluation phases)
+    spsa_controller = SPSAController(interval=100, eval_window=10)
+
     # Resume
     start_step = 0
+    samples_consumed = 0
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
         base_model.load_state_dict(checkpoint['model_state'], strict=False)
         base_model.state.load_state_cognitive(checkpoint['cognitive_state'])
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_step = checkpoint['step']
+        samples_consumed = checkpoint.get('samples_consumed', 0)
+        if 'spsa_state' in checkpoint:
+            spsa_controller.load_state_dict(checkpoint['spsa_state'])
         if is_main:
             print(f"Resumed from step {start_step}")
+
+    # Fast-forward data stream past already-consumed samples
+    if samples_consumed > 0 and is_main:
+        print(f"Fast-forwarding data stream past {samples_consumed} consumed samples...", flush=True)
+        for _ in range(samples_consumed):
+            next(data_stream)
+        print(f"Data stream resumed at position {samples_consumed}")
 
     # Checkpoint dir
     ckpt_path = Path(checkpoint_dir)
     ckpt_path.mkdir(parents=True, exist_ok=True)
 
     # Training state
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
     smooth_loss = 0.0
     smooth_loss_token = 0.0
     smooth_loss_fe = 0.0
     t_start = time.time()
     total_training_time = 0.0
 
-    # Gradient accumulation
+    # Gradient accumulation (correctly divides by world_size)
     tokens_per_micro = tc.device_batch_size * config.transformer.sequence_len
-    grad_accum = max(1, tc.total_batch_size // tokens_per_micro)
+    grad_accum = max(1, tc.total_batch_size // (tokens_per_micro * world_size))
 
     if is_main:
         print(f"Training: {max_steps} steps, grad_accum={grad_accum}, "
               f"batch_size={tc.device_batch_size}, seq_len={config.transformer.sequence_len}")
+        print(f"Effective batch: {grad_accum * tokens_per_micro * world_size} tokens/step")
         print(f"Phase 1 (α=0): steps 0-{tc.phase1_steps}")
         print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
         print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
 
-    # Background data prefetcher (loads + stacks batches in a separate thread)
+    # Background data prefetcher
     if is_main:
         print("Starting data prefetcher (downloading initial data shard)...", flush=True)
     prefetcher = DataPrefetcher(data_stream, tc.device_batch_size, device, prefetch_count=3)
     if is_main:
         print(f"Prefetcher ready. Batch size: {tc.device_batch_size}")
 
-    # torch.compile: compile only the backbone (not interface layers, which use .item()).
-    # Pretrained mode: auto-enabled (frozen backbone is pure tensor ops, big speedup).
-    # Scratch mode: opt-in via MEMORIA_COMPILE=1.
+    # torch.compile
     should_compile = (
         config.backbone == "pretrained"
         or os.environ.get('MEMORIA_COMPILE', '') == '1'
@@ -223,26 +252,20 @@ def train(
     if should_compile:
         try:
             if config.backbone == "pretrained":
-                # Compile each frozen backbone layer individually for best results
                 for i, layer in enumerate(base_model.backbone.model.layers):
                     base_model.backbone.model.layers[i] = torch.compile(layer)
-            elif world_size > 1:
-                base_model.transformer = torch.compile(base_model.transformer)
             else:
-                model = torch.compile(model)
+                base_model.transformer = torch.compile(base_model.transformer)
             if is_main:
-                print("torch.compile enabled (backbone layers compiled)")
+                print("torch.compile enabled")
         except Exception as e:
             if is_main:
                 print(f"torch.compile skipped: {e}")
-    else:
-        if is_main:
-            print("torch.compile disabled (set MEMORIA_COMPILE=1 to enable)")
 
-    # DDP no_sync context for gradient accumulation
+    # DDP no_sync support
     has_no_sync = hasattr(model, 'no_sync')
 
-    # GC management (from autoresearch — prevents Python GC stalls)
+    # GC management
     gc.collect()
     gc.freeze()
     gc.disable()
@@ -272,19 +295,16 @@ def train(
             if step == 0 and is_main:
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
-            # Get pre-stacked, pre-transferred batch from prefetcher
             input_ids, labels = prefetcher.next_batch()
 
-            # DDP no_sync for all but last micro-step (avoids redundant allreduce)
+            # DDP no_sync for all but last micro-step
             is_last_micro = (micro_step == grad_accum - 1)
             sync_ctx = nullcontext() if (is_last_micro or not has_no_sync) else model.no_sync()
 
             with sync_ctx:
-                with autocast_ctx:
-                    result = model(input_ids, targets=labels, alpha=alpha)
-
+                result = model(input_ids, targets=labels, alpha=alpha)
                 loss = result['loss'] / grad_accum
-                loss.backward()
+                accelerator.backward(loss)
 
             total_loss += loss.item()
             total_loss_token += result['loss_token'].item() / grad_accum
@@ -295,9 +315,11 @@ def train(
         if step == 0 and is_main:
             print(f"\r  Step 0 complete.{' ' * 30}", flush=True)
 
-        # Optimizer step (DDP syncs gradients automatically)
+        # Gradient clipping + optimizer step
+        if tc.grad_clip_norm > 0:
+            accelerator.clip_grad_norm_(model.parameters(), tc.grad_clip_norm)
         optimizer.step()
-        model.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
 
         # Fast fail
         if math.isnan(total_loss) or total_loss > 100:
@@ -305,18 +327,16 @@ def train(
                 print(f"\nFAIL: loss exploded at step {step}: {total_loss}")
             break
 
-        # Gather candidates and read indices from all ranks to rank 0 for Pass 2
+        # Gather candidates and read indices from all ranks to rank 0
         packed = pack_candidates(all_candidates)
         packed = gather_candidates(packed, rank, world_size, belief_dim)
         all_read_indices = gather_read_indices(all_read_indices, rank, world_size, device)
 
-        # Pass 2: cognitive update on rank 0 only (state is sequential)
+        # Pass 2: cognitive update on rank 0 only
         base_model.detach_state()
 
         if is_main:
             gathered_candidates = unpack_candidates(packed, belief_dim)
-            # Use actual read path retrieval indices for Hebbian learning,
-            # gathered from all ranks (not just rank 0's local retrievals)
             read_indices = list(set(all_read_indices))
 
             pass2_stats = run_pass2(
@@ -326,6 +346,7 @@ def train(
                 current_step=step,
                 is_sequence_boundary=True,
                 temperature=tc.fe_temperature,
+                spsa_controller=spsa_controller,
             )
         else:
             pass2_stats = {
@@ -333,8 +354,10 @@ def train(
                 'active_goals': 0, 'total_surprise': 0.0,
             }
 
-        # Sync ranks after Pass 2 (rank 0 does extra work, rank 1 must wait)
         sync_ranks(world_size)
+
+        # Track data consumption for checkpoint resume
+        samples_consumed += grad_accum * tc.device_batch_size
 
         # Timing
         t1 = time.time()
@@ -383,13 +406,21 @@ def train(
                 'dt_ms': dt * 1000,
             })
 
-        # Checkpoint (rank 0 only)
-        if is_main and step > 0 and step % tc.checkpoint_interval == 0:
-            save_checkpoint(base_model, optimizer, step, ckpt_path / f"step_{step}.pt")
+        # Periodic eval
+        if is_main and step > 0 and step % tc.eval_interval == 0:
+            eval_ppl = _run_eval(base_model, tokenizer, config, device)
+            print(f"\n  [eval] step {step}: perplexity = {eval_ppl:.2f}")
+            if log_to_wandb:
+                wandb.log({'eval_perplexity': eval_ppl, 'step': step})
 
-        # Push to HuggingFace Hub (rank 0 only)
+        # Checkpoint (main process only)
+        if is_main and step > 0 and step % tc.checkpoint_interval == 0:
+            save_checkpoint(base_model, optimizer, step, ckpt_path / f"step_{step}.pt",
+                           samples_consumed, spsa_controller)
+
+        # Push to HuggingFace Hub (async, main process only)
         if push_to_hub and step > 0 and step % hub_push_every == 0:
-            _push_to_hub(base_model, step, ckpt_path, hf_repo, hf_token)
+            _push_to_hub_async(base_model, step, ckpt_path, hf_repo, hf_token)
 
         # Time budget
         if time_budget and total_training_time >= time_budget:
@@ -407,73 +438,92 @@ def train(
 
     if is_main:
         print(f"\nTraining complete. {step + 1} steps, {total_training_time:.1f}s training time.")
-
-        # Final checkpoint
-        save_checkpoint(base_model, optimizer, step, ckpt_path / "final.pt")
-
-        # Final push to hub
+        save_checkpoint(base_model, optimizer, step, ckpt_path / "final.pt",
+                        samples_consumed, spsa_controller)
         if push_to_hub:
-            _push_to_hub(base_model, step, ckpt_path, hf_repo, hf_token, is_final=True)
+            _push_to_hub_async(base_model, step, ckpt_path, hf_repo, hf_token, is_final=True)
 
     if log_to_wandb:
         import wandb
         wandb.finish()
 
-    cleanup_distributed()
+    accelerator.end_training()
     return base_model
 
 
-def save_checkpoint(model, optimizer, step: int, path: Path):
-    """Save model + cognitive state + optimizer checkpoint."""
-    torch.save({
+def _run_eval(model, tokenizer, config, device, n_batches: int = 20) -> float:
+    """Quick eval: compute perplexity on held-out FineWeb samples."""
+    model.eval()
+    eval_stream = stream_fineweb_edu(tokenizer, config.transformer.sequence_len)
+    total_loss = 0.0
+    with torch.no_grad():
+        for _ in range(n_batches):
+            batch = next(eval_stream)
+            input_ids = batch['input_ids'].unsqueeze(0).to(device)
+            labels = batch['labels'].unsqueeze(0).to(device)
+            result = model(input_ids, targets=labels, alpha=0.0)
+            total_loss += result['loss_token'].item()
+    model.train()
+    return math.exp(min(total_loss / n_batches, 20.0))  # cap to avoid overflow
+
+
+def save_checkpoint(model, optimizer, step: int, path: Path,
+                    samples_consumed: int = 0, spsa_controller: SPSAController | None = None):
+    """Save model + cognitive state + optimizer + stream position checkpoint."""
+    ckpt = {
         'step': step,
         'model_state': model.state_dict(),
         'cognitive_state': model.state.state_dict_cognitive(),
         'optimizer_state': optimizer.state_dict(),
-    }, path)
-    print(f"\n  Checkpoint saved: {path}")
+        'samples_consumed': samples_consumed,
+    }
+    if spsa_controller is not None:
+        ckpt['spsa_state'] = spsa_controller.state_dict()
+    torch.save(ckpt, path)
+    print(f"\n  Checkpoint saved: {path} (stream pos: {samples_consumed} samples)")
 
 
-def _push_to_hub(model, step: int, ckpt_path: Path, repo_id: str, token: str, is_final: bool = False):
-    """Push checkpoint to HuggingFace Hub."""
-    try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=token)
+def _push_to_hub_async(model, step: int, ckpt_path: Path, repo_id: str, token: str, is_final: bool = False):
+    """Push checkpoint to HuggingFace Hub in a background thread."""
+    def _upload():
+        try:
+            from huggingface_hub import HfApi
+            import json, tempfile
+            api = HfApi(token=token)
 
-        # Upload the latest checkpoint
-        tag = "final" if is_final else f"step-{step}"
-        ckpt_file = ckpt_path / ("final.pt" if is_final else f"step_{step}.pt")
+            tag = "final" if is_final else f"step-{step}"
+            ckpt_file = ckpt_path / ("final.pt" if is_final else f"step_{step}.pt")
 
-        if ckpt_file.exists():
+            if ckpt_file.exists():
+                api.upload_file(
+                    path_or_fileobj=str(ckpt_file),
+                    path_in_repo=f"checkpoints/{ckpt_file.name}",
+                    repo_id=repo_id,
+                    repo_type="model",
+                    commit_message=f"Checkpoint at step {step}",
+                )
+
+            summary = {
+                'step': step,
+                'active_beliefs': model.state.num_active_beliefs(),
+                'active_edges': model.state.num_active_edges(),
+                'active_goals': model.state.num_active_goals(),
+                'beta': model.state.beta,
+            }
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                json.dump(summary, f, indent=2)
+                tmp_path = f.name
             api.upload_file(
-                path_or_fileobj=str(ckpt_file),
-                path_in_repo=f"checkpoints/{ckpt_file.name}",
-                repo_id=repo_id,
-                repo_type="model",
-                commit_message=f"Checkpoint at step {step}",
-            )
-            print(f"\n  Pushed to hub: {repo_id}/checkpoints/{ckpt_file.name}")
-
-        # Also upload training state summary
-        summary = {
-            'step': step,
-            'active_beliefs': model.state.num_active_beliefs(),
-            'active_edges': model.state.num_active_edges(),
-            'active_goals': model.state.num_active_goals(),
-            'beta': model.state.beta,
-        }
-        import json, tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(summary, f, indent=2)
-            f.flush()
-            api.upload_file(
-                path_or_fileobj=f.name,
+                path_or_fileobj=tmp_path,
                 path_in_repo=f"checkpoints/{tag}_summary.json",
                 repo_id=repo_id,
                 repo_type="model",
                 commit_message=f"Training summary at step {step}",
             )
-        os.unlink(f.name)
+            os.unlink(tmp_path)
+            print(f"\n  Pushed to hub: {repo_id}/checkpoints/{ckpt_file.name}")
+        except Exception as e:
+            print(f"\n  WARNING: Hub push failed: {e}")
 
-    except Exception as e:
-        print(f"\n  WARNING: Hub push failed: {e}")
+    thread = threading.Thread(target=_upload, daemon=True)
+    thread.start()

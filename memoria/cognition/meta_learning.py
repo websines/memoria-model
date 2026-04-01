@@ -3,11 +3,14 @@
 β = H / (|E| + H + ε) — computed from actual state, not a hyperparameter.
 
 SPSA (Simultaneous Perturbation Stochastic Approximation) tunes cognitive
-parameters by minimizing free energy:
-- Perturb parameters slightly
-- Measure free energy before/after
-- Gradient-free update: adjust in direction that reduced free energy
-- Only needs 2 evaluations per step regardless of parameter count
+parameters by minimizing free energy over multi-step evaluation windows:
+- Apply +Δ perturbation, let Pass 2 run for N steps, measure mean F(+Δ)
+- Apply -Δ perturbation, let Pass 2 run for N steps, measure mean F(-Δ)
+- Estimate gradient from the two means, update parameters
+
+This gives the perturbed thresholds time to causally affect the state via
+Pass 2 operations, unlike the original single-step approach where F(+Δ)
+and F(-Δ) measured the same state.
 
 Ported from: prototype-research/src/dynamics/meta_learning.rs
 """
@@ -37,73 +40,164 @@ def compute_beta(state: CognitiveState, temperature: float = 5.0) -> float:
     return result['beta'].item()
 
 
-def spsa_step(
-    state: CognitiveState,
-    temperature: float = 5.0,
-    perturbation_scale: float = 0.01,
-    step_size: float = 0.001,
-):
-    """One step of SPSA to tune meta parameters.
+class SPSAController:
+    """Multi-step SPSA controller for tuning cognitive meta-parameters.
+
+    Instead of perturbing and evaluating in the same step (which measures the
+    same state for both +Δ and -Δ), this controller spans multiple steps:
+
+    1. idle: wait for interval
+    2. eval_plus: apply +Δ, accumulate free energy over eval_window steps
+    3. eval_minus: apply -Δ, accumulate free energy over eval_window steps
+    4. compute gradient from mean F(+Δ) vs mean F(-Δ), update params, return to idle
 
     Tunes: reconsolidation_threshold (meta[4]), match_threshold (meta[5]),
-    and any other SPSA-tunable parameters in meta[6:].
-
-    Algorithm:
-    1. Perturb parameters by ±Δ (Bernoulli random)
-    2. Compute free energy at +Δ and -Δ
-    3. Estimate gradient: g = (F(+Δ) - F(-Δ)) / (2Δ)
-    4. Update: param -= step_size × g
-
-    Args:
-        state: cognitive state
-        temperature: for free energy computation
-        perturbation_scale: size of random perturbations
-        step_size: learning rate for parameter updates
+    goal_dedup_threshold (meta[6]).
     """
-    # Indices of tunable meta parameters (skip β[0] and accumulated_surprise[1])
-    tunable_start = 4  # reconsolidation_threshold, match_threshold, ...
-    tunable_end = min(8, state.config.meta_dim)  # first few are tunable
 
-    if tunable_end <= tunable_start:
-        return
+    TUNABLE_START = 4
+    # Clamp ranges for each tunable parameter
+    CLAMP_RANGES = [
+        (0.1, 0.9),    # reconsolidation_threshold
+        (0.3, 0.95),   # match_threshold
+        (0.2, 0.9),    # goal_dedup_threshold
+        (0.0, 1.0),    # generic fallback
+    ]
 
-    device = state.meta.device
+    def __init__(
+        self,
+        interval: int = 100,
+        eval_window: int = 10,
+        perturbation_scale: float = 0.01,
+        step_size: float = 0.001,
+    ):
+        self.interval = interval
+        self.eval_window = eval_window
+        self.perturbation_scale = perturbation_scale
+        self.step_size = step_size
 
-    with torch.no_grad():
-        original_values = state.meta.data[tunable_start:tunable_end].clone()
+        self._phase = 'idle'          # 'idle', 'eval_plus', 'eval_minus'
+        self._original_values = None  # saved before perturbation
+        self._delta = None            # perturbation direction
+        self._steps_in_phase = 0
+        self._fe_accumulator = 0.0
+        self._fe_plus_mean = 0.0
+        self._tunable_end = 0
 
-        # Random perturbation direction (Bernoulli ±1) — on correct device
-        n = tunable_end - tunable_start
-        delta = torch.where(
-            torch.rand(n, device=device) > 0.5,
-            torch.ones(n, device=device),
-            -torch.ones(n, device=device),
-        ) * perturbation_scale
+    @property
+    def phase(self) -> str:
+        return self._phase
 
-        # Evaluate at +Δ
-        state.meta.data[tunable_start:tunable_end] = original_values + delta
-        fe_plus = compute_free_energy(state, temperature)['free_energy'].item()
+    def step(self, state: CognitiveState, current_step: int, temperature: float = 5.0) -> bool:
+        """Called every step from Pass 2. Returns True if parameters were updated.
 
-        # Evaluate at -Δ
-        state.meta.data[tunable_start:tunable_end] = original_values - delta
-        fe_minus = compute_free_energy(state, temperature)['free_energy'].item()
+        Args:
+            state: cognitive state (meta params may be modified)
+            current_step: current training step
+            temperature: for free energy computation
 
-        # SPSA gradient estimate
-        gradient = (fe_plus - fe_minus) / (2.0 * delta + EPSILON)
+        Returns:
+            True if SPSA completed a full cycle and updated parameters this step
+        """
+        if self._phase == 'idle':
+            if current_step > 0 and current_step % self.interval == 0:
+                self._start_plus_phase(state)
+            return False
 
-        # Update parameters (minimize free energy)
-        new_values = original_values - step_size * gradient
+        # Accumulate free energy observation
+        fe = compute_free_energy(state, temperature)['free_energy'].item()
+        self._fe_accumulator += fe
+        self._steps_in_phase += 1
 
-        # Clamp to valid ranges
-        new_values[0] = new_values[0].clamp(0.1, 0.9)   # reconsolidation_threshold
-        new_values[1] = new_values[1].clamp(0.3, 0.95)   # match_threshold
-        if n > 2:
-            new_values[2] = new_values[2].clamp(0.2, 0.9)   # goal_dedup_threshold
+        if self._phase == 'eval_plus':
+            if self._steps_in_phase >= self.eval_window:
+                self._fe_plus_mean = self._fe_accumulator / self.eval_window
+                self._start_minus_phase(state)
+            return False
 
-        state.meta.data[tunable_start:tunable_end] = new_values
+        elif self._phase == 'eval_minus':
+            if self._steps_in_phase >= self.eval_window:
+                fe_minus_mean = self._fe_accumulator / self.eval_window
+                self._apply_update(state, fe_minus_mean)
+                return True
+            return False
+
+        return False
+
+    def _start_plus_phase(self, state: CognitiveState):
+        """Begin +Δ evaluation: save originals, apply positive perturbation."""
+        self._tunable_end = min(self.TUNABLE_START + 4, state.config.meta_dim)
+        n = self._tunable_end - self.TUNABLE_START
+        if n <= 0:
+            return
+
+        device = state.meta.device
+        with torch.no_grad():
+            self._original_values = state.meta.data[self.TUNABLE_START:self._tunable_end].clone()
+            self._delta = torch.where(
+                torch.rand(n, device=device) > 0.5,
+                torch.ones(n, device=device),
+                -torch.ones(n, device=device),
+            ) * self.perturbation_scale
+
+            state.meta.data[self.TUNABLE_START:self._tunable_end] = self._original_values + self._delta
+
+        self._phase = 'eval_plus'
+        self._steps_in_phase = 0
+        self._fe_accumulator = 0.0
+
+    def _start_minus_phase(self, state: CognitiveState):
+        """Switch to -Δ evaluation: apply negative perturbation."""
+        with torch.no_grad():
+            state.meta.data[self.TUNABLE_START:self._tunable_end] = self._original_values - self._delta
+
+        self._phase = 'eval_minus'
+        self._steps_in_phase = 0
+        self._fe_accumulator = 0.0
+
+    def _apply_update(self, state: CognitiveState, fe_minus_mean: float):
+        """Compute gradient from mean F(+Δ) vs mean F(-Δ), update and clamp."""
+        with torch.no_grad():
+            gradient = (self._fe_plus_mean - fe_minus_mean) / (2.0 * self._delta + EPSILON)
+            new_values = self._original_values - self.step_size * gradient
+
+            # Clamp each parameter to its valid range
+            n = self._tunable_end - self.TUNABLE_START
+            for i in range(n):
+                lo, hi = self.CLAMP_RANGES[min(i, len(self.CLAMP_RANGES) - 1)]
+                new_values[i] = new_values[i].clamp(lo, hi)
+
+            state.meta.data[self.TUNABLE_START:self._tunable_end] = new_values
+
+        # Reset to idle
+        self._phase = 'idle'
+        self._original_values = None
+        self._delta = None
+
+    def state_dict(self) -> dict:
+        """Serialize controller state for checkpointing."""
+        return {
+            'phase': self._phase,
+            'original_values': self._original_values,
+            'delta': self._delta,
+            'steps_in_phase': self._steps_in_phase,
+            'fe_accumulator': self._fe_accumulator,
+            'fe_plus_mean': self._fe_plus_mean,
+            'tunable_end': self._tunable_end,
+        }
+
+    def load_state_dict(self, d: dict):
+        """Restore controller state from checkpoint."""
+        self._phase = d.get('phase', 'idle')
+        self._original_values = d.get('original_values')
+        self._delta = d.get('delta')
+        self._steps_in_phase = d.get('steps_in_phase', 0)
+        self._fe_accumulator = d.get('fe_accumulator', 0.0)
+        self._fe_plus_mean = d.get('fe_plus_mean', 0.0)
+        self._tunable_end = d.get('tunable_end', 0)
 
 
-def apply_sequence_boundary_decay(state: CognitiveState, decay_factor: float = 0.95):
+def apply_sequence_boundary_decay(state: CognitiveState, decay_factor: float = 0.995):
     """Apply exponential decay to belief precision at sequence boundaries.
 
     Vectorized: applies decay to all active non-immutable beliefs in one op.

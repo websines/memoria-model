@@ -61,7 +61,7 @@ class StateInterfaceLayer(nn.Module):
         hidden: Tensor,
         state: CognitiveState,
         current_step: int = -1,
-    ) -> tuple[Tensor, list[WriteCandidate], Tensor, list[int]]:
+    ) -> tuple[Tensor, list[WriteCandidate], Tensor, list[int], Tensor, Tensor, Tensor]:
         """Forward pass through the state interface.
 
         Args:
@@ -74,6 +74,9 @@ class StateInterfaceLayer(nn.Module):
             candidates: list of WriteCandidate for pass 2
             utility_logits: [B, T, hidden_dim] from utility head (for aux loss)
             read_indices: list of belief indices actually retrieved
+            attn_weights: [B, T, num_heads, N_active] attention weights (for L_fe)
+            retrieved: [B, T, num_heads, D] retrieved beliefs per head (for L_fe)
+            obs_vectors: [B, T, D] observation projections (for L_fe)
         """
         normed = self.norm(hidden)
 
@@ -82,7 +85,7 @@ class StateInterfaceLayer(nn.Module):
         goal_priorities = goal_metadata[:, 0] if len(goal_indices) > 0 else None
 
         # Read: retrieve beliefs, add to residual stream
-        belief_info, utility_logits, read_indices = self.read_path(
+        belief_info, utility_logits, read_indices, attn_weights, retrieved = self.read_path(
             normed, state,
             goal_embeddings=goal_embeddings if len(goal_indices) > 0 else None,
             goal_priorities=goal_priorities,
@@ -91,6 +94,6 @@ class StateInterfaceLayer(nn.Module):
         hidden = hidden + belief_info  # residual connection
 
         # Write: project hidden states, match against beliefs, buffer candidates
-        candidates = self.write_path(normed, state, layer_idx=self.layer_idx)
+        candidates, obs_vectors = self.write_path(normed, state, layer_idx=self.layer_idx)
 
-        return hidden, candidates, utility_logits, read_indices
+        return hidden, candidates, utility_logits, read_indices, attn_weights, retrieved, obs_vectors

@@ -50,7 +50,8 @@ def interleaved_stream(
         try:
             code_iter = stream_code(tokenizer, seq_len, languages=stack_languages)
         except Exception as e:
-            print(f"WARNING: Code dataset unavailable ({e}). Redistributing weight to FineWeb.")
+            print(f"WARNING: Code dataset unavailable ({e}). Redistributing {w_stack:.0%} weight to FineWeb.")
+            print(f"  Data mix changed: FineWeb {w_fineweb:.0%} → {w_fineweb + w_stack:.0%}")
             w_fineweb += w_stack
             w_stack = 0
 
@@ -79,11 +80,13 @@ def interleaved_stream(
             except StopIteration:
                 try:
                     code_iter = stream_code(tokenizer, seq_len, languages=stack_languages)
-                except Exception:
+                except Exception as e:
+                    print(f"WARNING: Code stream restart failed ({e}). Redistributing weight to FineWeb.")
                     w_fineweb += w_stack
                     w_stack = 0
                 continue
-            except Exception:
+            except Exception as e:
+                print(f"WARNING: Code stream error ({e}). Redistributing weight to FineWeb.")
                 w_fineweb += w_stack
                 w_stack = 0
                 continue

@@ -1,7 +1,7 @@
 """Optimizer setup: Muon for matrix params, AdamW for everything else.
 
-Ported from autoresearch/train.py. Muon is the optimizer that made nanogpt
-speedruns 35% faster. Uses Newton-Schulz orthogonalization on gradient updates.
+Muon uses Newton-Schulz orthogonalization on gradient updates for matrix params,
+achieving ~35% faster convergence than AdamW on transformer blocks.
 
 Reference: github.com/karpathy/autoresearch (train.py)
 Reference: kellerjordan.github.io/posts/muon/ (Muon blog post)
@@ -9,7 +9,88 @@ Reference: kellerjordan.github.io/posts/muon/ (Muon blog post)
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 from ..model.config import MemoriaConfig
+
+
+# ── Muon Optimizer ──
+
+@torch.no_grad()
+def _newton_schulz(G: Tensor, steps: int = 5) -> Tensor:
+    """Newton-Schulz iteration for approximate matrix orthogonalization.
+
+    Computes the orthogonal polar factor of G in O(steps) matrix multiplies.
+    Coefficients from the Muon paper (degree-5 polynomial).
+    """
+    assert G.ndim == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + 1e-30)
+
+    transposed = G.shape[0] > G.shape[1]
+    if transposed:
+        X = X.T
+
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+
+    if transposed:
+        X = X.T
+
+    return X.to(G.dtype)
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon optimizer: momentum + Newton-Schulz orthogonalization.
+
+    For 2D+ parameters (attention, MLP weights), the gradient update is
+    orthogonalized via Newton-Schulz iteration, making updates explore
+    the loss landscape more efficiently.
+
+    For 1D parameters (biases, norms), falls back to standard SGD with momentum.
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            momentum = group['momentum']
+            ns_steps = group['ns_steps']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                g = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['momentum_buffer'] = torch.zeros_like(g)
+
+                buf = state['momentum_buffer']
+                buf.mul_(momentum).add_(g)
+
+                if group['nesterov']:
+                    update = g + momentum * buf
+                else:
+                    update = buf.clone()
+
+                # Newton-Schulz orthogonalization for 2D params
+                if update.ndim >= 2:
+                    original_shape = update.shape
+                    update_2d = update.view(update.shape[0], -1) if update.ndim > 2 else update
+                    update_2d = _newton_schulz(update_2d, ns_steps)
+                    update = update_2d.view(original_shape)
+                    # Scale: larger matrices get proportionally larger updates
+                    update *= max(1, update.shape[0] / update.shape[-1]) ** 0.5
+
+                p.add_(update, alpha=-lr)
 
 
 def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Optimizer:
@@ -75,20 +156,24 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
         'weight_decay': 0.0,
     })
 
-    # 4. Transformer matrix params (attention, MLP) → these benefit most from Muon
-    # For simplicity in v1, we use AdamW for all. Muon requires custom optimizer class.
-    # TODO: implement Muon for matrix params (from autoresearch)
-    matrix_params = []
+    # 4. Transformer matrix params (attention, MLP) → Muon for 2D, AdamW for 1D
+    matrix_params_2d = []
+    matrix_params_1d = []
     for block in model.transformer.blocks:
-        matrix_params.extend(block.parameters())
+        for p in block.parameters():
+            if p.ndim >= 2:
+                matrix_params_2d.append(p)
+            else:
+                matrix_params_1d.append(p)
 
-    if matrix_params:
+    # 1D params (biases, norms) still use AdamW
+    if matrix_params_1d:
         param_groups.append({
-            'params': matrix_params,
-            'lr': tc.matrix_lr,
+            'params': matrix_params_1d,
+            'lr': tc.scalar_lr,
             'betas': betas,
             'eps': 1e-8,
-            'weight_decay': tc.weight_decay,
+            'weight_decay': 0.0,
         })
 
     # 5. State interface params
@@ -105,13 +190,54 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     # Note: cognitive state params (beliefs, edges, goals, meta) have requires_grad=False
     # and are updated by pass 2, not by the optimizer.
 
-    optimizer = torch.optim.AdamW(param_groups)
+    # AdamW for non-matrix params
+    adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
+
+    # Muon for 2D matrix params (attention, MLP weights)
+    muon_optimizer = Muon(matrix_params_2d, lr=tc.matrix_lr) if matrix_params_2d else None
+
+    # Combine into a single interface
+    optimizer = _CombinedOptimizer(adamw_optimizer, muon_optimizer)
 
     # Store initial LRs for scheduling
     for group in optimizer.param_groups:
         group['initial_lr'] = group['lr']
 
     return optimizer
+
+
+class _CombinedOptimizer:
+    """Wraps AdamW + Muon into a single optimizer interface.
+
+    LR scheduling works via param_groups (both optimizers' groups are exposed).
+    """
+
+    def __init__(self, adamw: torch.optim.Optimizer | None, muon: Muon | None):
+        self._optimizers = [o for o in [adamw, muon] if o is not None]
+
+    @property
+    def param_groups(self) -> list:
+        groups = []
+        for o in self._optimizers:
+            groups.extend(o.param_groups)
+        return groups
+
+    def step(self):
+        for o in self._optimizers:
+            o.step()
+
+    def zero_grad(self, set_to_none: bool = False):
+        for o in self._optimizers:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def state_dict(self) -> dict:
+        return {
+            'optimizers': [o.state_dict() for o in self._optimizers],
+        }
+
+    def load_state_dict(self, state_dict: dict):
+        for o, sd in zip(self._optimizers, state_dict['optimizers']):
+            o.load_state_dict(sd)
 
 
 def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Optimizer:

@@ -10,6 +10,7 @@ dependencies = [
     "transformers>=4.51",
     "huggingface-hub[hf_xet]>=0.25",
     "torch-geometric>=2.6",
+    "accelerate>=1.0",
     "wandb",
     "numpy",
     "pyyaml",

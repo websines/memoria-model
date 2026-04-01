@@ -49,9 +49,10 @@ class TrainingConfig:
     adam_betas: tuple = (0.8, 0.95)
 
     # Schedule
-    warmup_ratio: float = 0.0
+    warmup_ratio: float = 0.02         # 2% warmup — stabilizes Adam estimates early
     warmdown_ratio: float = 0.5
     final_lr_frac: float = 0.0
+    grad_clip_norm: float = 1.0        # max gradient norm (0 to disable)
 
     # Free energy
     alpha_max: float = 0.1            # max weight for L_fe

@@ -135,12 +135,8 @@ class WritePath(nn.Module):
         hidden: Tensor,
         state: CognitiveState,
         layer_idx: int = 0,
-    ) -> list[WriteCandidate]:
+    ) -> tuple[list[WriteCandidate], Tensor]:
         """Project hidden states and match against existing beliefs.
-
-        We produce one write candidate per token position (taking the mean over batch).
-        In practice, not every token generates a meaningful observation — pass 2
-        filters by surprise magnitude.
 
         Args:
             hidden: [B, T, hidden_dim] transformer hidden states
@@ -148,11 +144,13 @@ class WritePath(nn.Module):
             layer_idx: which state interface layer this is (for tracking)
 
         Returns:
-            List of WriteCandidate objects for pass 2
+            candidates: list of WriteCandidate objects for pass 2
+            obs_vectors: [B, T, D] observation projections (in computation graph, for L_fe)
         """
         B, T, H = hidden.shape
+        D = self.belief_dim
 
-        # Project to belief space: [B, T, D]
+        # Project to belief space: [B, T, D] — stays in graph for differentiable L_fe
         obs_vectors = self.obs_proj(hidden)
 
         # Write gate: should this position produce a candidate at all?
@@ -162,95 +160,84 @@ class WritePath(nn.Module):
         obs_precision = self.precision_head(hidden)     # [B, T, 1]
         gated_precision = gate * obs_precision           # [B, T, 1]
 
-        # Process each batch sample independently to avoid cross-sample contamination.
-        # State is shared, but each sample's observations should be matched and
-        # buffered separately so unrelated samples don't get merged.
-        all_candidates = []
-        for b in range(B):
-            obs_b = obs_vectors[b]          # [T, D]
-            prec_b = gated_precision[b]     # [T, 1]
+        # Scale observation vectors by gated precision (set radius)
+        obs_angles = F.normalize(obs_vectors, dim=-1, eps=EPSILON)  # [B, T, D]
+        obs_beliefs = obs_angles * gated_precision                   # [B, T, D]
 
-            # Scale observation vectors by gated precision (set radius)
-            obs_angles = F.normalize(obs_b, dim=-1, eps=EPSILON)  # [T, D]
-            obs_beliefs = obs_angles * prec_b                      # [T, D] (radius = gated precision)
+        # Batch matching across all B*T positions in one matmul
+        candidates = self._match_and_buffer_batched(obs_beliefs, state, layer_idx, B, T)
 
-            # Match against existing beliefs
-            candidates = self._match_and_buffer(obs_beliefs, state, layer_idx)
-            all_candidates.extend(candidates)
+        return candidates, obs_vectors
 
-        return all_candidates
-
-    def _match_and_buffer(
+    def _match_and_buffer_batched(
         self,
-        observations: Tensor,
+        obs_beliefs: Tensor,
         state: CognitiveState,
         layer_idx: int,
+        B: int,
+        T: int,
     ) -> list[WriteCandidate]:
-        """Match observations against existing beliefs, produce candidates.
-
-        Vectorized: computes matches for all T positions in one matmul,
-        then filters by gate threshold and constructs candidates from tensors.
+        """Match all B*T observations against existing beliefs in one matmul.
 
         Args:
-            observations: [T, D] observation vectors (radius = precision)
+            obs_beliefs: [B, T, D] observation vectors (radius = precision)
             state: cognitive state
             layer_idx: layer index for tracking
+            B: batch size (for position reconstruction)
+            T: sequence length
 
         Returns:
             List of WriteCandidates
         """
-        T, D = observations.shape
+        D = obs_beliefs.shape[-1]
+        device = obs_beliefs.device
+        obs_flat = obs_beliefs.reshape(-1, D)  # [B*T, D]
+        N = obs_flat.shape[0]
 
         active_mask = state.get_active_mask()
         match_threshold = state.match_threshold
 
-        if active_mask.any():
+        obs_radii = obs_flat.norm(dim=-1)  # [N]
+        meaningful = obs_radii > 0.05
+
+        if active_mask.any() and meaningful.any():
             active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
             active_beliefs = state.beliefs.data[active_indices]  # [N_active, D]
             active_radii = active_beliefs.norm(dim=-1).clamp(min=EPSILON)
-            active_angles = active_beliefs / active_radii.unsqueeze(-1)  # [N_active, D]
+            active_angles = active_beliefs / active_radii.unsqueeze(-1)
 
-            obs_radii = observations.norm(dim=-1).clamp(min=EPSILON)
-            obs_angles = observations / obs_radii.unsqueeze(-1)  # [T, D]
+            obs_angles = obs_flat / obs_radii.unsqueeze(-1).clamp(min=EPSILON)
 
-            # Cosine similarity: [T, N_active]
+            # One big matmul: [B*T, N_active]
             similarities = obs_angles @ active_angles.T
-            best_sims, best_local = similarities.max(dim=-1)  # [T], [T]
-            best_global = active_indices[best_local]           # [T]
+            best_sims, best_local = similarities.max(dim=-1)
+            best_global = active_indices[best_local]
+
+            matched = meaningful & (best_sims > match_threshold)
         else:
-            best_sims = torch.zeros(T, device=observations.device)
-            best_global = torch.full((T,), -1, dtype=torch.long, device=observations.device)
+            best_sims = torch.zeros(N, device=device)
+            best_global = torch.full((N,), -1, dtype=torch.long, device=device)
+            matched = torch.zeros(N, dtype=torch.bool, device=device)
 
-        # Gate filter: only positions with meaningful precision
-        obs_radii = observations.norm(dim=-1)
-        meaningful = obs_radii > 0.05
-
-        # Vectorized: find which meaningful positions match vs are new
-        matched = meaningful & (best_sims > match_threshold) if active_mask.any() else torch.zeros(T, dtype=torch.bool, device=observations.device)
-        new = meaningful & ~matched
-
-        # Gather all meaningful indices
         meaningful_idx = meaningful.nonzero(as_tuple=False).squeeze(-1)
         if len(meaningful_idx) == 0:
             return []
 
-        # Detach observations for candidates
-        obs_detached = observations.detach()
+        obs_detached = obs_flat.detach()
 
-        # Build slots and sims tensors for all meaningful positions
-        slots = torch.where(matched, best_global, torch.tensor(-1, dtype=torch.long, device=observations.device))
+        slots = torch.where(matched, best_global, torch.tensor(-1, dtype=torch.long, device=device))
         sims_out = torch.where(matched, best_sims, torch.zeros_like(best_sims))
 
-        # Extract only meaningful positions — move to CPU once
         m_idx = meaningful_idx.cpu()
         m_slots = slots[meaningful_idx].cpu()
         m_sims = sims_out[meaningful_idx].cpu()
 
         candidates = []
         for i in range(len(m_idx)):
-            t = m_idx[i].item()
+            flat_pos = m_idx[i].item()
+            t = flat_pos % T  # position within sequence
             candidates.append(WriteCandidate(
-                belief_vector=obs_detached[t],
+                belief_vector=obs_detached[flat_pos],
                 matched_slot=m_slots[i].item(),
                 match_similarity=m_sims[i].item(),
                 source_position=t,

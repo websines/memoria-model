@@ -24,30 +24,9 @@ from torch import Tensor
 from .config import MemoriaConfig
 from ..core.state import CognitiveState
 from ..core.free_energy import compute_free_energy
+from ..core.losses import chunked_cross_entropy, compute_differentiable_free_energy
 from ..interface.layer import StateInterfaceLayer
 from ..interface.write_path import WriteCandidate
-
-
-def chunked_cross_entropy(logits: Tensor, targets: Tensor, chunk_size: int = 4096, ignore_index: int = -1) -> Tensor:
-    """Cross-entropy computed in chunks to avoid materializing [B*T, vocab] in memory."""
-    BT, V = logits.shape
-    if BT <= chunk_size:
-        return F.cross_entropy(logits, targets, ignore_index=ignore_index)
-
-    total_loss = 0.0
-    n_tokens = 0
-    for start in range(0, BT, chunk_size):
-        end = min(start + chunk_size, BT)
-        chunk_logits = logits[start:end]
-        chunk_targets = targets[start:end]
-        valid = (chunk_targets != ignore_index).sum().item()
-        if valid > 0:
-            total_loss = total_loss + F.cross_entropy(
-                chunk_logits, chunk_targets, ignore_index=ignore_index, reduction='sum'
-            )
-            n_tokens += valid
-
-    return total_loss / max(n_tokens, 1)
 
 
 class PretrainedMemoriaModel(nn.Module):
@@ -174,6 +153,9 @@ class PretrainedMemoriaModel(nn.Module):
         all_candidates: list[WriteCandidate] = []
         all_utility_logits: list[Tensor] = []
         all_read_indices: list[int] = []
+        all_attn_weights: list[Tensor] = []
+        all_retrieved: list[Tensor] = []
+        all_obs_vectors: list[Tensor] = []
         interface_idx = 0
         # Track if we've passed any interface (gradient chain must be maintained after)
         grad_active = False
@@ -207,9 +189,8 @@ class PretrainedMemoriaModel(nn.Module):
                 # Cast to float32 for interface layers (backbone outputs bfloat16)
                 hidden_f32 = hidden.float()
 
-                interface_out, candidates, utility_logits, read_indices = self.interfaces[interface_idx](
-                    hidden_f32, self.state
-                )
+                interface_out, candidates, utility_logits, read_indices, attn_w, retrieved, obs_v = \
+                    self.interfaces[interface_idx](hidden_f32, self.state)
 
                 # Gated residual: read_gate controls how much belief info is injected
                 gate = torch.sigmoid(self.read_gate[interface_idx])
@@ -220,6 +201,9 @@ class PretrainedMemoriaModel(nn.Module):
                 all_candidates.extend(candidates)
                 all_utility_logits.append(utility_logits)
                 all_read_indices.extend(read_indices)
+                all_attn_weights.append(attn_w)
+                all_retrieved.append(retrieved)
+                all_obs_vectors.append(obs_v)
                 interface_idx += 1
                 grad_active = True  # from here on, gradients must flow
 
@@ -239,11 +223,18 @@ class PretrainedMemoriaModel(nn.Module):
                 targets.view(-1),
             )
 
-            # Free energy loss
+            # Free energy loss (differentiable — provides actual gradients to interfaces)
             if alpha > 0:
-                fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
-                result['loss_fe'] = fe_stats['free_energy']
-                result['free_energy_stats'] = fe_stats
+                loss_fe = compute_differentiable_free_energy(
+                    all_attn_weights, all_retrieved, all_obs_vectors,
+                    self.config.state.belief_dim,
+                )
+                result['loss_fe'] = loss_fe
+
+                # State free energy for beta/stats only (no gradients)
+                with torch.no_grad():
+                    fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
+                    result['free_energy_stats'] = fe_stats
 
                 # Utility loss from interface layers
                 loss_utility = torch.tensor(0.0, device=idx.device)
@@ -257,7 +248,7 @@ class PretrainedMemoriaModel(nn.Module):
                     loss_utility = loss_utility / len(all_utility_logits)
                 result['loss_utility'] = loss_utility
 
-                result['loss'] = result['loss_token'] + alpha * result['loss_fe'] + alpha * 0.1 * loss_utility
+                result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility
             else:
                 result['loss_fe'] = torch.tensor(0.0, device=idx.device)
                 result['loss'] = result['loss_token']
@@ -274,14 +265,9 @@ class PretrainedMemoriaModel(nn.Module):
         return output[0] if isinstance(output, tuple) else output
 
     def detach_state(self):
-        """Detach cognitive state from computation graph."""
-        with torch.no_grad():
-            self.state.beliefs.data = self.state.beliefs.data.clone()
-            self.state.edge_relations.data = self.state.edge_relations.data.clone()
-            self.state.edge_weights.data = self.state.edge_weights.data.clone()
-            self.state.goal_embeddings.data = self.state.goal_embeddings.data.clone()
-            self.state.goal_metadata.data = self.state.goal_metadata.data.clone()
-            self.state.meta.data = self.state.meta.data.clone()
+        """No-op. State tensors have requires_grad=False and are accessed via .data,
+        so they are never part of the computation graph."""
+        pass
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

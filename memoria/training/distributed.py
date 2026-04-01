@@ -1,77 +1,17 @@
-"""Distributed training setup for multi-GPU via DDP.
+"""Distributed ops for cognitive state (not handled by Accelerate).
 
-Architecture:
-- Transformer + interface weights: replicated via DDP (gradients synced automatically)
-- Cognitive state: lives on rank 0, broadcast to all ranks before each step
-- Write candidates: gathered to rank 0 after forward pass
-- Pass 2: runs on rank 0 only, then state is broadcast again
+Accelerate handles DDP model wrapping, gradient sync, and device placement.
+This module provides the cognitive-state-specific distributed operations:
+- broadcast_state: rank 0 → all ranks before each forward pass
+- gather_candidates: all ranks → rank 0 after forward pass
+- gather_read_indices: all ranks → rank 0 for Hebbian learning
+- sync_ranks: barrier after Pass 2
 
-Single-GPU mode: all DDP ops become no-ops, no overhead.
+Single-GPU mode: all ops are no-ops, no overhead.
 """
 
-import os
-from datetime import timedelta
-
 import torch
-import torch.nn as nn
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-
-def setup_distributed() -> tuple[int, int, torch.device]:
-    """Initialize distributed training if available.
-
-    Returns:
-        (rank, world_size, device)
-    """
-    if 'RANK' in os.environ and torch.cuda.device_count() > 1:
-        # Launched via torchrun
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-
-        dist.init_process_group(backend='nccl', timeout=timedelta(minutes=30))
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f'cuda:{local_rank}')
-
-        if rank == 0:
-            print(f"DDP initialized: {world_size} GPUs")
-
-        return rank, world_size, device
-    else:
-        # Single GPU or CPU
-        device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
-        return 0, 1, device
-
-
-def cleanup_distributed():
-    """Destroy distributed process group."""
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def wrap_ddp(model: nn.Module, device: torch.device, rank: int, world_size: int) -> tuple[nn.Module, nn.Module]:
-    """Wrap model in DDP if distributed.
-
-    The cognitive state is excluded from DDP by setting requires_grad=False
-    (already done). DDP only syncs gradient-bearing parameters.
-
-    Args:
-        model: MemoriaModel on device
-        device: this rank's device
-        rank: this process rank
-        world_size: total processes
-
-    Returns:
-        (wrapped_model, base_model) — wrapped for forward, base for state access
-    """
-    model = model.to(device)
-    base_model = model
-
-    if world_size > 1:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-
-    return model, base_model
 
 
 def broadcast_state(state, rank: int, world_size: int):

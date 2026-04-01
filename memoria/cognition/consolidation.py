@@ -19,24 +19,33 @@ from ..core.polar import angular_similarity, precision_weighted_average, belief_
 def soft_consolidation(
     state: CognitiveState,
     similarity_threshold: float = 0.95,
+    max_beliefs_to_check: int = 512,
 ) -> int:
     """Merge very similar active beliefs (differentiable-friendly).
 
-    Vectorized: computes full similarity matrix and extracts merge pairs with
-    torch.nonzero instead of nested Python loops.
+    Samples a subset of active beliefs if count exceeds max_beliefs_to_check,
+    capping the similarity matrix to max_beliefs_to_check^2 instead of N^2.
 
     Args:
         state: cognitive state
         similarity_threshold: how similar beliefs must be to merge
+        max_beliefs_to_check: cap on beliefs to compare (limits O(N^2) cost)
 
     Returns:
         Number of beliefs merged
     """
     active_mask = state.get_active_mask()
-    if active_mask.sum() < 2:
+    n_active = active_mask.sum().item()
+    if n_active < 2:
         return 0
 
     active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    # Sample subset if too many active beliefs
+    if n_active > max_beliefs_to_check:
+        perm = torch.randperm(n_active, device=active_indices.device)[:max_beliefs_to_check]
+        active_indices = active_indices[perm]
+
     active_beliefs = state.beliefs.data[active_indices]
     n = len(active_indices)
 
