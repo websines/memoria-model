@@ -242,13 +242,18 @@ class PretrainedMemoriaModel(nn.Module):
             # Utility loss from interface layers
             loss_utility = torch.tensor(0.0, device=idx.device)
             if all_utility_logits:
-                for util_hidden in all_utility_logits:
-                    util_logits = lm_head(util_hidden)
-                    loss_utility = loss_utility + chunked_cross_entropy(
-                        util_logits.view(-1, util_logits.size(-1)),
-                        targets.view(-1),
-                    )
-                loss_utility = loss_utility / len(all_utility_logits)
+                if alpha > 0:
+                    for util_hidden in all_utility_logits:
+                        util_logits = lm_head(util_hidden)
+                        loss_utility = loss_utility + chunked_cross_entropy(
+                            util_logits.view(-1, util_logits.size(-1)),
+                            targets.view(-1),
+                        )
+                    loss_utility = loss_utility / len(all_utility_logits)
+                else:
+                    # Cheap graph participation without materializing [B*T, vocab]
+                    for util_hidden in all_utility_logits:
+                        loss_utility = loss_utility + util_hidden.sum() * 0.0
             result['loss_utility'] = loss_utility
 
             result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility

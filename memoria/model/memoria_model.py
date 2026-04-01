@@ -149,16 +149,23 @@ class MemoriaModel(nn.Module):
             # in the computation graph (required by DDP). When α=0, these contribute
             # zero to the loss but keep parameters in the graph for gradient reduction.
 
-            # Utility loss — use self.transformer.head() for consistent norm + softcap
+            # Utility loss
             loss_utility = torch.tensor(0.0, device=idx.device)
             if all_utility_logits:
-                for util_hidden in all_utility_logits:
-                    util_logits = self.transformer.head(util_hidden)
-                    loss_utility = loss_utility + chunked_cross_entropy(
-                        util_logits.view(-1, util_logits.size(-1)),
-                        targets.view(-1),
-                    )
-                loss_utility = loss_utility / len(all_utility_logits)
+                if alpha > 0:
+                    # Full utility: run through LM head (materializes [B*T, vocab] per layer)
+                    for util_hidden in all_utility_logits:
+                        util_logits = self.transformer.head(util_hidden)
+                        loss_utility = loss_utility + chunked_cross_entropy(
+                            util_logits.view(-1, util_logits.size(-1)),
+                            targets.view(-1),
+                        )
+                    loss_utility = loss_utility / len(all_utility_logits)
+                else:
+                    # Cheap graph participation: keep utility_head in the computation
+                    # graph for DDP without materializing the huge vocab logit tensor
+                    for util_hidden in all_utility_logits:
+                        loss_utility = loss_utility + util_hidden.sum() * 0.0
             result['loss_utility'] = loss_utility
 
             # Differentiable free energy (provides actual gradients to interfaces)
