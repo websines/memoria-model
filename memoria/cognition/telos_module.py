@@ -47,23 +47,26 @@ class TelosModule(nn.Module):
     computation only.
     """
 
-    def __init__(self, belief_dim: int, max_goals: int = 64, surprise_dim: int = 64):
+    def __init__(self, belief_dim: int, max_goals: int = 64, surprise_dim: int | None = None):
         super().__init__()
         self.belief_dim = belief_dim
         self.max_goals = max_goals
-        self.surprise_dim = surprise_dim
+        self.surprise_dim = surprise_dim if surprise_dim is not None else belief_dim
 
         # --- RND Surprise ---
-        # Target: frozen random projection of belief space
-        self.surprise_target = nn.Linear(belief_dim, surprise_dim, bias=False)
+        # Target: frozen random projection of belief space.
+        # Uses full belief_dim to avoid information loss (64 was too small for D=256).
+        # Orthogonal init for stable, seed-independent random features.
+        self.surprise_target = nn.Linear(belief_dim, self.surprise_dim, bias=False)
+        nn.init.orthogonal_(self.surprise_target.weight)
         # Freeze target — never updated
         for p in self.surprise_target.parameters():
             p.requires_grad = False
         # Predictor: trained to match target. Prediction error = novelty.
         self.surprise_predictor = nn.Sequential(
-            nn.Linear(belief_dim, belief_dim // 2),
+            nn.Linear(belief_dim, belief_dim),
             nn.ReLU(),
-            nn.Linear(belief_dim // 2, surprise_dim),
+            nn.Linear(belief_dim, self.surprise_dim),
         )
 
         # --- Goal Generator ---

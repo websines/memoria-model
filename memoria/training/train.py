@@ -355,7 +355,7 @@ def train(
                 read_belief_indices=read_indices,
                 current_step=step,
                 is_sequence_boundary=has_boundary,
-                spsa_controller=spsa_controller,
+                total_steps=max_steps,
             )
         else:
             pass2_stats = {

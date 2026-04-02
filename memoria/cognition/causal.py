@@ -267,25 +267,10 @@ def causal_edge_learning(
                         edge_idx = edge_index.get((prev_idx, curr_idx), -1)
 
                         if edge_idx >= 0:
-                            # Bayesian posterior update
-                            obs = state.edge_causal_obs[edge_idx].item()
-                            obs = max(obs, 1.0)
-                            old_w = state.edge_weights.data[edge_idx].item()
-                            new_w = (old_w * obs + signal) / (obs + 1.0)
-
-                            state.edge_weights.data[edge_idx] = min(new_w, 1.0)
-                            state.edge_causal_obs[edge_idx] = obs + 1.0
-
-                            # Update relation vector
-                            cause_angle = belief_angles[prev_idx]
-                            effect_angle = belief_angles[curr_idx]
-                            new_rel = torch.zeros(K, device=state.beliefs.device)
-                            new_rel[:D] = (effect_angle[:D] - cause_angle[:D]) * state.meta_params.causal_relation_scale.item()
-                            alpha = 1.0 / (obs + 1.0)
-                            state.edge_relations.data[edge_idx] = (
-                                (1.0 - alpha) * state.edge_relations.data[edge_idx] + alpha * new_rel
-                            )
-
+                            # Edge already exists — just mark as reinforced.
+                            # Weight and relation updates are handled by gradient
+                            # through L_fe_bethe (edge_weights has requires_grad=True).
+                            state.edge_causal_obs[edge_idx] += 1.0
                             reinforced.add(edge_idx)
                             stats['edges_strengthened'] += 1
                         else:
@@ -304,32 +289,9 @@ def causal_edge_learning(
                                 edge_index[(prev_idx, curr_idx)] = new_idx
                                 stats['edges_created'] += 1
 
-                # Batch decay unreinforced causal edges
-                if state.edge_active.any():
-                    active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
-                    causal_mask = state.edge_causal_obs[active_idx] > 0
-                    immutable_mask = state.immutable_edges[active_idx]
-                    decay_mask = causal_mask & ~immutable_mask
-
-                    if decay_mask.any():
-                        decay_edges = active_idx[decay_mask]
-                        # Filter out reinforced edges
-                        reinforced_t = torch.tensor(list(reinforced), dtype=torch.long, device=decay_edges.device) if reinforced else torch.tensor([], dtype=torch.long, device=decay_edges.device)
-                        if len(reinforced_t) > 0:
-                            # Create mask for non-reinforced
-                            is_reinforced = (decay_edges.unsqueeze(-1) == reinforced_t.unsqueeze(0)).any(dim=-1)
-                            decay_edges = decay_edges[~is_reinforced]
-
-                        if len(decay_edges) > 0:
-                            weights = state.edge_weights.data[decay_edges]
-                            weights *= (1.0 - decay_rate)
-                            state.edge_weights.data[decay_edges] = weights
-                            # Deallocate edges that decayed below threshold
-                            dead = weights < 0.01
-                            if dead.any():
-                                for eidx in decay_edges[dead].tolist():
-                                    state.deallocate_edge(eidx)
-                            stats['edges_decayed'] = len(decay_edges)
+                # Edge weight decay removed — handled by optimizer weight decay on
+                # edge_weights (requires_grad=True). Dead edges (weight < EPSILON)
+                # cleaned up in pass2 structural cleanup.
 
         # Store current step's surprises for next step
         state.belief_prev_surprise.zero_()

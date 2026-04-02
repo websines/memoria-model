@@ -33,6 +33,7 @@ def run_pass2(
     read_belief_indices: list[int],
     current_step: int,
     is_sequence_boundary: bool = True,
+    total_steps: int = 1,  # must be provided by caller (training loop knows max_steps)
     spsa_controller=None,  # deprecated, kept for call-site compat
 ) -> dict:
     """Structural cleanup pass after gradient-based updates.
@@ -125,12 +126,11 @@ def run_pass2(
         stats['hard_cleanup_removed'] = 0
 
     # ── 5. Differentiable goal generation (via TelosModule) ──
-    # Goals are generated here using the learned TelosModule.
-    # This runs in no_grad since we're in pass2 (structural).
-    # The TelosModule also runs in the forward pass (with gradients) for training.
+    # Gated by cooldown from running_stats to prevent slot flooding.
+    cooldown = state.running_stats.goal_cooldown_steps
     with torch.no_grad():
         active_mask = state.get_active_mask()
-        if active_mask.any():
+        if active_mask.any() and current_step % max(cooldown, 1) == 0:
             beta = state.meta.data[0].item()
             goal_embeds, goal_surprise = state.telos.generate_goals(
                 state.beliefs.data, active_mask, beta, max_new=3,
@@ -170,7 +170,7 @@ def run_pass2(
     })
 
     # Anneal Telos Gumbel-Softmax temperature
-    state.telos.anneal_temperature(current_step, 5000)
+    state.telos.anneal_temperature(current_step, total_steps)
 
     stats['active_beliefs'] = state.num_active_beliefs()
     stats['active_edges'] = state.num_active_edges()

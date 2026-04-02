@@ -282,7 +282,7 @@ class _CombinedOptimizer:
 
 
 def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Optimizer:
-    """Optimizer for pretrained mode: only interface layers + read gates are trained."""
+    """Optimizer for pretrained mode: interface layers + cognitive state + telos."""
     tc = config.training
     betas = tc.adam_betas
 
@@ -302,6 +302,49 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
             'weight_decay': 0.0,
         },
     ]
+
+    # Cognitive state (beliefs, edges, relations)
+    cognitive_params = [p for p in [model.state.beliefs, model.state.edge_weights, model.state.edge_relations] if p.requires_grad]
+    if cognitive_params:
+        param_groups.append({
+            'params': cognitive_params,
+            'lr': tc.belief_lr,
+            'betas': (0.9, 0.999),
+            'eps': 1e-8,
+            'weight_decay': tc.weight_decay,
+        })
+
+    # Cognitive meta-parameters
+    cognitive_meta_params = list(model.state.meta_params.parameters())
+    if cognitive_meta_params:
+        param_groups.append({
+            'params': cognitive_meta_params,
+            'lr': tc.cognitive_meta_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # Telos module (surprise predictor, goal generator, transition net, progress head)
+    telos_params = [p for p in model.state.telos.parameters() if p.requires_grad]
+    if telos_params:
+        param_groups.append({
+            'params': telos_params,
+            'lr': tc.interface_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # Goal embeddings
+    if model.state.goal_embeddings.requires_grad:
+        param_groups.append({
+            'params': [model.state.goal_embeddings],
+            'lr': tc.belief_lr,
+            'betas': (0.9, 0.999),
+            'eps': 1e-8,
+            'weight_decay': tc.weight_decay * 0.5,
+        })
 
     optimizer = torch.optim.AdamW(param_groups)
     for group in optimizer.param_groups:

@@ -265,7 +265,47 @@ class PretrainedMemoriaModel(nn.Module):
                         loss_utility = loss_utility + util_hidden.sum() * 0.0
             result['loss_utility'] = loss_utility
 
-            result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility
+            # Telos: differentiable goal system
+            if alpha > 0:
+                active_mask = self.state.get_active_mask()
+                loss_surprise = self.state.telos.surprise_loss(
+                    self.state.beliefs[active_mask] if active_mask.any()
+                    else self.state.beliefs[:0]
+                )
+                active_goals_mask = self.state.goal_status_logits[:, 2] > self.state.goal_status_logits[:, 0]
+                if active_goals_mask.any():
+                    active_goal_embeds = self.state.goal_embeddings[active_goals_mask]
+                    progress = self.state.telos.estimate_progress(
+                        active_goal_embeds, self.state.beliefs, active_mask,
+                    )
+                    active_status_logits = self.state.goal_status_logits[active_goals_mask]
+                    new_logits = self.state.telos.update_status(
+                        active_goal_embeds, active_status_logits, progress,
+                        self.state.beliefs, active_mask,
+                    )
+                    self.state.goal_status_logits.data[active_goals_mask] = new_logits.detach()
+                    status_probs = torch.nn.functional.gumbel_softmax(
+                        new_logits, tau=self.state.telos.gumbel_tau.item(), hard=False,
+                    )
+                    # Penalize stalled (3) + failed (5), reward completed (4)
+                    loss_surprise = loss_surprise + (
+                        (status_probs[:, 3] + status_probs[:, 5] - status_probs[:, 4]).mean() * 0.1
+                    )
+                else:
+                    loss_surprise = loss_surprise + self.state.goal_embeddings.sum() * 0.0
+                result['loss_surprise'] = loss_surprise
+            else:
+                result['loss_surprise'] = torch.tensor(0.0, device=idx.device)
+                for p in self.state.telos.parameters():
+                    if p.requires_grad:
+                        result['loss_surprise'] = result['loss_surprise'] + p.sum() * 0.0
+
+            result['loss'] = (
+                result['loss_token']
+                + alpha * loss_fe
+                + alpha * 0.1 * loss_utility
+                + alpha * 0.1 * result['loss_surprise']
+            )
         else:
             logits = lm_head(hidden)
             result['logits'] = logits
@@ -283,6 +323,7 @@ class PretrainedMemoriaModel(nn.Module):
         self.state.beliefs.detach_()
         self.state.edge_weights.detach_()
         self.state.edge_relations.detach_()
+        self.state.goal_embeddings.detach_()
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

@@ -213,9 +213,18 @@ class MemoriaModel(nn.Module):
                         active_goal_embeds, active_status_logits, progress,
                         self.state.beliefs, active_mask,
                     )
-                    # Write back (in-place, but new_logits has grad)
-                    with torch.no_grad():
-                        self.state.goal_status_logits[active_goals_mask] = new_logits.detach()
+                    # Write back — keep in graph so transition net gets gradients
+                    # through the Bethe free energy's telos energy term
+                    self.state.goal_status_logits.data[active_goals_mask] = new_logits.detach()
+                    # But also add a loss term that depends on new_logits to train the transition net
+                    # Encourage active goals (status 2) over stalled/failed — soft prior
+                    status_probs = torch.nn.functional.gumbel_softmax(
+                        new_logits, tau=self.state.telos.gumbel_tau.item(), hard=False,
+                    )
+                    # Penalize stalled (3) + failed (5), reward completed (4)
+                    loss_surprise = loss_surprise + (
+                        (status_probs[:, 3] + status_probs[:, 5] - status_probs[:, 4]).mean() * 0.1
+                    )
                     result['goal_progress'] = progress.mean().item() if len(progress) > 0 else 0.0
                 else:
                     loss_surprise = loss_surprise + self.state.goal_embeddings.sum() * 0.0  # DDP graph participation
