@@ -192,7 +192,47 @@ class MemoriaModel(nn.Module):
             result['loss_fe_proxy'] = loss_fe_proxy
             result['loss_fe_bethe'] = loss_fe_bethe
 
-            result['loss'] = result['loss_token'] + alpha * loss_fe + alpha * 0.1 * loss_utility
+            # Telos: differentiable goal system (RND surprise + progress + transitions)
+            if alpha > 0:
+                active_mask = self.state.get_active_mask()
+                # RND surprise loss (trains predictor to match target for seen beliefs)
+                loss_surprise = self.state.telos.surprise_loss(
+                    self.state.beliefs[active_mask] if active_mask.any()
+                    else self.state.beliefs[:0]
+                )
+                # Goal progress estimation (differentiable)
+                active_goals_mask = self.state.goal_status_logits[:, 2] > self.state.goal_status_logits[:, 0]  # active > empty
+                if active_goals_mask.any():
+                    active_goal_embeds = self.state.goal_embeddings[active_goals_mask]
+                    progress = self.state.telos.estimate_progress(
+                        active_goal_embeds, self.state.beliefs, active_mask,
+                    )
+                    # Update status transitions
+                    active_status_logits = self.state.goal_status_logits[active_goals_mask]
+                    new_logits = self.state.telos.update_status(
+                        active_goal_embeds, active_status_logits, progress,
+                        self.state.beliefs, active_mask,
+                    )
+                    # Write back (in-place, but new_logits has grad)
+                    with torch.no_grad():
+                        self.state.goal_status_logits[active_goals_mask] = new_logits.detach()
+                    result['goal_progress'] = progress.mean().item() if len(progress) > 0 else 0.0
+                else:
+                    loss_surprise = loss_surprise + self.state.goal_embeddings.sum() * 0.0  # DDP graph participation
+                result['loss_surprise'] = loss_surprise
+            else:
+                result['loss_surprise'] = torch.tensor(0.0, device=idx.device)
+                # DDP graph participation for telos params
+                for p in self.state.telos.parameters():
+                    if p.requires_grad:
+                        result['loss_surprise'] = result['loss_surprise'] + p.sum() * 0.0
+
+            result['loss'] = (
+                result['loss_token']
+                + alpha * loss_fe
+                + alpha * 0.1 * loss_utility
+                + alpha * 0.1 * result['loss_surprise']
+            )
         else:
             logits = self.transformer.head(x)
             result['logits'] = logits
@@ -216,6 +256,7 @@ class MemoriaModel(nn.Module):
         self.state.beliefs.detach_()
         self.state.edge_weights.detach_()
         self.state.edge_relations.detach_()
+        self.state.goal_embeddings.detach_()
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

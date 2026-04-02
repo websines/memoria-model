@@ -1,35 +1,30 @@
-"""Pass 2 orchestrator: runs all cognitive updates after the forward pass.
+"""Pass 2: structural cleanup after gradient-based state updates.
 
-Order:
-1. Surprise computation
-2. Belief updates (precision-weighted revision)
-3. Causal edge learning (temporal surprise precedence → directed edges)
-4. Hebbian edge strengthening (co-activation → undirected edges)
-5. Goal progress tracking
-6. Intrinsic goal generation (from surprise)
-7. Stall detection + deadline enforcement
-8. Meta update (β computation, periodic SPSA)
-9. Consolidation (periodic)
+The gradient (from L_token + L_fe_bethe + L_fe_proxy + L_utility + L_surprise)
+handles ALL continuous updates to beliefs, edges, and relations via optimizer.step().
 
-This runs ONCE per sequence (training) or per response (inference).
-The cognitive state is modified in-place.
+Pass 2 handles only discrete structural operations that gradients cannot:
+1. Allocate new belief slots for unmatched write candidates
+2. Create new edges for co-activated belief pairs (topology, not weights)
+3. Structural cleanup: zero-norm beliefs → free slot, zero-weight edges → inactive
+4. Periodic consolidation (merge near-identical beliefs, prune dead ones)
+5. Differentiable goal generation via TelosModule (runs with gradients when called from forward)
+6. Beta computation and running statistics update
+
+This runs ONCE per step after optimizer.step() and detach_state().
+The cognitive state is modified in-place via .data access (no gradients).
 """
 
+import torch
 from ..core.state import CognitiveState
+from ..core.polar import EPSILON
 from ..interface.write_path import WriteCandidate
 from .surprise import compute_surprise_batch
 from .belief_update import allocate_new_beliefs
 from .hebbian import hebbian_update, extract_co_activations
 from .causal import causal_edge_learning
-from .telos import (
-    generate_intrinsic_goals, update_goal_progress,
-    detect_stalls, enforce_deadlines,
-)
 from .consolidation import soft_consolidation, periodic_hard_cleanup
-from .meta_learning import compute_beta, SPSAController, apply_sequence_boundary_decay
-
-
-MAX_CANDIDATES = 1024  # safety valve: subsample if too many candidates
+from .meta_learning import compute_beta
 
 
 def run_pass2(
@@ -38,112 +33,77 @@ def run_pass2(
     read_belief_indices: list[int],
     current_step: int,
     is_sequence_boundary: bool = True,
-    consolidation_interval: int = 50,
-    max_candidates: int = MAX_CANDIDATES,
-    spsa_controller: SPSAController | None = None,
+    spsa_controller=None,  # deprecated, kept for call-site compat
 ) -> dict:
-    """Run the full pass 2 cognitive update loop.
+    """Structural cleanup pass after gradient-based updates.
+
+    All continuous updates (belief content, precision, edge weights, relations)
+    are handled by optimizer.step() through L_fe_bethe. This function handles
+    only discrete structural operations.
 
     Args:
-        state: cognitive state to update (modified in-place)
+        state: cognitive state to update (modified in-place via .data)
         candidates: write candidates from state interface layers
         read_belief_indices: indices of beliefs that were read during pass 1
         current_step: current training/inference step
-        is_sequence_boundary: whether we're at a sequence boundary (apply decay)
-        consolidation_interval: run consolidation every N steps
-        max_candidates: subsample candidates if exceeding this count
-        spsa_controller: multi-step SPSA controller (created by training loop, None to skip)
+        is_sequence_boundary: whether we're at a sequence boundary
+        spsa_controller: deprecated, ignored
 
     Returns:
-        dict with statistics from all sub-operations
+        dict with statistics
     """
-    stats = {
-        'step': current_step,
-    }
+    stats = {'step': current_step}
 
-    # Subsample candidates if too many (safety valve)
+    # ── 1. Structural cleanup: zero-norm beliefs and edges ──
+    with torch.no_grad():
+        # Beliefs driven to zero by weight decay → free the slot
+        radii = state.beliefs.data.norm(dim=-1)
+        dead_beliefs = (radii > 0) & (radii < EPSILON) & ~state.immutable_beliefs
+        if dead_beliefs.any():
+            dead_idx = dead_beliefs.nonzero(as_tuple=False).squeeze(-1)
+            for idx in dead_idx.tolist():
+                state.deallocate_belief(idx)
+        stats['beliefs_cleaned'] = dead_beliefs.sum().item()
+
+        # Edges driven to zero by weight decay → deactivate
+        dead_edges = state.edge_active & (state.edge_weights.data.abs() < EPSILON)
+        if dead_edges.any():
+            dead_idx = dead_edges.nonzero(as_tuple=False).squeeze(-1)
+            for idx in dead_idx.tolist():
+                state.deallocate_edge(idx)
+        stats['edges_cleaned'] = dead_edges.sum().item()
+
+    # ── 2. New belief allocation (discrete: pick a slot) ──
+    max_candidates = 1024
     if len(candidates) > max_candidates:
         import random
         candidates = random.sample(candidates, max_candidates)
 
-    # 1. Surprise computation
     surprise_results = compute_surprise_batch(candidates, state)
     stats['num_candidates'] = len(candidates)
-    stats['num_surprise_results'] = len(surprise_results)
     stats['total_surprise'] = sum(sr.surprise for sr in surprise_results)
 
-    # 2. Belief updates
     update_stats = allocate_new_beliefs(surprise_results, state)
     stats.update({f'belief_{k}': v for k, v in update_stats.items()})
 
-    # Collect indices and surprises of updated beliefs (for goal progress + Hebbian)
-    # For existing slots: direct from surprise results
-    # For new allocations: batch cosine similarity search
+    # Collect indices for edge creation
     updated_indices = []
     surprise_values = []
-    new_observations = []
-    new_surprises = []
-
     for sr in surprise_results:
         if sr.slot >= 0:
             updated_indices.append(sr.slot)
             surprise_values.append(sr.surprise)
-        elif sr.is_new:
-            new_observations.append(sr.observation)
-            new_surprises.append(sr.surprise)
 
-    # Batch-find slots for newly allocated beliefs
-    n_new = min(len(new_observations), update_stats['new_allocations'])
-    if n_new > 0:
-        import torch
-        active_mask = state.get_active_mask()
-        active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
-        if len(active_indices) > 0:
-            active_beliefs = state.beliefs.data[active_indices]  # [A, D]
-            new_obs_t = torch.stack(new_observations[:n_new])    # [K, D]
-            # Batch cosine similarity: [K, A]
-            sims = torch.nn.functional.cosine_similarity(
-                new_obs_t.unsqueeze(1),       # [K, 1, D]
-                active_beliefs.unsqueeze(0),  # [1, A, D]
-                dim=-1,
-            )
-            best_local = sims.argmax(dim=-1)  # [K]
-            best_slots = active_indices[best_local]  # [K]
-            for i in range(n_new):
-                updated_indices.append(best_slots[i].item())
-                surprise_values.append(new_surprises[i])
-
-    # 3. Causal edge learning (temporal surprise precedence → directed edges)
+    # ── 3. Edge topology creation (discrete: create new edges, no weight updates) ──
     causal_stats = causal_edge_learning(state, updated_indices, surprise_values)
     stats['causal_edges_created'] = causal_stats['edges_created']
-    stats['causal_edges_strengthened'] = causal_stats['edges_strengthened']
 
-    # 4. Hebbian edge strengthening (co-activation → undirected edges)
     co_activations = extract_co_activations(state, read_belief_indices)
     hebbian_update(state, co_activations)
     stats['co_activation_pairs'] = len(co_activations)
 
-    # 5. Goal progress
-    update_goal_progress(state, updated_indices, surprise_values)
-    stats['active_goals'] = state.num_active_goals()
-
-    # 6. Meta update: β + multi-step SPSA
-    beta = compute_beta(state, state.meta_params.fe_temperature.item())
-    stats['beta'] = beta
-
-    # SPSA removed — its tunable params are now nn.Parameters in MetaParams,
-    # trained by backprop through L_fe. Nevergrad available as fallback if
-    # future discrete parameters need gradient-free optimization.
-    if spsa_controller is not None:
-        did_update = spsa_controller.step(state, current_step, state.meta_params.fe_temperature.item())
-        stats['spsa_step'] = did_update
-        stats['spsa_phase'] = spsa_controller.phase
-    else:
-        stats['spsa_step'] = False
-        stats['spsa_phase'] = 'disabled'
-
-    # 7. Consolidation (periodic, not every step)
-    if current_step % 10 == 0:
+    # ── 4. Periodic consolidation (structural: merge similar beliefs) ──
+    if current_step % state.running_stats.soft_consolidation_interval == 0:
         merged = soft_consolidation(
             state,
             similarity_threshold=state.running_stats.merge_similarity_threshold,
@@ -152,6 +112,7 @@ def run_pass2(
         merged = 0
     stats['soft_merges'] = merged
 
+    consolidation_interval = state.running_stats.hard_consolidation_interval
     consolidation_timer = state.meta.data[2].item()
     if consolidation_timer >= consolidation_interval:
         removed = periodic_hard_cleanup(
@@ -159,21 +120,47 @@ def run_pass2(
             low_precision_threshold=state.running_stats.hard_cleanup_precision_threshold,
         )
         stats['hard_cleanup_removed'] = removed
-        state.meta.data[2] = 0.0  # reset timer
+        state.meta.data[2] = 0.0
     else:
         stats['hard_cleanup_removed'] = 0
 
-    # 8. Intrinsic goal generation (AFTER consolidation so goals reference valid beliefs)
-    new_goals = generate_intrinsic_goals(state, current_step)
-    stats['goals_generated'] = new_goals
+    # ── 5. Differentiable goal generation (via TelosModule) ──
+    # Goals are generated here using the learned TelosModule.
+    # This runs in no_grad since we're in pass2 (structural).
+    # The TelosModule also runs in the forward pass (with gradients) for training.
+    with torch.no_grad():
+        active_mask = state.get_active_mask()
+        if active_mask.any():
+            beta = state.meta.data[0].item()
+            goal_embeds, goal_surprise = state.telos.generate_goals(
+                state.beliefs.data, active_mask, beta, max_new=3,
+            )
+            # Allocate goal slots
+            n_allocated = 0
+            for i in range(goal_embeds.shape[0]):
+                # Find empty goal slot (status_logits argmax == 0 means empty)
+                status_probs = torch.softmax(state.goal_status_logits, dim=-1)
+                empty_mask = status_probs[:, 0] > 0.5  # mostly empty
+                if empty_mask.any():
+                    slot = empty_mask.nonzero(as_tuple=False)[0].item()
+                    state.goal_embeddings.data[slot] = goal_embeds[i]
+                    # Set status to proposed (index 1)
+                    state.goal_status_logits[slot] = torch.zeros(6, device=state.beliefs.device)
+                    state.goal_status_logits[slot, 1] = 5.0  # strong prior on proposed
+                    state.goal_metadata.data[slot, 6] = float(current_step)  # created_step
+                    n_allocated += 1
+            stats['goals_generated'] = n_allocated
+        else:
+            stats['goals_generated'] = 0
 
-    # 9. Stall detection + deadline enforcement
-    detect_stalls(state, current_step)
-    enforce_deadlines(state, current_step)
+    # ── 6. Beta computation + running stats ──
+    beta = compute_beta(state, state.meta_params.fe_temperature.item())
+    stats['beta'] = beta
+    stats['active_goals'] = state.num_active_goals()
 
-    # Sequence boundary: decay belief precision (every 10 steps, not every step)
-    if is_sequence_boundary and current_step % 10 == 0:
-        apply_sequence_boundary_decay(state)
+    # Increment consolidation timer
+    if is_sequence_boundary:
+        state.meta.data[2] += 1.0
 
     # Update running statistics
     mean_surprise = stats.get('total_surprise', 0) / max(stats.get('num_candidates', 1), 1)
@@ -182,7 +169,9 @@ def run_pass2(
         'current_step': current_step,
     })
 
-    # Final stats
+    # Anneal Telos Gumbel-Softmax temperature
+    state.telos.anneal_temperature(current_step, 5000)
+
     stats['active_beliefs'] = state.num_active_beliefs()
     stats['active_edges'] = state.num_active_edges()
 

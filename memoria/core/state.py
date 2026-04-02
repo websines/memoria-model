@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from .polar import belief_is_active, EPSILON
 from .meta_params import MetaParams
 from .running_stats import RunningStats
+from ..cognition.telos_module import TelosModule, NUM_STATUS
 
 
 @dataclass
@@ -76,14 +77,23 @@ class CognitiveState(nn.Module):
         # Goal embedding (same space as beliefs) + metadata
         self.goal_embeddings = nn.Parameter(
             torch.zeros(config.max_goals, config.belief_dim),
-            requires_grad=False,
+            requires_grad=True,  # differentiable — trained by L_fe_bethe telos energy
         )
         self.goal_metadata = nn.Parameter(
             torch.zeros(config.max_goals, config.goal_metadata_dim),
-            requires_grad=False,
+            requires_grad=False,  # structural metadata (created_step, etc.)
         )
-        # Metadata layout: [priority, urgency, progress, status, depth, surprise_accum, created_step, deadline]
-        # Status encoding: 0=empty, 0.2=proposed, 0.4=active, 0.6=stalled, 0.8=completed, 1.0=failed
+        # Metadata layout: [priority, urgency, progress, status_legacy, depth, surprise_accum, created_step, deadline]
+        # Status encoding (legacy float): kept for backward compat but overridden by goal_status_logits
+
+        # Gumbel-Softmax status: [max_goals, 6] logits over {empty, proposed, active, stalled, completed, failed}
+        self.register_buffer(
+            'goal_status_logits',
+            torch.zeros(config.max_goals, NUM_STATUS),
+        )
+        # Initialize all goals as empty (high logit on STATUS_EMPTY)
+        with torch.no_grad():
+            self.goal_status_logits[:, 0] = 10.0  # strong prior on empty
 
         # ── Meta Region ──
         self.meta = nn.Parameter(
@@ -138,6 +148,12 @@ class CognitiveState(nn.Module):
 
         # ── Running statistics (replace 10 hardcoded thresholds) ──
         self.running_stats = RunningStats()
+
+        # ── Differentiable Telos (learned goal system) ──
+        self.telos = TelosModule(
+            belief_dim=config.belief_dim,
+            max_goals=config.max_goals,
+        )
 
     # ── Belief Region Accessors ──
 
@@ -278,22 +294,25 @@ class CognitiveState(nn.Module):
             embeddings: [N_active_goals, D]
             metadata: [N_active_goals, G]
         """
-        # Only return goals with PROPOSED (0.2) or ACTIVE (0.4) status
-        status = self.goal_metadata.data[:, 3]  # status is at index 3
-        mask = (status > 0.1) & (status < 0.5)  # 0.2 (proposed) and 0.4 (active)
+        # Gumbel-Softmax status: goal is active if proposed (1) or active (2) has highest prob
+        status_probs = torch.softmax(self.goal_status_logits, dim=-1)
+        best_status = status_probs.argmax(dim=-1)
+        mask = (best_status == 1) | (best_status == 2)  # proposed or active
         indices = mask.nonzero(as_tuple=False).squeeze(-1)
-        return indices, self.goal_embeddings.data[indices], self.goal_metadata.data[indices]
+        return indices, self.goal_embeddings[indices], self.goal_metadata.data[indices]
 
     def get_all_allocated_goals(self) -> tuple[Tensor, Tensor, Tensor]:
-        """Get all non-empty goals (any status). For slot management only."""
-        status = self.goal_metadata.data[:, 3]
-        mask = status > 0.0
+        """Get all non-empty goals (any non-empty status). For slot management only."""
+        status_probs = torch.softmax(self.goal_status_logits, dim=-1)
+        best_status = status_probs.argmax(dim=-1)
+        mask = best_status != 0  # not empty
         indices = mask.nonzero(as_tuple=False).squeeze(-1)
-        return indices, self.goal_embeddings.data[indices], self.goal_metadata.data[indices]
+        return indices, self.goal_embeddings[indices], self.goal_metadata.data[indices]
 
     def num_active_goals(self) -> int:
-        status = self.goal_metadata.data[:, 3]
-        return ((status > 0.1) & (status < 0.5)).sum().item()
+        status_probs = torch.softmax(self.goal_status_logits, dim=-1)
+        best_status = status_probs.argmax(dim=-1)
+        return ((best_status == 1) | (best_status == 2)).sum().item()
 
     # ── Meta Accessors ──
 
@@ -335,8 +354,10 @@ class CognitiveState(nn.Module):
             'belief_last_accessed': self.belief_last_accessed.clone(),
             'belief_access_count': self.belief_access_count.clone(),
             'belief_prev_surprise': self.belief_prev_surprise.clone(),
+            'goal_status_logits': self.goal_status_logits.clone(),
             'meta_params': self.meta_params.state_dict(),
             'running_stats': {k: v.clone() for k, v in self.running_stats._buffers.items()},
+            'telos': self.telos.state_dict(),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -361,12 +382,16 @@ class CognitiveState(nn.Module):
                 self.belief_access_count.copy_(state['belief_access_count'])
             if 'belief_prev_surprise' in state:
                 self.belief_prev_surprise.copy_(state['belief_prev_surprise'])
+            if 'goal_status_logits' in state:
+                self.goal_status_logits.copy_(state['goal_status_logits'])
             if 'meta_params' in state:
                 self.meta_params.load_state_dict(state['meta_params'])
             if 'running_stats' in state:
                 for k, v in state['running_stats'].items():
                     if hasattr(self.running_stats, k):
                         getattr(self.running_stats, k).copy_(v)
+            if 'telos' in state:
+                self.telos.load_state_dict(state['telos'])
 
     # ── Summary ──
 

@@ -54,6 +54,25 @@
 - model/pretrained_model.py — same combined loss structure.
 - The edge graph now contributes to the training gradient. Previously: zero contribution from edges to loss.
 
+**Differentiable Telos (learned goal system, replaces all hardcoded goal heuristics)**
+- NEW: cognition/telos_module.py — `TelosModule(nn.Module)` with 4 learned components:
+  1. RND surprise: frozen random projection + trained predictor. Prediction error = novelty. Replaces `1/radius` proxy.
+  2. Goal generator: MLP(belief_summary → goal_embedding). Replaces threshold-based generation.
+  3. Progress estimator: cosine attention over beliefs → MLP → progress in [0,1]. Replaces counter-based progress.
+  4. Transition network: MLP(goal_features → status_logit_deltas) for Gumbel-Softmax lifecycle.
+- core/state.py — goal_embeddings now `requires_grad=True`. Added `goal_status_logits` buffer [max_goals, 6] for Gumbel-Softmax status (replaces float encoding). Added TelosModule to state. Updated get_active_goals/num_active_goals to use Gumbel-Softmax.
+- model/memoria_model.py — Telos runs in forward pass: RND surprise loss + progress estimation + status transitions. Added `loss_surprise` to combined loss.
+- cognition/pass2.py — Rewritten to structural cleanup only (~130 lines, down from ~190). Removed all heuristic update rules. Kept: slot allocation, edge topology creation, structural cleanup (zero-norm removal), periodic consolidation, learned goal generation via TelosModule, beta computation, running stats.
+- training/optimizer.py — Added Telos param group and goal_embeddings param group.
+- Gumbel-Softmax temperature anneals from 1.0 → 0.1 over training via `telos.anneal_temperature()`.
+
+**Pass 2 is now structural cleanup only. Zero heuristic update rules remain.**
+- Continuous updates (beliefs, edges, relations, goal embeddings): gradient via optimizer.step()
+- Discrete structural ops (slot allocation, edge creation, consolidation merges): pass2
+- Goal lifecycle (proposed→active→completed): learned Gumbel-Softmax transition network
+- Surprise signal: learned RND, not handcoded formula
+- Progress estimation: learned MLP + attention, not counter
+
 **Dependencies added**: torchopt>=0.7, nevergrad>=1.0
 
 **Phase 5: Removed SPSA**

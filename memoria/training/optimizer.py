@@ -210,6 +210,27 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'weight_decay': 0.0,
         })
 
+    # 8. Telos module (learned goal generation, progress, transitions)
+    telos_params = [p for p in model.state.telos.parameters() if p.requires_grad]
+    if telos_params:
+        param_groups.append({
+            'params': telos_params,
+            'lr': tc.interface_lr,  # same LR as interface layers
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # 9. Goal embeddings (differentiable, slow LR like beliefs)
+    if model.state.goal_embeddings.requires_grad:
+        param_groups.append({
+            'params': [model.state.goal_embeddings],
+            'lr': tc.belief_lr,
+            'betas': (0.9, 0.999),
+            'eps': 1e-8,
+            'weight_decay': tc.weight_decay * 0.5,  # lighter decay than beliefs
+        })
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 
