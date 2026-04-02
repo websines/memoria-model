@@ -143,3 +143,37 @@ def test_candidates_produced(model):
     # Should have some candidates (from 2 interface layers × 16 token positions)
     # Not all positions produce meaningful candidates, but some should
     assert isinstance(result['candidates'], list)
+
+
+def test_gradient_flow_to_beliefs(model):
+    """Gradients from L_fe should flow into belief vectors (gradient wall removed)."""
+    # Add beliefs so read/write paths have something to work with
+    for _ in range(5):
+        model.state.allocate_belief(torch.randn(model.config.state.belief_dim))
+
+    # Zero grads
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    idx = torch.randint(0, 256, (1, 16))
+    targets = torch.randint(0, 256, (1, 16))
+    result = model.forward(idx, targets=targets, alpha=0.1)
+
+    result['loss'].backward()
+
+    # Beliefs should have received gradients (gradient wall is down)
+    assert model.state.beliefs.grad is not None
+    # At least some belief slots should have non-zero gradients
+    active_mask = model.state.get_active_mask()
+    if active_mask.any():
+        active_grads = model.state.beliefs.grad[active_mask]
+        assert active_grads.abs().sum() > 0, "Active beliefs should have non-zero gradients"
+
+
+def test_cognitive_meta_params_in_model(model):
+    """MetaParams should be part of the model and have learnable parameters."""
+    meta_params = list(model.state.meta_params.parameters())
+    assert len(meta_params) == 15, f"Expected 15 meta params, got {len(meta_params)}"
+    for p in meta_params:
+        assert p.requires_grad, "All meta params should be learnable"

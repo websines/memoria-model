@@ -230,6 +230,7 @@ class PretrainedMemoriaModel(nn.Module):
             loss_fe = compute_differentiable_free_energy(
                 all_attn_weights, all_retrieved, all_obs_vectors,
                 self.config.state.belief_dim,
+                fe_lambda=self.state.meta_params.fe_lambda,
             )
             result['loss_fe'] = loss_fe
 
@@ -270,9 +271,10 @@ class PretrainedMemoriaModel(nn.Module):
         return output[0] if isinstance(output, tuple) else output
 
     def detach_state(self):
-        """No-op. State tensors have requires_grad=False and are accessed via .data,
-        so they are never part of the computation graph."""
-        pass
+        """Detach state tensors from computation graph before structural pass2 modifications."""
+        self.state.beliefs.detach_()
+        self.state.edge_weights.detach_()
+        self.state.edge_relations.detach_()
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

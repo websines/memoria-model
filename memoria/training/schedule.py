@@ -35,8 +35,11 @@ def get_lr_multiplier(step: int, total_steps: int, config: TrainingConfig) -> fl
         # Constant
         return 1.0
     else:
-        # Cosine warmdown
+        # Warmdown
         cooldown_progress = (1.0 - progress) / config.warmdown_ratio
+        if getattr(config, 'warmdown_type', None) == 'linear':
+            return cooldown_progress
+        # Cosine warmdown (default)
         return cooldown_progress * 1.0 + (1 - cooldown_progress) * config.final_lr_frac
 
 

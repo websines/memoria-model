@@ -203,8 +203,8 @@ def causal_edge_learning(
     state: CognitiveState,
     updated_indices: list[int],
     surprise_values: list[float],
-    min_signal: float = 0.1,
-    decay_rate: float = 0.005,
+    min_signal: float | None = None,
+    decay_rate: float | None = None,
 ) -> dict:
     """Learn directed causal edges from temporal surprise patterns.
 
@@ -216,11 +216,17 @@ def causal_edge_learning(
         updated_indices: belief indices updated THIS step (from surprise computation)
         surprise_values: corresponding surprise values
         min_signal: minimum geometric-mean surprise to create/strengthen an edge
+            (defaults to state.meta_params.causal_min_signal)
         decay_rate: per-step decay for unreinforced causal edges (slower than Hebbian)
+            (defaults to state.meta_params.causal_decay_rate)
 
     Returns:
         dict with statistics
     """
+    if min_signal is None:
+        min_signal = state.meta_params.causal_min_signal.item()
+    if decay_rate is None:
+        decay_rate = state.meta_params.causal_decay_rate.item()
     stats = {'edges_created': 0, 'edges_strengthened': 0, 'edges_decayed': 0}
 
     with torch.no_grad():
@@ -274,7 +280,7 @@ def causal_edge_learning(
                             cause_angle = belief_angles[prev_idx]
                             effect_angle = belief_angles[curr_idx]
                             new_rel = torch.zeros(K, device=state.beliefs.device)
-                            new_rel[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
+                            new_rel[:D] = (effect_angle[:D] - cause_angle[:D]) * state.meta_params.causal_relation_scale.item()
                             alpha = 1.0 / (obs + 1.0)
                             state.edge_relations.data[edge_idx] = (
                                 (1.0 - alpha) * state.edge_relations.data[edge_idx] + alpha * new_rel
@@ -287,10 +293,10 @@ def causal_edge_learning(
                             cause_angle = belief_angles[prev_idx]
                             effect_angle = belief_angles[curr_idx]
                             relation = torch.zeros(K, device=state.beliefs.device)
-                            relation[:D] = (effect_angle[:D] - cause_angle[:D]) * 0.1
+                            relation[:D] = (effect_angle[:D] - cause_angle[:D]) * state.meta_params.causal_relation_scale.item()
 
                             new_idx = state.allocate_edge(
-                                prev_idx, curr_idx, relation, weight=signal * 0.3,
+                                prev_idx, curr_idx, relation, weight=signal * state.meta_params.causal_initial_weight_scale.item(),
                             )
                             if new_idx >= 0:
                                 state.edge_causal_obs[new_idx] = 1.0

@@ -197,7 +197,7 @@ class SPSAController:
         self._tunable_end = d.get('tunable_end', 0)
 
 
-def apply_sequence_boundary_decay(state: CognitiveState, decay_factor: float = 0.995):
+def apply_sequence_boundary_decay(state: CognitiveState, decay_factor: float | None = None):
     """Apply exponential decay to belief precision at sequence boundaries.
 
     Vectorized: applies decay to all active non-immutable beliefs in one op.
@@ -206,7 +206,11 @@ def apply_sequence_boundary_decay(state: CognitiveState, decay_factor: float = 0
     Args:
         state: cognitive state
         decay_factor: multiplicative decay per sequence boundary
+            (defaults to state.meta_params.precision_decay_factor)
     """
+    if decay_factor is None:
+        decay_factor = state.meta_params.precision_decay_factor.item()
+
     with torch.no_grad():
         active = state.get_active_mask()
         mutable = active & ~state.immutable_beliefs

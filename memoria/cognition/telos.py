@@ -39,7 +39,7 @@ STATUS_FAILED = 1.0
 def generate_intrinsic_goals(
     state: CognitiveState,
     current_step: int,
-    cooldown_steps: int = 50,
+    cooldown_steps: int | None = None,
 ) -> int:
     """Generate goals from surprise hotspots.
 
@@ -52,15 +52,19 @@ def generate_intrinsic_goals(
         state: cognitive state
         current_step: current training/inference step
         cooldown_steps: minimum steps between goal generations
+            (defaults to state.running_stats.goal_cooldown_steps)
 
     Returns:
         Number of goals generated
     """
+    if cooldown_steps is None:
+        cooldown_steps = state.running_stats.goal_cooldown_steps
+
     beta = state.beta
     accumulated = state.accumulated_surprise
 
     # Adaptive threshold: higher β (uncertainty) → lower threshold (more goals)
-    threshold = 2.0 / (1.0 + beta)
+    threshold = state.running_stats.goal_threshold_scale / (1.0 + beta)
 
     if accumulated < threshold:
         return 0
@@ -123,7 +127,7 @@ def generate_intrinsic_goals(
             state.goal_metadata.data[slot, URGENCY] = 0.0
             state.goal_metadata.data[slot, PROGRESS] = 0.0
             state.goal_metadata.data[slot, STATUS] = STATUS_ACTIVE
-            state.goal_metadata.data[slot, DEPTH] = 3.0  # operational level
+            state.goal_metadata.data[slot, DEPTH] = float(goal_embed.norm().item())  # depth from goal complexity
             state.goal_metadata.data[slot, SURPRISE_ACCUM] = 0.0
             state.goal_metadata.data[slot, CREATED_STEP] = float(current_step)
             state.goal_metadata.data[slot, DEADLINE] = 0.0  # no deadline
@@ -176,9 +180,9 @@ def update_goal_progress(
                     goal_angle.unsqueeze(0), belief_angle.unsqueeze(0)
                 ).item()
 
-                if relevance > 0.3:  # only count meaningfully relevant updates
+                if relevance > state.meta_params.goal_relevance_threshold.item():  # only count meaningfully relevant updates
                     surprise = surprise_values[bi] if bi < len(surprise_values) else 0.0
-                    progress_delta = relevance * min(surprise, 1.0) * 0.1
+                    progress_delta = relevance * min(surprise, 1.0) * state.meta_params.goal_progress_rate.item()
                     state.goal_metadata.data[gidx, PROGRESS] = min(
                         state.goal_metadata.data[gidx, PROGRESS].item() + progress_delta,
                         1.0,
@@ -192,11 +196,8 @@ def update_goal_progress(
 def detect_stalls(state: CognitiveState, current_step: int):
     """Mark active goals as stalled if no progress for too long.
 
-    Stall threshold scales with urgency:
-    - urgency >= 0.8: stall after 20 steps
-    - urgency >= 0.5: stall after 50 steps
-    - urgency >= 0.2: stall after 100 steps
-    - urgency < 0.2:  stall after 200 steps
+    Stall threshold scales with urgency derived from running_stats.stall_threshold_base
+    multiplied by [1, 2.5, 5, 10] for decreasing urgency bands.
 
     Ported from: prototype-research/src/queue/worker.rs (detect_stalls)
     """
@@ -205,6 +206,7 @@ def detect_stalls(state: CognitiveState, current_step: int):
         return
 
     with torch.no_grad():
+        stall_base = state.running_stats.stall_threshold_base
         for gi, gidx in enumerate(goal_indices):
             gidx = gidx.item()
             status = state.goal_metadata.data[gidx, STATUS].item()
@@ -215,15 +217,15 @@ def detect_stalls(state: CognitiveState, current_step: int):
             urgency = state.goal_metadata.data[gidx, URGENCY].item()
             created = state.goal_metadata.data[gidx, CREATED_STEP].item()
 
-            # Urgency-scaled threshold
+            # Urgency-scaled threshold derived from running_stats.stall_threshold_base
             if urgency >= 0.8:
-                threshold = 20
+                threshold = int(stall_base * 1)
             elif urgency >= 0.5:
-                threshold = 50
+                threshold = int(stall_base * 2.5)
             elif urgency >= 0.2:
-                threshold = 100
+                threshold = int(stall_base * 5)
             else:
-                threshold = 200
+                threshold = int(stall_base * 10)
 
             idle_steps = current_step - created
             progress = state.goal_metadata.data[gidx, PROGRESS].item()
@@ -272,8 +274,8 @@ def _is_duplicate_goal(state: CognitiveState, goal_embed: Tensor) -> bool:
     if len(goal_indices) == 0:
         return False
 
-    # Dynamic threshold from meta region (SPSA-tunable, default 0.5)
-    threshold = state.meta.data[6].item() if state.meta.data[6].item() > 0 else 0.5
+    # Dynamic threshold from learned meta-parameters
+    threshold = state.meta_params.goal_dedup_threshold.item()
 
     goal_angle = F.normalize(goal_embed, dim=0, eps=EPSILON)
     existing_angles = F.normalize(existing_embeds, dim=-1, eps=EPSILON)

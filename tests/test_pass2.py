@@ -53,8 +53,8 @@ def test_pass2_new_beliefs(state):
     assert stats['belief_new_allocations'] == 2
 
 
-def test_pass2_belief_update(state):
-    """Pass 2 should update matched beliefs."""
+def test_pass2_matched_observation(state):
+    """Pass 2 with matched observations should track surprise (continuous updates via gradient)."""
     # Add existing belief
     b = make_belief_vec([1, 0, 0], 1.0, state.config.belief_dim)
     slot = state.allocate_belief(b)
@@ -69,12 +69,13 @@ def test_pass2_belief_update(state):
     ]
 
     stats = run_pass2(state, candidates, [slot], current_step=1)
-    # Should be an incremental update (low surprise, not reconsolidation)
-    assert stats['belief_incremental_updates'] + stats['belief_reconsolidations'] > 0
+    # Belief content is now updated by gradient, not pass2 — just verify stats are computed
+    assert stats['belief_total_surprise'] >= 0
+    assert stats['num_candidates'] == 1
 
 
-def test_pass2_reconsolidation(state):
-    """High-surprise observation should trigger reconsolidation."""
+def test_pass2_high_surprise_observation(state):
+    """High-surprise observation should be tracked (continuous updates via gradient)."""
     # Strong belief pointing one way
     b = make_belief_vec([1, 0, 0], 0.5, state.config.belief_dim)
     slot = state.allocate_belief(b)
@@ -89,8 +90,8 @@ def test_pass2_reconsolidation(state):
     ]
 
     stats = run_pass2(state, candidates, [slot], current_step=1)
-    # High gain (strong obs vs weak belief) → reconsolidation
-    assert stats['belief_reconsolidations'] > 0
+    # High surprise should be recorded
+    assert stats['belief_total_surprise'] > 0
 
 
 def test_pass2_hebbian(state):
@@ -162,31 +163,26 @@ def test_pass2_consolidation(state):
 
     assert state.num_active_beliefs() == 2
 
-    stats = run_pass2(state, [], [], current_step=1)
+    # Use step=10 so periodic soft_consolidation triggers (runs every 10 steps)
+    stats = run_pass2(state, [], [], current_step=10)
 
     # Should have merged (cosine_sim > 0.95)
     assert stats['soft_merges'] > 0 or state.num_active_beliefs() <= 2
 
 
 def test_pass2_kernel_rules(state):
-    """Immutable beliefs should not be modified."""
+    """Immutable beliefs should not be evicted or structurally modified."""
     b = make_belief_vec([1, 0, 0], 2.0, state.config.belief_dim)
     slot = state.allocate_belief(b)
     state.immutable_beliefs[slot] = True
     original = state.beliefs.data[slot].clone()
 
-    # Try to reconsolidate with opposite observation
-    obs = make_belief_vec([-1, 0, 0], 10.0, state.config.belief_dim)
-    candidates = [
-        WriteCandidate(
-            belief_vector=obs, matched_slot=slot,
-            match_similarity=0.1, source_position=0, source_layer=0,
-        ),
-    ]
+    # With structural-only pass2, immutable beliefs are protected during eviction/consolidation
+    # The belief content itself is now updated by gradient (not pass2), so kernel rules
+    # protect against structural operations (deallocation, merge)
+    stats = run_pass2(state, [], [slot], current_step=1)
 
-    stats = run_pass2(state, candidates, [slot], current_step=1)
-
-    assert stats['belief_blocked_by_kernel'] > 0
+    # Immutable belief should still exist unchanged (structurally)
     assert torch.allclose(state.beliefs.data[slot], original)
 
 

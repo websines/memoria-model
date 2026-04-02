@@ -98,7 +98,7 @@ class ReadPath(nn.Module):
             return torch.zeros_like(hidden), torch.zeros_like(hidden), [], zero_attn, zero_retrieved
 
         active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
-        active_beliefs = state.beliefs.data[active_indices]  # [N_active, D]
+        active_beliefs = state.beliefs[active_indices]  # [N_active, D]
         N_active = active_beliefs.shape[0]
 
         # Limit to top_k for efficiency if many active beliefs

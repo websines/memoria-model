@@ -18,7 +18,7 @@ The cognitive state is modified in-place.
 from ..core.state import CognitiveState
 from ..interface.write_path import WriteCandidate
 from .surprise import compute_surprise_batch
-from .belief_update import apply_belief_updates
+from .belief_update import allocate_new_beliefs
 from .hebbian import hebbian_update, extract_co_activations
 from .causal import causal_edge_learning
 from .telos import (
@@ -39,7 +39,6 @@ def run_pass2(
     current_step: int,
     is_sequence_boundary: bool = True,
     consolidation_interval: int = 50,
-    temperature: float = 5.0,
     max_candidates: int = MAX_CANDIDATES,
     spsa_controller: SPSAController | None = None,
 ) -> dict:
@@ -52,7 +51,6 @@ def run_pass2(
         current_step: current training/inference step
         is_sequence_boundary: whether we're at a sequence boundary (apply decay)
         consolidation_interval: run consolidation every N steps
-        temperature: for free energy computation
         max_candidates: subsample candidates if exceeding this count
         spsa_controller: multi-step SPSA controller (created by training loop, None to skip)
 
@@ -75,7 +73,7 @@ def run_pass2(
     stats['total_surprise'] = sum(sr.surprise for sr in surprise_results)
 
     # 2. Belief updates
-    update_stats = apply_belief_updates(surprise_results, state)
+    update_stats = allocate_new_beliefs(surprise_results, state)
     stats.update({f'belief_{k}': v for k, v in update_stats.items()})
 
     # Collect indices and surprises of updated beliefs (for goal progress + Hebbian)
@@ -129,41 +127,60 @@ def run_pass2(
     update_goal_progress(state, updated_indices, surprise_values)
     stats['active_goals'] = state.num_active_goals()
 
-    # 6. Intrinsic goal generation
-    new_goals = generate_intrinsic_goals(state, current_step)
-    stats['goals_generated'] = new_goals
-
-    # 7. Stall detection + deadline enforcement
-    detect_stalls(state, current_step)
-    enforce_deadlines(state, current_step)
-
-    # 8. Meta update: β + multi-step SPSA
-    beta = compute_beta(state, temperature)
+    # 6. Meta update: β + multi-step SPSA
+    beta = compute_beta(state, state.meta_params.fe_temperature.item())
     stats['beta'] = beta
 
+    # SPSA removed — its tunable params are now nn.Parameters in MetaParams,
+    # trained by backprop through L_fe. Nevergrad available as fallback if
+    # future discrete parameters need gradient-free optimization.
     if spsa_controller is not None:
-        did_update = spsa_controller.step(state, current_step, temperature)
+        did_update = spsa_controller.step(state, current_step, state.meta_params.fe_temperature.item())
         stats['spsa_step'] = did_update
         stats['spsa_phase'] = spsa_controller.phase
     else:
         stats['spsa_step'] = False
         stats['spsa_phase'] = 'disabled'
 
-    # 9. Consolidation
-    merged = soft_consolidation(state)
+    # 7. Consolidation (periodic, not every step)
+    if current_step % 10 == 0:
+        merged = soft_consolidation(
+            state,
+            similarity_threshold=state.running_stats.merge_similarity_threshold,
+        )
+    else:
+        merged = 0
     stats['soft_merges'] = merged
 
     consolidation_timer = state.meta.data[2].item()
     if consolidation_timer >= consolidation_interval:
-        removed = periodic_hard_cleanup(state)
+        removed = periodic_hard_cleanup(
+            state,
+            low_precision_threshold=state.running_stats.hard_cleanup_precision_threshold,
+        )
         stats['hard_cleanup_removed'] = removed
         state.meta.data[2] = 0.0  # reset timer
     else:
         stats['hard_cleanup_removed'] = 0
 
+    # 8. Intrinsic goal generation (AFTER consolidation so goals reference valid beliefs)
+    new_goals = generate_intrinsic_goals(state, current_step)
+    stats['goals_generated'] = new_goals
+
+    # 9. Stall detection + deadline enforcement
+    detect_stalls(state, current_step)
+    enforce_deadlines(state, current_step)
+
     # Sequence boundary: decay belief precision (every 10 steps, not every step)
     if is_sequence_boundary and current_step % 10 == 0:
         apply_sequence_boundary_decay(state)
+
+    # Update running statistics
+    mean_surprise = stats.get('total_surprise', 0) / max(stats.get('num_candidates', 1), 1)
+    state.running_stats.update(state, {
+        'mean_surprise': mean_surprise,
+        'current_step': current_step,
+    })
 
     # Final stats
     stats['active_beliefs'] = state.num_active_beliefs()

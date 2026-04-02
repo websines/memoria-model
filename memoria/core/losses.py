@@ -53,6 +53,7 @@ def compute_differentiable_free_energy(
     retrieved: list[Tensor],
     observations: list[Tensor],
     belief_dim: int,
+    fe_lambda: float | None = None,
 ) -> Tensor:
     """Compute free energy proxy over forward-pass tensors (fully differentiable).
 
@@ -112,4 +113,5 @@ def compute_differentiable_free_energy(
     entropy = torch.stack(entropy_terms).mean()
 
     # F = E - lambda * H  (lambda=0.1 prevents entropy from dominating)
-    return energy - 0.1 * entropy
+    lam = fe_lambda if fe_lambda is not None else 0.1
+    return energy - lam * entropy

@@ -94,7 +94,7 @@ def soft_consolidation(
             state.beliefs.data[idx_i] = new_angle * new_radius
             state.beliefs.data[idx_j].zero_()  # free slot
 
-            # Redirect edges from j to i
+            # Redirect edges from j to i (no dedup per-merge; dedup once after all merges)
             _redirect_edges(state, from_idx=idx_j, to_idx=idx_i)
 
             merged_set.add(j)
@@ -103,6 +103,10 @@ def soft_consolidation(
             # Update local tracking
             radii[i] = new_radius
             angles[i] = new_angle
+
+    # Deduplicate edges once after all merges complete (not per-merge)
+    if merged > 0:
+        _deduplicate_edges(state)
 
     return merged
 
@@ -167,8 +171,7 @@ def _redirect_edges(state: CognitiveState, from_idx: int, to_idx: int):
     if tgt_match.any():
         state.edge_tgt[active_edges[tgt_match]] = to_idx
 
-    # Deduplicate
-    _deduplicate_edges(state)
+    # Dedup removed from per-merge redirect; now called once after all merges
 
 
 def _deduplicate_edges(state: CognitiveState):
@@ -184,13 +187,10 @@ def _deduplicate_edges(state: CognitiveState):
     tgts = state.edge_tgt[active_edges]
     weights = state.edge_weights.data[active_edges]
 
-    # Canonical key: (min, max) for undirected dedup
-    mins = torch.min(srcs, tgts)
-    maxs = torch.max(srcs, tgts)
-
+    # Directed key: (src, tgt) preserves causal edge direction
     seen: dict[tuple[int, int], tuple[int, float]] = {}
     for i in range(len(active_edges)):
-        key = (mins[i].item(), maxs[i].item())
+        key = (srcs[i].item(), tgts[i].item())
         eidx = active_edges[i].item()
         w = weights[i].item()
 

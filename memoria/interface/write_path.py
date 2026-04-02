@@ -49,8 +49,8 @@ def pack_candidates(candidates: list[WriteCandidate]) -> Tensor:
     device = candidates[0].belief_vector.device
     N = len(candidates)
 
-    # Stack belief vectors
-    beliefs = torch.stack([c.belief_vector for c in candidates])  # [N, D]
+    # Stack belief vectors (detach only here for distributed transport)
+    beliefs = torch.stack([c.belief_vector.detach() for c in candidates])  # [N, D]
 
     # Build metadata columns
     meta = torch.tensor(
@@ -205,7 +205,7 @@ class WritePath(nn.Module):
 
         if active_mask.any() and meaningful.any():
             active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
-            active_beliefs = state.beliefs.data[active_indices]  # [N_active, D]
+            active_beliefs = state.beliefs[active_indices]  # [N_active, D]
             active_radii = active_beliefs.norm(dim=-1).clamp(min=EPSILON)
             active_angles = active_beliefs / active_radii.unsqueeze(-1)
 
@@ -226,7 +226,7 @@ class WritePath(nn.Module):
         if len(meaningful_idx) == 0:
             return []
 
-        obs_detached = obs_flat.detach()
+        obs_for_candidates = obs_flat
 
         slots = torch.where(matched, best_global, torch.tensor(-1, dtype=torch.long, device=device))
         sims_out = torch.where(matched, best_sims, torch.zeros_like(best_sims))
@@ -240,7 +240,7 @@ class WritePath(nn.Module):
             flat_pos = m_idx[i].item()
             t = flat_pos % T  # position within sequence
             candidates.append(WriteCandidate(
-                belief_vector=obs_detached[flat_pos],
+                belief_vector=obs_for_candidates[flat_pos],
                 matched_slot=m_slots[i].item(),
                 match_similarity=m_sims[i].item(),
                 source_position=t,

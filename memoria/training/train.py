@@ -39,7 +39,7 @@ from .distributed import (
     broadcast_state, gather_candidates, gather_read_indices, sync_ranks,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
-from ..cognition.meta_learning import SPSAController
+from ..cognition.meta_learning import SPSAController  # kept for checkpoint backward compat
 
 
 class DataPrefetcher:
@@ -194,8 +194,10 @@ def train(
         stack_languages=["python", "javascript", "rust", "go"],
     )
 
-    # SPSA controller (persists across steps, tracks multi-step evaluation phases)
-    spsa_controller = SPSAController(interval=100, eval_window=10)
+    # SPSA controller removed — its 3 tunable params (reconsolidation_threshold,
+    # match_threshold, goal_dedup_threshold) are now nn.Parameters in MetaParams,
+    # trained by backprop through L_fe. No gradient-free optimization needed.
+    spsa_controller = None
 
     # Resume
     start_step = 0
@@ -207,8 +209,7 @@ def train(
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_step = checkpoint['step']
         samples_consumed = checkpoint.get('samples_consumed', 0)
-        if 'spsa_state' in checkpoint:
-            spsa_controller.load_state_dict(checkpoint['spsa_state'])
+        # spsa_state in old checkpoints is ignored — SPSA replaced by learned MetaParams
         if is_main:
             print(f"Resumed from step {start_step}")
 
@@ -340,6 +341,10 @@ def train(
         # Pass 2: cognitive update on rank 0 only
         base_model.detach_state()
 
+        # Detect actual sequence boundaries (EOS token present in last batch)
+        eos_id = tokenizer.eos_token_id
+        has_boundary = eos_id is not None and (input_ids == eos_id).any().item()
+
         if is_main:
             gathered_candidates = unpack_candidates(packed, belief_dim)
             read_indices = list(set(all_read_indices))
@@ -349,8 +354,7 @@ def train(
                 candidates=gathered_candidates,
                 read_belief_indices=read_indices,
                 current_step=step,
-                is_sequence_boundary=True,
-                temperature=tc.fe_temperature,
+                is_sequence_boundary=has_boundary,
                 spsa_controller=spsa_controller,
             )
         else:
@@ -473,7 +477,7 @@ def _run_eval(model, tokenizer, config, device, n_batches: int = 20) -> float:
 
 
 def save_checkpoint(model, optimizer, step: int, path: Path,
-                    samples_consumed: int = 0, spsa_controller: SPSAController | None = None):
+                    samples_consumed: int = 0, spsa_controller=None):
     """Save model + cognitive state + optimizer + stream position checkpoint."""
     ckpt = {
         'step': step,
@@ -482,8 +486,6 @@ def save_checkpoint(model, optimizer, step: int, path: Path,
         'optimizer_state': optimizer.state_dict(),
         'samples_consumed': samples_consumed,
     }
-    if spsa_controller is not None:
-        ckpt['spsa_state'] = spsa_controller.state_dict()
     torch.save(ckpt, path)
     print(f"\n  Checkpoint saved: {path} (stream pos: {samples_consumed} samples)")
 

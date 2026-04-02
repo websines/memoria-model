@@ -110,6 +110,8 @@ def _synthetic_stream(
 ) -> Iterator[dict[str, Tensor]]:
     """Tokenize synthetic text data into fixed-length sequences."""
     eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        eos_id = tokenizer.vocab_size - 1
     buffer = []
 
     for text in data:

@@ -16,6 +16,8 @@ dependencies = [
     "pyyaml",
     "pytest",
     "python-dotenv",
+    "torchopt>=0.7",
+    "nevergrad>=1.0",
 ]
 
 [project.optional-dependencies]

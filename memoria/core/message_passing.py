@@ -82,10 +82,10 @@ class FactorGraphMessagePassing(nn.Module if not HAS_PYG else MessagePassing):
         active_idx = active_mask.nonzero(as_tuple=False).squeeze(-1)
         src = state.edge_src[active_idx]  # [E]
         tgt = state.edge_tgt[active_idx]  # [E]
-        relations = state.edge_relations.data[active_idx]  # [E, K]
-        weights = state.edge_weights.data[active_idx]  # [E]
+        relations = state.edge_relations[active_idx]  # [E, K]
+        weights = state.edge_weights[active_idx]  # [E]
 
-        beliefs = state.beliefs.data  # [N, D]
+        beliefs = state.beliefs  # [N, D]
         radii = beliefs.norm(dim=-1).clamp(min=EPSILON)  # [N]
         angles = beliefs / radii.unsqueeze(-1)  # [N, D]
 
@@ -148,9 +148,9 @@ def compute_energy_from_messages(
     active_idx = state.edge_active.nonzero(as_tuple=False).squeeze(-1)
     src = state.edge_src[active_idx]
     tgt = state.edge_tgt[active_idx]
-    weights = state.edge_weights.data[active_idx]
+    weights = state.edge_weights[active_idx]
 
-    radii = state.beliefs.data.norm(dim=-1).clamp(min=EPSILON)
+    radii = state.beliefs.norm(dim=-1).clamp(min=EPSILON)
     src_radii = radii[src]
     tgt_radii = radii[tgt]
 

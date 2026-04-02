@@ -1,13 +1,11 @@
-"""Hebbian association: co-activated beliefs strengthen connecting edges.
+"""Hebbian association: create edges between co-activated beliefs.
 
 "Neurons that fire together wire together."
 
 After each forward pass, beliefs that were both read (co-activated) during
-the same pass strengthen their connecting edge. Edges not activated decay.
-
-Update rule (saturating Hebb):
-    w_new = w_old + η(1 - w_old)    # strengthening, saturates at 1.0
-    w_new = w_old × (1 - decay)      # decay for inactive edges
+the same pass get a new connecting edge if one does not already exist.
+Edge weight strengthening and decay are handled by the optimizer (gradient
+descent + weight decay) — this module only handles structural edge creation.
 
 Ported from: prototype-research/src/pipeline/hebbian.rs
 Reference: Fast Weights (Ba & Hinton, 2016) — outer-product Hebbian updates
@@ -23,10 +21,11 @@ from ..core.polar import angular_similarity, EPSILON
 def hebbian_update(
     state: CognitiveState,
     co_activated_pairs: list[tuple[int, int]],
-    learning_rate: float = 0.05,
-    decay_rate: float = 0.01,
 ):
-    """Update edge weights based on co-activation.
+    """Create edges for new co-activation pairs.
+
+    Only structural: new edges are created for pairs that do not already have
+    one.  Weight strengthening and decay are handled by the optimizer.
 
     Uses tensor operations instead of Python dicts for edge matching:
     builds canonical (min, max) edge keys as tensors and matches via
@@ -36,8 +35,6 @@ def hebbian_update(
         state: cognitive state
         co_activated_pairs: list of (belief_idx_a, belief_idx_b) pairs that
             were co-activated (both read in the same forward pass)
-        learning_rate: η in the Hebb rule
-        decay_rate: how much inactive edges decay per step
     """
     with torch.no_grad():
         if not co_activated_pairs:
@@ -72,30 +69,7 @@ def hebbian_update(
             (edge_maxs.unsqueeze(1) == pair_maxs.unsqueeze(0))
         )
 
-        edge_matched = match_matrix.any(dim=1)   # [E] — edges with a co-activated pair
         pair_matched = match_matrix.any(dim=0)    # [P] — pairs with existing edges
-
-        immutable = state.immutable_edges[active_idx]
-        causal = state.edge_causal_obs[active_idx] > 0
-
-        # Strengthen matched, mutable edges
-        strengthen_mask = edge_matched & ~immutable
-        if strengthen_mask.any():
-            s_idx = active_idx[strengthen_mask]
-            w = state.edge_weights.data[s_idx]
-            state.edge_weights.data[s_idx] = (w + learning_rate * (1.0 - w)).clamp(max=1.0)
-
-        # Decay non-matched, non-causal, mutable edges
-        decay_mask = ~edge_matched & ~immutable & ~causal
-        if decay_mask.any():
-            d_idx = active_idx[decay_mask]
-            w = state.edge_weights.data[d_idx]
-            w_new = w * (1.0 - decay_rate)
-            state.edge_weights.data[d_idx] = w_new
-            dead = w_new < 0.01
-            if dead.any():
-                for eidx in d_idx[dead].tolist():
-                    state.deallocate_edge(eidx)
 
         # Create edges for unmatched pairs
         if not pair_matched.all():
@@ -107,7 +81,7 @@ def hebbian_update(
 def _create_edge(state: CognitiveState, a: int, b: int):
     """Create an edge between two beliefs (no existence check — caller ensures uniqueness)."""
     relation = torch.zeros(state.config.relation_dim, device=state.beliefs.device)
-    state.allocate_edge(a, b, relation, weight=0.1)
+    state.allocate_edge(a, b, relation, weight=state.meta_params.initial_edge_weight.item())
 
 
 def extract_co_activations(

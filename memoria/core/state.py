@@ -17,6 +17,8 @@ from torch import Tensor
 from dataclasses import dataclass
 
 from .polar import belief_is_active, EPSILON
+from .meta_params import MetaParams
+from .running_stats import RunningStats
 
 
 @dataclass
@@ -50,7 +52,7 @@ class CognitiveState(nn.Module):
         # Radius = precision, angle = content direction.
         self.beliefs = nn.Parameter(
             torch.zeros(config.max_beliefs, config.belief_dim),
-            requires_grad=False,  # Updated by pass 2, not by optimizer
+            requires_grad=True,  # Updated by pass 2, not by optimizer
         )
 
         # ── Relation Region ──
@@ -59,11 +61,11 @@ class CognitiveState(nn.Module):
         self.register_buffer('edge_tgt', torch.zeros(config.max_edges, dtype=torch.long))
         self.edge_relations = nn.Parameter(
             torch.zeros(config.max_edges, config.relation_dim),
-            requires_grad=False,
+            requires_grad=True,
         )
         self.edge_weights = nn.Parameter(
             torch.zeros(config.max_edges),
-            requires_grad=False,
+            requires_grad=True,
         )
         # Track which edges are active (allocated)
         self.register_buffer('edge_active', torch.zeros(config.max_edges, dtype=torch.bool))
@@ -131,16 +133,22 @@ class CognitiveState(nn.Module):
             'immutable_goals', torch.zeros(config.max_goals, dtype=torch.bool)
         )
 
+        # ── Learnable meta-parameters (replace 15 magic numbers) ──
+        self.meta_params = MetaParams()
+
+        # ── Running statistics (replace 10 hardcoded thresholds) ──
+        self.running_stats = RunningStats()
+
     # ── Belief Region Accessors ──
 
     def get_belief_radii(self) -> Tensor:
         """Get precision (radius) of all beliefs."""
-        return self.beliefs.data.norm(dim=-1)
+        return self.beliefs.norm(dim=-1)
 
     def get_belief_angles(self) -> Tensor:
         """Get content direction (unit vector) of all beliefs."""
         radii = self.get_belief_radii().unsqueeze(-1).clamp(min=EPSILON)
-        return self.beliefs.data / radii
+        return self.beliefs / radii
 
     def get_active_mask(self) -> Tensor:
         """Boolean mask of active (non-empty) beliefs."""
@@ -155,7 +163,7 @@ class CognitiveState(nn.Module):
         """
         mask = self.get_active_mask()
         indices = mask.nonzero(as_tuple=False).squeeze(-1)
-        return indices, self.beliefs.data[indices]
+        return indices, self.beliefs[indices]
 
     def num_active_beliefs(self) -> int:
         """Count of active beliefs."""
@@ -217,8 +225,8 @@ class CognitiveState(nn.Module):
         return (
             self.edge_src[indices],
             self.edge_tgt[indices],
-            self.edge_relations.data[indices],
-            self.edge_weights.data[indices],
+            self.edge_relations[indices],
+            self.edge_weights[indices],
         )
 
     def allocate_edge(self, src: int, tgt: int, relation: Tensor, weight: float = 0.1) -> int:
@@ -327,6 +335,8 @@ class CognitiveState(nn.Module):
             'belief_last_accessed': self.belief_last_accessed.clone(),
             'belief_access_count': self.belief_access_count.clone(),
             'belief_prev_surprise': self.belief_prev_surprise.clone(),
+            'meta_params': self.meta_params.state_dict(),
+            'running_stats': {k: v.clone() for k, v in self.running_stats._buffers.items()},
         }
 
     def load_state_cognitive(self, state: dict):
@@ -351,6 +361,12 @@ class CognitiveState(nn.Module):
                 self.belief_access_count.copy_(state['belief_access_count'])
             if 'belief_prev_surprise' in state:
                 self.belief_prev_surprise.copy_(state['belief_prev_surprise'])
+            if 'meta_params' in state:
+                self.meta_params.load_state_dict(state['meta_params'])
+            if 'running_stats' in state:
+                for k, v in state['running_stats'].items():
+                    if hasattr(self.running_stats, k):
+                        getattr(self.running_stats, k).copy_(v)
 
     # ── Summary ──
 

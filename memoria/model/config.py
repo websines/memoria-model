@@ -45,12 +45,15 @@ class TrainingConfig:
     unembedding_lr: float = 0.004
     scalar_lr: float = 0.5
     interface_lr: float = 0.01        # for state interface layer params
+    belief_lr: float = 0.0001         # slow LR for cognitive state (beliefs, edges)
+    cognitive_meta_lr: float = 0.001  # LR for learned meta-parameters
     weight_decay: float = 0.2
     adam_betas: tuple = (0.8, 0.95)
 
     # Schedule
     warmup_ratio: float = 0.02         # 2% warmup — stabilizes Adam estimates early
-    warmdown_ratio: float = 0.5
+    warmdown_ratio: float = 0.2        # 20% warmdown (WSD schedule)
+    warmdown_type: str = "linear"      # "linear" (decay-to-zero) or "cosine"
     final_lr_frac: float = 0.0
     grad_clip_norm: float = 1.0        # max gradient norm (0 to disable)
 

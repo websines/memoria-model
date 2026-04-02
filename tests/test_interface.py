@@ -34,7 +34,7 @@ def interface(config):
 def test_read_empty_state(interface, state):
     """Reading from empty state returns zeros (graceful degradation)."""
     hidden = torch.randn(2, 10, 128)  # [B, T, H]
-    output, candidates, _, _ = interface(hidden, state)
+    output, candidates, _, _, _, _, _ = interface(hidden, state)
     # Output should be same shape as input
     assert output.shape == hidden.shape
     # With empty state, read path returns zeros → output ≈ input
@@ -54,7 +54,7 @@ def test_read_retrieves_relevant_beliefs(config, state):
     # Create a hidden state that, after projection, should be similar to the belief
     # We'll just check that the output is non-zero when beliefs exist
     hidden = torch.randn(1, 5, 128)
-    output, utility, _ = read_path(hidden, state)
+    output, utility, _, _, _ = read_path(hidden, state)
     assert output.shape == (1, 5, 128)
     # With at least one belief, output should be non-zero (projections are random init)
     # (Can't guarantee specific values without controlling the projection weights)
@@ -84,8 +84,8 @@ def test_read_with_goal_modulation(config, state):
     hidden = torch.randn(1, 3, 128)
 
     # Run with and without goal modulation
-    out_no_goal, _, _ = read_path(hidden, state)
-    out_with_goal, _, _ = read_path(hidden, state, goal_embeddings=goal_embed, goal_priorities=goal_priorities)
+    out_no_goal, _, _, _, _ = read_path(hidden, state)
+    out_with_goal, _, _, _, _ = read_path(hidden, state, goal_embeddings=goal_embed, goal_priorities=goal_priorities)
 
     # Outputs should differ (goal modulation changes attention weights)
     assert not torch.allclose(out_no_goal, out_with_goal, atol=1e-6)
@@ -98,7 +98,7 @@ def test_write_to_empty_state(config, state):
     write_path = WritePath(hidden_dim=128, belief_dim=config.belief_dim)
 
     hidden = torch.randn(1, 5, 128)
-    candidates = write_path(hidden, state, layer_idx=0)
+    candidates, obs_vectors = write_path(hidden, state, layer_idx=0)
 
     # All candidates should be unmatched (no existing beliefs)
     for c in candidates:
@@ -116,9 +116,9 @@ def test_write_matches_existing_beliefs(config, state):
 
     # Create hidden states and manually set the projection to produce the same direction
     # For this test, we directly call _match_and_buffer with a known observation
-    obs = belief.clone().unsqueeze(0)  # [1, D] same as existing belief
+    obs = belief.clone().unsqueeze(0).unsqueeze(0)  # [1, 1, D] same as existing belief
 
-    candidates = write_path._match_and_buffer(obs, state, layer_idx=0)
+    candidates = write_path._match_and_buffer_batched(obs, state, layer_idx=0, B=1, T=1)
 
     # Should match the existing belief
     assert len(candidates) > 0
@@ -131,7 +131,7 @@ def test_write_candidates_have_precision(config, state):
     write_path = WritePath(hidden_dim=128, belief_dim=config.belief_dim)
 
     hidden = torch.randn(1, 3, 128)
-    candidates = write_path(hidden, state, layer_idx=0)
+    candidates, obs_vectors = write_path(hidden, state, layer_idx=0)
 
     for c in candidates:
         radius = c.belief_vector.norm().item()
@@ -143,7 +143,7 @@ def test_write_candidates_have_precision(config, state):
 def test_interface_returns_candidates(interface, state):
     """Interface should return both updated hidden and write candidates."""
     hidden = torch.randn(2, 10, 128)
-    output, candidates, _, _ = interface(hidden, state)
+    output, candidates, _, _, _, _, _ = interface(hidden, state)
 
     assert output.shape == hidden.shape
     assert isinstance(candidates, list)
@@ -156,7 +156,7 @@ def test_interface_gradients_flow(interface, state):
         state.allocate_belief(torch.randn(state.config.belief_dim))
 
     hidden = torch.randn(1, 5, 128, requires_grad=True)
-    output, _, _, _ = interface(hidden, state)
+    output, _, _, _, _, _, _ = interface(hidden, state)
     loss = output.sum()
     loss.backward()
 
@@ -171,7 +171,7 @@ def test_interface_output_shape_invariant(interface, state):
             state.allocate_belief(torch.randn(state.config.belief_dim))
 
         hidden = torch.randn(1, 8, 128)
-        output, _, _, _ = interface(hidden, state)
+        output, _, _, _, _, _, _ = interface(hidden, state)
         assert output.shape == hidden.shape
 
         # Reset state for next iteration

@@ -187,8 +187,28 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'weight_decay': 0.0,
         })
 
-    # Note: cognitive state params (beliefs, edges, goals, meta) have requires_grad=False
-    # and are updated by pass 2, not by the optimizer.
+    # 6. Cognitive state continuous params (beliefs, edge_weights, edge_relations)
+    # Slow LR + weight decay replaces: radius clamp, edge death thresholds, sequence boundary decay
+    cognitive_params = [p for p in [model.state.beliefs, model.state.edge_weights, model.state.edge_relations] if p.requires_grad]
+    if cognitive_params:
+        param_groups.append({
+            'params': cognitive_params,
+            'lr': tc.belief_lr,
+            'betas': (0.9, 0.999),
+            'eps': 1e-8,
+            'weight_decay': tc.weight_decay,
+        })
+
+    # 7. Cognitive meta-parameters (learned thresholds replacing magic numbers)
+    cognitive_meta_params = list(model.state.meta_params.parameters())
+    if cognitive_meta_params:
+        param_groups.append({
+            'params': cognitive_meta_params,
+            'lr': tc.cognitive_meta_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
 
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
