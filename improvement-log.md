@@ -46,6 +46,14 @@
 - test_pass2.py — updated for structural-only pass2 (removed incremental_updates/reconsolidation assertions)
 - test_model.py — added test_gradient_flow_to_beliefs (PASSES: beliefs receive gradients) and test_cognitive_meta_params_in_model
 
+**Proper Bethe Free Energy (replaces fake proxy)**
+- core/free_energy.py — added `power_spherical_entropy()`: closed-form entropy via `torch.digamma` (De Cao & Aziz 2020). Replaces the made-up `1/(r+1)` with proper information-theoretic entropy for directional beliefs. Dimension-aware (D=256 matters).
+- core/free_energy.py — added `compute_bethe_free_energy()`: proper Bethe free energy with (d_i-1) counting correction per Yedidia/Freeman/Weiss. Energy from edge disagreement + telos goals. Entropy from Power Spherical. Fully differentiable — gradients flow into beliefs, edge weights, edge relations.
+- core/free_energy.py — updated legacy `compute_entropy()` to use Power Spherical instead of `1/(r+1)`. Fixed beta computation: use `-H/N` (negentropy per belief) as uncertainty measure since differential entropy of continuous distributions is negative.
+- model/memoria_model.py — L_fe is now `L_fe_proxy + L_fe_bethe`. Proxy trains interfaces (read/write paths). Bethe trains the world model (beliefs, edges, relations through the factor graph).
+- model/pretrained_model.py — same combined loss structure.
+- The edge graph now contributes to the training gradient. Previously: zero contribution from edges to loss.
+
 **Dependencies added**: torchopt>=0.7, nevergrad>=1.0
 
 **Phase 5: Removed SPSA**

@@ -23,7 +23,7 @@ from torch import Tensor
 
 from .config import MemoriaConfig
 from ..core.state import CognitiveState
-from ..core.free_energy import compute_free_energy
+from ..core.free_energy import compute_free_energy, compute_bethe_free_energy
 from ..core.losses import chunked_cross_entropy, compute_differentiable_free_energy
 from ..interface.layer import StateInterfaceLayer
 from ..interface.write_path import WriteCandidate
@@ -226,19 +226,27 @@ class PretrainedMemoriaModel(nn.Module):
             # Always compute L_fe and L_utility so all interface parameters participate
             # in the computation graph (required by DDP with dynamic cognitive state).
 
-            # Differentiable free energy
-            loss_fe = compute_differentiable_free_energy(
+            # Interface proxy: trains read/write paths
+            loss_fe_proxy = compute_differentiable_free_energy(
                 all_attn_weights, all_retrieved, all_obs_vectors,
                 self.config.state.belief_dim,
                 fe_lambda=self.state.meta_params.fe_lambda,
             )
-            result['loss_fe'] = loss_fe
 
-            # State free energy for beta/stats only (no gradients)
+            # Proper Bethe free energy: trains beliefs, edges, relations
             if alpha > 0:
-                with torch.no_grad():
-                    fe_stats = compute_free_energy(self.state, self.config.training.fe_temperature)
-                    result['free_energy_stats'] = fe_stats
+                fe_result = compute_bethe_free_energy(
+                    self.state, self.state.meta_params.fe_temperature.item(),
+                )
+                loss_fe_bethe = fe_result['free_energy']
+                result['free_energy_stats'] = fe_result
+            else:
+                loss_fe_bethe = torch.tensor(0.0, device=idx.device)
+
+            loss_fe = loss_fe_proxy + loss_fe_bethe
+            result['loss_fe'] = loss_fe
+            result['loss_fe_proxy'] = loss_fe_proxy
+            result['loss_fe_bethe'] = loss_fe_bethe
 
             # Utility loss from interface layers
             loss_utility = torch.tensor(0.0, device=idx.device)
