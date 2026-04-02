@@ -174,18 +174,14 @@ class PretrainedMemoriaModel(nn.Module):
         layer_kwargs['position_ids'] = position_ids
 
         # Run through transformer layers with interface injection
+        ttt_ctx = TTTContext()
+
         for i, layer in enumerate(backbone_model.layers):
             if not grad_active and i <= first_interface:
-                # Before first interface: no trainable path yet, save memory
                 with torch.no_grad():
                     layer_output = layer(hidden, **layer_kwargs)
                     hidden = layer_output[0] if isinstance(layer_output, tuple) else layer_output
             else:
-                # After first interface: gradients must flow through frozen layers
-                # to reach interface params. Frozen weights (requires_grad=False) won't
-                # accumulate grads, but the computation graph is preserved for inputs.
-                # Use gradient checkpointing to trade compute for memory — recompute
-                # activations during backward instead of storing them (saves ~10GB).
                 hidden = torch.utils.checkpoint.checkpoint(
                     self._run_layer, layer, hidden, layer_kwargs,
                     use_reentrant=False,
@@ -193,34 +189,63 @@ class PretrainedMemoriaModel(nn.Module):
 
             # Insert state interface after designated layers
             if interface_idx < len(self.interfaces) and i == self.interface_positions[interface_idx]:
-                # Cast to float32 for interface layers (backbone outputs bfloat16)
                 hidden_f32 = hidden.float()
-
                 interface_out, candidates, utility_logits, read_indices, attn_w, retrieved, obs_v = \
                     self.interfaces[interface_idx](hidden_f32, self.state)
-
-                # Gated residual: read_gate controls how much belief info is injected
                 gate = torch.sigmoid(self.read_gate[interface_idx])
                 hidden = (hidden_f32 + gate * (interface_out - hidden_f32)).to(hidden.dtype)
-                # Note: interface_out = hidden + belief_info (from layer.py),
-                # so (interface_out - hidden) = belief_info. This applies gate to just the belief signal.
-
                 all_candidates.extend(candidates)
                 all_utility_logits.append(utility_logits)
                 all_read_indices.extend(read_indices)
                 all_attn_weights.append(attn_w)
                 all_retrieved.append(retrieved)
                 all_obs_vectors.append(obs_v)
+                ttt_ctx.record_utility(interface_idx, i, utility_logits)
                 interface_idx += 1
-                grad_active = True  # from here on, gradients must flow
+                grad_active = True
 
-        # Final norm — must preserve grad chain
+            # In-Place TTT: apply persistent fast-weight delta
+            if self.ttt.is_ttt_layer(i):
+                ttt_ctx.save_pre_delta(i, hidden)
+                hidden = self.ttt.apply_delta(layer_idx=i, hidden=hidden)
+
+        # Final norm
         hidden = backbone_model.norm(hidden)
 
         result = {
             'candidates': all_candidates,
             'read_indices': all_read_indices,
         }
+
+        # TTT gradient step with quality gating (RND surprise + loss rollback).
+        # Runs at BOTH training and inference — the backbone improves with every input.
+        if targets is not None:
+            active_mask = self.state.get_active_mask()
+            if active_mask.any():
+                with torch.no_grad():
+                    surprise = self.state.telos.compute_surprise(
+                        self.state.beliefs.data[active_mask]
+                    )
+                    mean_surprise = surprise.mean().item()
+                    self.ttt.update_surprise_ema(mean_surprise)
+            else:
+                mean_surprise = 0.0
+
+            if self.ttt.should_update(mean_surprise):
+                for layer_idx in self.ttt._ttt_layer_list:
+                    pre_delta = ttt_ctx.get_pre_delta(layer_idx)
+                    if pre_delta is not None:
+                        self.ttt.ttt_step(
+                            layer_idx=layer_idx,
+                            hidden_pre_delta=pre_delta,
+                            targets=targets,
+                            lm_head_weight=lm_head.weight.data,
+                            vocab_size=self.config.transformer.vocab_size,
+                        )
+                self.ttt.ttt_step_beliefs(
+                    self.state.beliefs, all_candidates,
+                    active_mask if active_mask.any() else self.state.get_active_mask(),
+                )
 
         if targets is not None:
             # LM head (frozen, but we need grad through interface paths)

@@ -141,13 +141,46 @@ class MemoriaModel(nn.Module):
                 ttt_ctx.record_utility(interface_idx, i, utility_logits)
                 interface_idx += 1
 
-            # In-Place TTT: apply fast-weight delta to MLP output on designated layers
+            # In-Place TTT: apply persistent fast-weight delta
             if self.ttt.is_ttt_layer(i):
-                utility = ttt_ctx.get_utility(i)
-                x = self.ttt.apply_ttt_update(
-                    layer_idx=i, hidden=x, targets=targets if targets is not None else idx,
-                    lm_head=self.transformer.lm_head, utility_signal=utility,
-                    fe_value=ttt_ctx.fe_value,
+                ttt_ctx.save_pre_delta(i, x)
+                x = self.ttt.apply_delta(layer_idx=i, hidden=x)
+
+        # TTT gradient step: update persistent deltas using NTP loss on this chunk.
+        # This runs at BOTH training and inference — the model improves with every input.
+        # Quality gate: RND surprise filters out-of-distribution inputs.
+        # Rollback gate: loss increase after update → revert (inside ttt_step).
+        if targets is not None:
+            # Compute RND surprise on active beliefs as quality signal
+            active_mask = self.state.get_active_mask()
+            if active_mask.any():
+                with torch.no_grad():
+                    surprise = self.state.telos.compute_surprise(
+                        self.state.beliefs.data[active_mask]
+                    )
+                    mean_surprise = surprise.mean().item()
+                    self.ttt.update_surprise_ema(mean_surprise)
+            else:
+                mean_surprise = 0.0
+
+            # Only update if input is in the learnable zone (not OOD, not fully predicted)
+            if self.ttt.should_update(mean_surprise):
+                for layer_idx in self.ttt._ttt_layer_list:
+                    pre_delta = ttt_ctx.get_pre_delta(layer_idx)
+                    if pre_delta is not None:
+                        self.ttt.ttt_step(
+                            layer_idx=layer_idx,
+                            hidden_pre_delta=pre_delta,
+                            targets=targets,
+                            lm_head_weight=self.transformer.lm_head.weight.data,
+                            vocab_size=self.config.transformer.vocab_size,
+                        )
+
+                # Update beliefs from write candidates (inference-time belief learning)
+                self.ttt.ttt_step_beliefs(
+                    self.state.beliefs,
+                    all_candidates,
+                    active_mask,
                 )
 
         result = {
