@@ -25,6 +25,7 @@ from .config import MemoriaConfig
 from ..core.state import CognitiveState
 from ..core.free_energy import compute_free_energy, compute_bethe_free_energy
 from ..core.losses import chunked_cross_entropy, compute_differentiable_free_energy
+from ..core.ttt import InPlaceTTT, TTTContext
 from ..interface.layer import StateInterfaceLayer
 from ..interface.write_path import WriteCandidate
 
@@ -101,6 +102,12 @@ class PretrainedMemoriaModel(nn.Module):
 
         self._hidden_dim = hidden_dim
         self._n_layers = n_layers
+
+        # In-Place TTT: fast-weight deltas on upper MLP layers
+        self.ttt = InPlaceTTT(
+            hidden_dim=hidden_dim,
+            n_layers=n_layers,
+        )
 
     @torch.no_grad()
     def init_weights(self):

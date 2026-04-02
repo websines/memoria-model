@@ -40,6 +40,7 @@ from .distributed import (
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
 from ..cognition.meta_learning import SPSAController  # kept for checkpoint backward compat
+from .cognitive_seed import save_cognitive_seed
 
 
 class DataPrefetcher:
@@ -104,6 +105,7 @@ def train(
     push_to_hub: bool = True,
     hub_push_every: int = 2000,
     resume_from: str | None = None,
+    cognitive_seed: str | None = None,  # path to cognitive seed from previous run
 ):
     """Main training entry point.
 
@@ -198,6 +200,14 @@ def train(
     # match_threshold, goal_dedup_threshold) are now nn.Parameters in MetaParams,
     # trained by backprop through L_fe. No gradient-free optimization needed.
     spsa_controller = None
+
+    # Load cognitive seed from previous run (before resume, which may override)
+    if cognitive_seed and is_main:
+        from .cognitive_seed import load_cognitive_seed
+        load_cognitive_seed(base_model.state, cognitive_seed)
+
+    # Belief advantage tracking (with-state vs without-state loss delta)
+    belief_advantage_ema = 0.0
 
     # Resume
     start_step = 0
@@ -356,6 +366,7 @@ def train(
                 current_step=step,
                 is_sequence_boundary=has_boundary,
                 total_steps=max_steps,
+                belief_advantage=belief_advantage_ema,
             )
         else:
             pass2_stats = {
@@ -415,6 +426,39 @@ def train(
                 'dt_ms': dt * 1000,
             })
 
+        # Belief advantage evaluation: with-state vs without-state loss delta
+        # Measures whether the cognitive state is actually helping predictions
+        # Runs at eval_interval / 5 (derived from config, not hardcoded)
+        belief_eval_interval = max(1, tc.eval_interval // 5)
+        if is_main and step > 0 and step % belief_eval_interval == 0 and alpha > 0:
+            base_model.eval()
+            with torch.no_grad():
+                # Loss WITH state (already computed)
+                loss_with = total_loss_token
+                # Loss WITHOUT state (alpha=0 disables all cognitive contributions)
+                result_without = base_model(input_ids, targets=labels, alpha=0.0)
+                loss_without = result_without['loss_token'].item()
+            base_model.train()
+            belief_advantage = loss_without - loss_with  # positive = beliefs help
+            ba_decay = 0.95  # EMA decay — matches controller's reward_ema_decay convention
+            belief_advantage_ema = ba_decay * belief_advantage_ema + (1 - ba_decay) * belief_advantage
+            if log_to_wandb:
+                import wandb
+                wandb.log({
+                    'belief_advantage': belief_advantage,
+                    'belief_advantage_ema': belief_advantage_ema,
+                    'step': step,
+                })
+            if step % tc.eval_interval == 0:
+                print(f"\n  [belief advantage] step {step}: {belief_advantage:.4f} (ema: {belief_advantage_ema:.4f})")
+
+        # Controller REINFORCE loss (train at same interval as belief advantage)
+        if is_main and step > 0 and step % belief_eval_interval == 0:
+            controller_loss = base_model.state.controller.compute_loss()
+            if controller_loss.item() > 0:
+                controller_loss.backward()
+                # Note: controller params get stepped with the next optimizer.step()
+
         # Periodic eval
         if is_main and step > 0 and step % tc.eval_interval == 0:
             eval_ppl = _run_eval(base_model, tokenizer, config, device)
@@ -449,6 +493,8 @@ def train(
         print(f"\nTraining complete. {step + 1} steps, {total_training_time:.1f}s training time.")
         save_checkpoint(base_model, optimizer, step, ckpt_path / "final.pt",
                         samples_consumed, spsa_controller)
+        # Save cognitive seed for next run
+        save_cognitive_seed(base_model.state, ckpt_path / "cognitive_seed.pt")
         if push_to_hub:
             _push_to_hub_async(base_model, step, ckpt_path, hf_repo, hf_token, is_final=True)
 

@@ -1,5 +1,119 @@
 # Memoria Improvement Log
 
+## 2026-04-02 — Self-Improving Architecture: 5 Gap Closures (61/61 tests pass)
+
+### Problem Statement
+
+Memoria had a differentiable cognitive state but five structural gaps prevented genuine self-improvement:
+
+1. **Backbone doesn't learn from state experience** — frozen/static backbone ignores what the cognitive state knows
+2. **Pass 2 algorithms are fixed** — hardcoded Hebbian/causal edge creation heuristics
+3. **No closed-loop evaluation** — no measurement of whether beliefs actually help
+4. **No recursive self-modification** — pass2 structural decisions are hand-coded
+5. **Improvement doesn't compound across runs** — each run starts from zero
+
+### What was implemented
+
+**Feature 1: Belief Advantage Evaluation** (`train.py`)
+- Every 100 steps (when α>0), computes `loss_without_state - loss_with_state`
+- Positive delta = beliefs are helping predictions. Negative = beliefs are hurting.
+- Tracked as EMA, logged to wandb as `belief_advantage` and `belief_advantage_ema`
+- Provides the foundational signal for all other self-improvement mechanisms
+- This is the simplest possible closed-loop: "is my memory helping?"
+
+**Feature 2: In-Place TTT Fast-Weight Deltas** (`core/ttt.py`, `memoria_model.py`, `pretrained_model.py`)
+- NEW: `InPlaceTTT` module adds low-rank deltas to upper MLP.c_proj layers (top 25%)
+- Each delta is `gate * (A @ B)` where gate is driven by read path utility signal
+- High utility (beliefs contributed to prediction) → open gate → apply delta → backbone adapts
+- `lr_modulator` MLP maps Bethe free energy → step size (high FE = more adaptation)
+- `TTTContext` tracks per-interface utility signals across the forward pass
+- Design: TTT is layered ON TOP of the read path, not replacing it
+- The read path decides when/where TTT runs; TTT modifies how the backbone processes belief info
+- Reference: In-Place TTT (ByteDance/PKU, ICLR 2026, OpenReview dTWfCLSoyl)
+
+**Feature 3: Learned Edge Proposal with CoED Directions** (`cognition/edge_proposal.py`, `core/state.py`, `core/message_passing.py`)
+- NEW: `EdgeProposer` replaces Hebbian co-activation and causal temporal precedence heuristics
+- MLP: `(belief_i || belief_j || |diff|)` → edge probability (proposal_net), direction angle (direction_net), relation vector (relation_net)
+- `edge_direction`: per-edge angle θ ∈ [0, π/2]. θ=π/4 undirected, θ=0 directed src→tgt
+- `message_passing.py` updated: messages scaled by cos(θ) forward, sin(θ) reverse
+- AdaRelation adaptive threshold: lowers when graph is changing, raises when stable
+- Pass2 now collects co-activation + causal candidate pairs, feeds them to EdgeProposer
+- The network decides WHICH edges get created; gradient through L_fe_bethe trains it
+- Keeps sparse edge budget (max_edges); only replaces the creation policy
+- Reference: ORI (NeurIPS 2024), CoED-GNN (ICLR 2025, arXiv:2410.14109)
+
+**Feature 4: Cross-Run Cognitive Seed** (`training/cognitive_seed.py`, `train.py`)
+- NEW: `save_cognitive_seed()` extracts transferable knowledge after training:
+  - Meta-parameters (most stable across runs)
+  - Telos module weights (learned goal system)
+  - Running statistics
+  - Core beliefs (high-confidence, survived consolidation)
+  - Core edges (between core beliefs, high weight)
+  - Edge proposal network weights
+- NEW: `load_cognitive_seed()` with content-matched belief transfer:
+  - Matches seed beliefs to target beliefs by cosine similarity (NOT slot index)
+  - Only transfers when seed belief is more confident than existing match
+  - Unmatched seed beliefs allocated to empty slots
+  - Edges transferred by matching both endpoint beliefs by content
+- Cognitive seed saved automatically at end of training, loadable via `--cognitive-seed` arg
+- Design: belief slots are mutable storage locations, not stable semantic coordinates. EWC on raw slots is invalid. Content matching is required.
+- Reference: SDFT (arXiv:2601.19897), CALM (ICLR 2024)
+
+**Feature 5: SEAL-Style Cognitive Controller** (`cognition/cognitive_controller.py`, `cognition/pass2.py`)
+- NEW: `CognitiveController` — learned policy over pass2 structural actions
+- Action space (5 continuous values):
+  - `allocate_rate`: fraction of candidate beliefs to allocate [0, 1]
+  - `merge_threshold`: similarity threshold for consolidation [0.8, 0.99]
+  - `prune_threshold`: minimum precision to keep [0.01, 0.5]
+  - `connect_rate`: fraction of proposed edges to accept [0, 1]
+  - `goal_rate`: how many goals to generate [0, 3]
+- Input: 8-dim state summary (radii stats, fill ratio, edge density, beta, surprise, goals, belief_advantage_ema)
+- REINFORCE with value baseline, trained every 100 steps using belief_advantage as reward
+- Initialized permissive (sigmoid(5) ≈ 0.993) so untrained controller doesn't restrict pass2
+- Pass2 applies controller actions to modulate all structural decisions
+- Reference: SEAL (MIT, NeurIPS 2025, arXiv:2506.10943)
+
+### Integration into optimizer
+
+Scratch mode (`setup_optimizer`): 4 new param groups added (groups 10-13)
+- TTT module params (delta factors, gate biases, lr modulator) at interface_lr
+- Edge proposal network at interface_lr
+- Edge directions at belief_lr × 10 (structural, fast adaptation)
+- Cognitive controller at interface_lr × 0.1 (slow, must be stable)
+
+Pretrained mode (`_setup_pretrained_optimizer`): same 4 groups added
+
+### Files changed
+
+| File | Change |
+|---|---|
+| NEW `core/ttt.py` | InPlaceTTT module + TTTContext |
+| NEW `cognition/edge_proposal.py` | EdgeProposer with CoED directions |
+| NEW `cognition/cognitive_controller.py` | CognitiveController (REINFORCE) |
+| NEW `training/cognitive_seed.py` | save/load with content-matched transfer |
+| `core/state.py` | Added edge_direction, EdgeProposer, CognitiveController; updated serialization |
+| `core/message_passing.py` | CoED direction scaling (cos/sin) on messages |
+| `model/memoria_model.py` | TTT integration in forward pass |
+| `model/pretrained_model.py` | TTT integration + import |
+| `cognition/pass2.py` | Rewritten: EdgeProposer replaces Hebbian/causal, controller modulates all actions |
+| `training/optimizer.py` | 4 new param groups in both scratch and pretrained optimizers |
+| `training/train.py` | Belief advantage eval, controller training, cognitive seed save/load |
+
+### What this means for self-improvement
+
+Before these changes, Memoria was a "self-organizing" system: beliefs improved via gradient, but the backbone, edge topology, and structural decisions were static.
+
+Now:
+- **Backbone adapts** to what the cognitive state knows (TTT fast-weights gated by belief utility)
+- **Edge topology is learned** end-to-end via EdgeProposer (replaces all hand-coded heuristics)
+- **Belief helpfulness is measured** every 100 steps (belief advantage)
+- **Structural decisions are learned** via CognitiveController (REINFORCE on belief advantage)
+- **Knowledge compounds across runs** via content-matched cognitive seed transfer
+
+The system learns what to remember, how to connect memories, when to create/prune/merge, and whether any of it is working. The backbone's weights are shaped by what the memory system knows. This is self-improvement within the architecture, not self-modification of the architecture.
+
+---
+
 ## 2026-04-02 — Implementation Complete: Differentiable Cognitive State
 
 ### What was done (61/61 tests pass)

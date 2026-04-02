@@ -102,17 +102,36 @@ class FactorGraphMessagePassing(nn.Module if not HAS_PYG else MessagePassing):
         # Agreement per edge
         agreement = angular_similarity(src_angles, tgt_transformed)  # [E]
 
-        # Messages: target sends precision-weighted angle to source
-        msg_precision = weights * radii[tgt]  # [E] — precision of each message
-        msg_values = msg_precision.unsqueeze(-1) * tgt_transformed  # [E, D]
+        # CoED edge directions: scale messages by cos(θ) for tgt→src, sin(θ) for src→tgt
+        # θ=π/4 (init): cos=sin=0.707 — symmetric/undirected
+        # θ→0: cos→1, sin→0 — fully directed src→tgt (message flows tgt to src)
+        # θ→π/2: cos→0, sin→1 — fully directed tgt→src
+        directions = state.edge_direction[active_idx]  # [E]
+        dir_cos = torch.cos(directions)  # tgt→src message scale
+        dir_sin = torch.sin(directions)  # src→tgt message scale
 
-        # Aggregate messages at each source node
+        # Messages: tgt sends to src, scaled by cos(θ)
+        msg_precision_fwd = weights * radii[tgt] * dir_cos  # [E]
+        msg_values_fwd = msg_precision_fwd.unsqueeze(-1) * tgt_transformed  # [E, D]
+
+        # Reverse messages: src sends to tgt, scaled by sin(θ)
+        src_transformed = torch.nn.functional.normalize(
+            src_angles + relation_bias, dim=-1, eps=EPSILON
+        )
+        msg_precision_rev = weights * radii[src] * dir_sin  # [E]
+        msg_values_rev = msg_precision_rev.unsqueeze(-1) * src_transformed  # [E, D]
+
+        # Aggregate forward + reverse messages
         n = state.config.max_beliefs
         agg_messages = torch.zeros(n, self.belief_dim, device=beliefs.device)
         agg_precisions = torch.zeros(n, device=beliefs.device)
 
-        agg_messages.scatter_add_(0, src.unsqueeze(-1).expand(-1, self.belief_dim), msg_values)
-        agg_precisions.scatter_add_(0, src, msg_precision)
+        # Forward: tgt→src
+        agg_messages.scatter_add_(0, src.unsqueeze(-1).expand(-1, self.belief_dim), msg_values_fwd)
+        agg_precisions.scatter_add_(0, src, msg_precision_fwd)
+        # Reverse: src→tgt
+        agg_messages.scatter_add_(0, tgt.unsqueeze(-1).expand(-1, self.belief_dim), msg_values_rev)
+        agg_precisions.scatter_add_(0, tgt, msg_precision_rev)
 
         # Normalize by total precision (precision-weighted fusion)
         safe_prec = agg_precisions.unsqueeze(-1).clamp(min=EPSILON)

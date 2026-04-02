@@ -20,6 +20,8 @@ from .polar import belief_is_active, EPSILON
 from .meta_params import MetaParams
 from .running_stats import RunningStats
 from ..cognition.telos_module import TelosModule, NUM_STATUS
+from ..cognition.edge_proposal import EdgeProposer
+from ..cognition.cognitive_controller import CognitiveController
 
 
 @dataclass
@@ -154,6 +156,23 @@ class CognitiveState(nn.Module):
             belief_dim=config.belief_dim,
             max_goals=config.max_goals,
         )
+
+        # ── Learned edge proposal (replaces Hebbian/causal heuristics) ──
+        self.edge_proposal = EdgeProposer(
+            belief_dim=config.belief_dim,
+            relation_dim=config.relation_dim,
+        )
+
+        # ── Continuous edge directions (CoED, ICLR 2025) ──
+        # θ=π/4 undirected, θ=0 directed src→tgt, θ=π/2 directed tgt→src
+        import math
+        self.edge_direction = nn.Parameter(
+            torch.full((config.max_edges,), math.pi / 4),  # init undirected
+            requires_grad=True,
+        )
+
+        # ── SEAL-style cognitive controller ──
+        self.controller = CognitiveController(belief_dim=config.belief_dim)
 
     # ── Belief Region Accessors ──
 
@@ -358,6 +377,9 @@ class CognitiveState(nn.Module):
             'meta_params': self.meta_params.state_dict(),
             'running_stats': {k: v.clone() for k, v in self.running_stats._buffers.items()},
             'telos': self.telos.state_dict(),
+            'edge_direction': self.edge_direction.data.clone(),
+            'edge_proposal': self.edge_proposal.state_dict(),
+            'controller': self.controller.state_dict(),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -392,6 +414,12 @@ class CognitiveState(nn.Module):
                         getattr(self.running_stats, k).copy_(v)
             if 'telos' in state:
                 self.telos.load_state_dict(state['telos'])
+            if 'edge_direction' in state:
+                self.edge_direction.data.copy_(state['edge_direction'])
+            if 'edge_proposal' in state:
+                self.edge_proposal.load_state_dict(state['edge_proposal'])
+            if 'controller' in state:
+                self.controller.load_state_dict(state['controller'])
 
     # ── Summary ──
 

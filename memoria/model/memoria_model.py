@@ -25,6 +25,7 @@ from .transformer import Transformer
 from ..core.state import CognitiveState
 from ..core.free_energy import compute_free_energy, compute_bethe_free_energy
 from ..core.losses import chunked_cross_entropy, compute_differentiable_free_energy
+from ..core.ttt import InPlaceTTT, TTTContext
 from ..interface.layer import StateInterfaceLayer
 from ..interface.write_path import WriteCandidate
 
@@ -72,6 +73,12 @@ class MemoriaModel(nn.Module):
         ]
         # e.g., with 12 layers and interface_every=4: positions [3, 7, 11]
 
+        # In-Place TTT: fast-weight deltas on upper MLP.c_proj layers
+        self.ttt = InPlaceTTT(
+            hidden_dim=config.transformer.n_embd,
+            n_layers=config.transformer.n_layer,
+        )
+
     @torch.no_grad()
     def init_weights(self):
         """Initialize all weights."""
@@ -112,6 +119,7 @@ class MemoriaModel(nn.Module):
         all_retrieved: list[Tensor] = []
         all_obs_vectors: list[Tensor] = []
         interface_idx = 0
+        ttt_ctx = TTTContext()
 
         for i, block in enumerate(self.transformer.blocks):
             x = block(
@@ -130,7 +138,17 @@ class MemoriaModel(nn.Module):
                 all_attn_weights.append(attn_w)
                 all_retrieved.append(retrieved)
                 all_obs_vectors.append(obs_v)
+                ttt_ctx.record_utility(interface_idx, i, utility_logits)
                 interface_idx += 1
+
+            # In-Place TTT: apply fast-weight delta to MLP output on designated layers
+            if self.ttt.is_ttt_layer(i):
+                utility = ttt_ctx.get_utility(i)
+                x = self.ttt.apply_ttt_update(
+                    layer_idx=i, hidden=x, targets=targets if targets is not None else idx,
+                    lm_head=self.transformer.lm_head, utility_signal=utility,
+                    fe_value=ttt_ctx.fe_value,
+                )
 
         result = {
             'candidates': all_candidates,

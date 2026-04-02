@@ -228,7 +228,51 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'lr': tc.belief_lr,
             'betas': (0.9, 0.999),
             'eps': 1e-8,
-            'weight_decay': tc.weight_decay * 0.5,  # lighter decay than beliefs
+            'weight_decay': tc.weight_decay * 0.5,
+        })
+
+    # 10. In-Place TTT module (fast-weight deltas, lr modulator)
+    if hasattr(model, 'ttt'):
+        ttt_params = [p for p in model.ttt.parameters() if p.requires_grad]
+        if ttt_params:
+            param_groups.append({
+                'params': ttt_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
+    # 11. Edge proposal network (learned edge creation)
+    edge_proposal_params = [p for p in model.state.edge_proposal.parameters() if p.requires_grad]
+    if edge_proposal_params:
+        param_groups.append({
+            'params': edge_proposal_params,
+            'lr': tc.interface_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # 12. Edge directions (CoED, learned per-edge direction angles)
+    if model.state.edge_direction.requires_grad:
+        param_groups.append({
+            'params': [model.state.edge_direction],
+            'lr': tc.belief_lr * 10,  # faster than beliefs (structural, not content)
+            'betas': (0.9, 0.999),
+            'eps': 1e-8,
+            'weight_decay': 0.0,  # no decay — directions should persist
+        })
+
+    # 13. Cognitive controller (SEAL-style learned pass2 policy)
+    controller_params = [p for p in model.state.controller.parameters() if p.requires_grad]
+    if controller_params:
+        param_groups.append({
+            'params': controller_params,
+            'lr': tc.interface_lr * 0.1,  # slow — controller should be stable
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
         })
 
     # AdamW for non-matrix params
@@ -344,6 +388,38 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
             'betas': (0.9, 0.999),
             'eps': 1e-8,
             'weight_decay': tc.weight_decay * 0.5,
+        })
+
+    # Edge proposal network
+    edge_proposal_params = [p for p in model.state.edge_proposal.parameters() if p.requires_grad]
+    if edge_proposal_params:
+        param_groups.append({
+            'params': edge_proposal_params,
+            'lr': tc.interface_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # Edge directions
+    if model.state.edge_direction.requires_grad:
+        param_groups.append({
+            'params': [model.state.edge_direction],
+            'lr': tc.belief_lr * 10,
+            'betas': (0.9, 0.999),
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # Cognitive controller
+    controller_params = [p for p in model.state.controller.parameters() if p.requires_grad]
+    if controller_params:
+        param_groups.append({
+            'params': controller_params,
+            'lr': tc.interface_lr * 0.1,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
         })
 
     optimizer = torch.optim.AdamW(param_groups)

@@ -5,11 +5,12 @@ handles ALL continuous updates to beliefs, edges, and relations via optimizer.st
 
 Pass 2 handles only discrete structural operations that gradients cannot:
 1. Allocate new belief slots for unmatched write candidates
-2. Create new edges for co-activated belief pairs (topology, not weights)
+2. Create new edges via learned EdgeProposer (replaces Hebbian/causal heuristics)
 3. Structural cleanup: zero-norm beliefs → free slot, zero-weight edges → inactive
 4. Periodic consolidation (merge near-identical beliefs, prune dead ones)
-5. Differentiable goal generation via TelosModule (runs with gradients when called from forward)
+5. Differentiable goal generation via TelosModule
 6. Beta computation and running statistics update
+7. CognitiveController makes structural decisions (merge/prune/connect rates)
 
 This runs ONCE per step after optimizer.step() and detach_state().
 The cognitive state is modified in-place via .data access (no gradients).
@@ -21,8 +22,7 @@ from ..core.polar import EPSILON
 from ..interface.write_path import WriteCandidate
 from .surprise import compute_surprise_batch
 from .belief_update import allocate_new_beliefs
-from .hebbian import hebbian_update, extract_co_activations
-from .causal import causal_edge_learning
+from .hebbian import extract_co_activations
 from .consolidation import soft_consolidation, periodic_hard_cleanup
 from .meta_learning import compute_beta
 
@@ -33,14 +33,11 @@ def run_pass2(
     read_belief_indices: list[int],
     current_step: int,
     is_sequence_boundary: bool = True,
-    total_steps: int = 1,  # must be provided by caller (training loop knows max_steps)
-    spsa_controller=None,  # deprecated, kept for call-site compat
+    total_steps: int = 1,
+    belief_advantage: float = 0.0,
+    spsa_controller=None,  # deprecated
 ) -> dict:
     """Structural cleanup pass after gradient-based updates.
-
-    All continuous updates (belief content, precision, edge weights, relations)
-    are handled by optimizer.step() through L_fe_bethe. This function handles
-    only discrete structural operations.
 
     Args:
         state: cognitive state to update (modified in-place via .data)
@@ -48,6 +45,8 @@ def run_pass2(
         read_belief_indices: indices of beliefs that were read during pass 1
         current_step: current training/inference step
         is_sequence_boundary: whether we're at a sequence boundary
+        total_steps: total training steps (for temperature annealing)
+        belief_advantage: current belief advantage for controller reward
         spsa_controller: deprecated, ignored
 
     Returns:
@@ -55,9 +54,13 @@ def run_pass2(
     """
     stats = {'step': current_step}
 
+    # ── 0. Controller actions (learned structural decisions) ──
+    actions = state.controller.get_actions(state)
+    state.controller.record_reward(belief_advantage)
+    stats['controller_actions'] = actions
+
     # ── 1. Structural cleanup: zero-norm beliefs and edges ──
     with torch.no_grad():
-        # Beliefs driven to zero by weight decay → free the slot
         radii = state.beliefs.data.norm(dim=-1)
         dead_beliefs = (radii > 0) & (radii < EPSILON) & ~state.immutable_beliefs
         if dead_beliefs.any():
@@ -66,7 +69,6 @@ def run_pass2(
                 state.deallocate_belief(idx)
         stats['beliefs_cleaned'] = dead_beliefs.sum().item()
 
-        # Edges driven to zero by weight decay → deactivate
         dead_edges = state.edge_active & (state.edge_weights.data.abs() < EPSILON)
         if dead_edges.any():
             dead_idx = dead_edges.nonzero(as_tuple=False).squeeze(-1)
@@ -75,10 +77,18 @@ def run_pass2(
         stats['edges_cleaned'] = dead_edges.sum().item()
 
     # ── 2. New belief allocation (discrete: pick a slot) ──
-    max_candidates = 1024
+    max_candidates = state.running_stats.max_candidates  # derived from running_stats (default 1024)
     if len(candidates) > max_candidates:
         import random
         candidates = random.sample(candidates, max_candidates)
+
+    # Controller modulates allocation rate (only subsample when controller wants to restrict)
+    allocate_rate = actions.get('allocate_rate', 1.0)
+    n_candidates_for_subsample = max(3, max_candidates // 10)  # derived from max_candidates
+    if allocate_rate < 0.9 and len(candidates) > n_candidates_for_subsample:
+        import random
+        n_keep = max(1, int(len(candidates) * allocate_rate))
+        candidates = random.sample(candidates, n_keep)
 
     surprise_results = compute_surprise_batch(candidates, state)
     stats['num_candidates'] = len(candidates)
@@ -95,20 +105,48 @@ def run_pass2(
             updated_indices.append(sr.slot)
             surprise_values.append(sr.surprise)
 
-    # ── 3. Edge topology creation (discrete: create new edges, no weight updates) ──
-    causal_stats = causal_edge_learning(state, updated_indices, surprise_values)
-    stats['causal_edges_created'] = causal_stats['edges_created']
-
+    # ── 3. Learned edge proposal (replaces Hebbian + causal heuristics) ──
     co_activations = extract_co_activations(state, read_belief_indices)
-    hebbian_update(state, co_activations)
+    # Add temporal surprise pairs (causal candidates)
+    causal_pairs = _extract_causal_candidates(state, updated_indices, surprise_values)
+    all_candidate_pairs = co_activations + causal_pairs
+
+    # Apply controller connect_rate
+    connect_rate = actions.get('connect_rate', 1.0)
+    if connect_rate < 1.0 and len(all_candidate_pairs) > 0:
+        import random
+        n_keep = max(1, int(len(all_candidate_pairs) * connect_rate))
+        all_candidate_pairs = random.sample(all_candidate_pairs, n_keep)
+
+    with torch.no_grad():
+        accepted_edges, _ = state.edge_proposal.propose_edges(
+            all_candidate_pairs, state.beliefs.data,
+        )
+        n_created = 0
+        for src, tgt, weight, theta in accepted_edges:
+            relation = torch.zeros(state.config.relation_dim, device=state.beliefs.device)
+            eidx = state.allocate_edge(src, tgt, relation, weight=weight)
+            if eidx >= 0:
+                state.edge_direction.data[eidx] = theta
+                n_created += 1
+        stats['edges_proposed'] = len(all_candidate_pairs)
+        stats['edges_created'] = n_created
+        state.edge_proposal.update_ada_threshold(state.num_active_edges(), len(all_candidate_pairs))
+
+    # Store surprise for next-step causal detection
+    with torch.no_grad():
+        state.belief_prev_surprise.zero_()
+        for idx, s in zip(updated_indices, surprise_values):
+            state.belief_prev_surprise[idx] = s
+
     stats['co_activation_pairs'] = len(co_activations)
 
     # ── 4. Periodic consolidation (structural: merge similar beliefs) ──
+    merge_threshold = actions.get('merge_threshold', state.running_stats.merge_similarity_threshold)
+    prune_threshold = actions.get('prune_threshold', state.running_stats.hard_cleanup_precision_threshold)
+
     if current_step % state.running_stats.soft_consolidation_interval == 0:
-        merged = soft_consolidation(
-            state,
-            similarity_threshold=state.running_stats.merge_similarity_threshold,
-        )
+        merged = soft_consolidation(state, similarity_threshold=merge_threshold)
     else:
         merged = 0
     stats['soft_merges'] = merged
@@ -116,38 +154,37 @@ def run_pass2(
     consolidation_interval = state.running_stats.hard_consolidation_interval
     consolidation_timer = state.meta.data[2].item()
     if consolidation_timer >= consolidation_interval:
-        removed = periodic_hard_cleanup(
-            state,
-            low_precision_threshold=state.running_stats.hard_cleanup_precision_threshold,
-        )
+        removed = periodic_hard_cleanup(state, low_precision_threshold=prune_threshold)
         stats['hard_cleanup_removed'] = removed
         state.meta.data[2] = 0.0
     else:
         stats['hard_cleanup_removed'] = 0
 
     # ── 5. Differentiable goal generation (via TelosModule) ──
-    # Gated by cooldown from running_stats to prevent slot flooding.
     cooldown = state.running_stats.goal_cooldown_steps
+    goal_rate = int(actions.get('goal_rate', 3.0))
     with torch.no_grad():
         active_mask = state.get_active_mask()
-        if active_mask.any() and current_step % max(cooldown, 1) == 0:
+        if active_mask.any() and current_step % max(cooldown, 1) == 0 and goal_rate > 0:
             beta = state.meta.data[0].item()
             goal_embeds, goal_surprise = state.telos.generate_goals(
-                state.beliefs.data, active_mask, beta, max_new=3,
+                state.beliefs.data, active_mask, beta, max_new=goal_rate,
             )
-            # Allocate goal slots
             n_allocated = 0
+            # Goal slot is empty when argmax(status_logits) == 0 (empty class has highest logit)
             for i in range(goal_embeds.shape[0]):
-                # Find empty goal slot (status_logits argmax == 0 means empty)
-                status_probs = torch.softmax(state.goal_status_logits, dim=-1)
-                empty_mask = status_probs[:, 0] > 0.5  # mostly empty
+                best_status = state.goal_status_logits.argmax(dim=-1)
+                empty_mask = best_status == 0
                 if empty_mask.any():
                     slot = empty_mask.nonzero(as_tuple=False)[0].item()
                     state.goal_embeddings.data[slot] = goal_embeds[i]
-                    # Set status to proposed (index 1)
+                    # Reset logits and set proposed (idx 1) as dominant
+                    # Initial logit = inverse Gumbel-Softmax temperature so the
+                    # status is decisive at current tau (not a magic number)
+                    init_logit = 1.0 / max(state.telos.gumbel_tau.item(), 0.1)
                     state.goal_status_logits[slot] = torch.zeros(6, device=state.beliefs.device)
-                    state.goal_status_logits[slot, 1] = 5.0  # strong prior on proposed
-                    state.goal_metadata.data[slot, 6] = float(current_step)  # created_step
+                    state.goal_status_logits[slot, 1] = init_logit
+                    state.goal_metadata.data[slot, 6] = float(current_step)
                     n_allocated += 1
             stats['goals_generated'] = n_allocated
         else:
@@ -158,21 +195,60 @@ def run_pass2(
     stats['beta'] = beta
     stats['active_goals'] = state.num_active_goals()
 
-    # Increment consolidation timer
     if is_sequence_boundary:
         state.meta.data[2] += 1.0
 
-    # Update running statistics
     mean_surprise = stats.get('total_surprise', 0) / max(stats.get('num_candidates', 1), 1)
     state.running_stats.update(state, {
         'mean_surprise': mean_surprise,
         'current_step': current_step,
     })
 
-    # Anneal Telos Gumbel-Softmax temperature
     state.telos.anneal_temperature(current_step, total_steps)
 
     stats['active_beliefs'] = state.num_active_beliefs()
     stats['active_edges'] = state.num_active_edges()
 
     return stats
+
+
+def _extract_causal_candidates(
+    state: CognitiveState,
+    updated_indices: list[int],
+    surprise_values: list[float],
+    min_signal: float | None = None,
+) -> list[tuple[int, int]]:
+    """Extract candidate pairs from temporal surprise precedence.
+
+    Beliefs surprised at step t-1 × beliefs surprised at step t = causal candidates.
+    The EdgeProposer decides which become actual edges.
+    """
+    if min_signal is None:
+        min_signal = state.meta_params.causal_min_signal.item()
+
+    pairs = []
+    prev_surprise = state.belief_prev_surprise
+    prev_updated = (prev_surprise > EPSILON).nonzero(as_tuple=False).squeeze(-1)
+
+    if len(prev_updated) == 0 or len(updated_indices) == 0:
+        return pairs
+
+    curr_map = {idx: s for idx, s in zip(updated_indices, surprise_values) if s > EPSILON}
+    if not curr_map:
+        return pairs
+
+    for prev_idx in prev_updated.tolist():
+        prev_s = prev_surprise[prev_idx].item()
+        for curr_idx, curr_s in curr_map.items():
+            if prev_idx == curr_idx:
+                continue
+            signal = (prev_s * curr_s) ** 0.5
+            if signal >= min_signal:
+                pairs.append((prev_idx, curr_idx))
+
+    # Cap to prevent explosion
+    if len(pairs) > 256:
+        import random
+        pairs = random.sample(pairs, 256)
+
+    return pairs
