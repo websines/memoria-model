@@ -317,6 +317,7 @@ class MemoriaModel(nn.Module):
         self.state.edge_weights.detach_()
         self.state.edge_relations.detach_()
         self.state.goal_embeddings.detach_()
+        self.state.goal_status_logits.detach_()
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

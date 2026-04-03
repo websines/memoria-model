@@ -298,6 +298,8 @@ class _CombinedOptimizer:
     """
 
     def __init__(self, adamw: torch.optim.Optimizer | None, muon: Muon | None):
+        self.adamw = adamw
+        self.muon = muon
         self._optimizers = [o for o in [adamw, muon] if o is not None]
 
     @property

@@ -95,10 +95,10 @@ class PretrainedMemoriaModel(nn.Module):
             for i in range(n_interfaces)
         ]
 
-        # Read path gate: starts at 0, learned scalar that controls how much
-        # belief information is injected. Prevents disrupting the pretrained model
-        # before interfaces have learned useful projections.
-        self.read_gate = nn.Parameter(torch.zeros(n_interfaces))
+        # Read path gate: learned scalar controlling belief injection strength.
+        # sigmoid(-5) ≈ 0.007 — near-zero initial gating prevents disrupting
+        # pretrained representations before interfaces learn useful projections.
+        self.read_gate = nn.Parameter(torch.full((n_interfaces,), -5.0))
 
         self._hidden_dim = hidden_dim
         self._n_layers = n_layers
@@ -362,6 +362,7 @@ class PretrainedMemoriaModel(nn.Module):
         self.state.edge_weights.detach_()
         self.state.edge_relations.detach_()
         self.state.goal_embeddings.detach_()
+        self.state.goal_status_logits.detach_()
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

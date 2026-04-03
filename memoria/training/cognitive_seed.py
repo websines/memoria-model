@@ -115,7 +115,7 @@ def load_cognitive_seed(
         match_threshold: cosine similarity threshold for matching
     """
     path = Path(path)
-    seed = torch.load(path, map_location=state.beliefs.device)
+    seed = torch.load(path, map_location=state.beliefs.device, weights_only=True)
 
     print(f"Loading cognitive seed: {path}")
 

@@ -75,12 +75,20 @@ class DataPrefetcher:
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self._error is not None:
             raise RuntimeError(f"Data prefetcher failed: {self._error}")
-        try:
-            input_ids, labels = self.queue.get(timeout=120)
-        except queue.Empty:
-            if self._error is not None:
-                raise RuntimeError(f"Data prefetcher failed: {self._error}")
-            raise RuntimeError("Data prefetcher timed out after 120s — check data pipeline")
+        # Short poll intervals (5s) so worker errors surface quickly instead of
+        # blocking for the full 120s timeout before checking
+        deadline = time.monotonic() + 120
+        while True:
+            try:
+                input_ids, labels = self.queue.get(timeout=5)
+                break
+            except queue.Empty:
+                if self._error is not None:
+                    raise RuntimeError(f"Data prefetcher failed: {self._error}")
+                if not self.thread.is_alive():
+                    raise RuntimeError("Data prefetcher thread died unexpectedly")
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Data prefetcher timed out after 120s — check data pipeline")
         return input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
 
     def stop(self):
@@ -172,8 +180,11 @@ def train(
     # Optimizer
     optimizer = setup_optimizer(model, config)
 
-    # Prepare with accelerate (handles DDP wrapping, device placement)
-    model, optimizer = accelerator.prepare(model, optimizer)
+    # Prepare model with Accelerate (DDP wrapping + device placement).
+    # Optimizer is NOT prepared: in scratch mode it's a _CombinedOptimizer (not an
+    # Optimizer subclass), and bf16 mode doesn't need GradScaler wrapping.
+    # Optimizer param refs remain valid because DDP reuses the same underlying params.
+    model = accelerator.prepare(model)
     base_model = accelerator.unwrap_model(model)
 
     if is_main:
@@ -213,7 +224,7 @@ def train(
     start_step = 0
     samples_consumed = 0
     if resume_from:
-        checkpoint = torch.load(resume_from, map_location=device)
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=True)
         load_result = base_model.load_state_dict(checkpoint['model_state'], strict=False)
         if is_main and (load_result.missing_keys or load_result.unexpected_keys):
             # Filter out expected missing keys (frozen backbone excluded from checkpoint)
@@ -300,6 +311,16 @@ def train(
 
     belief_dim = config.state.belief_dim
 
+    # Persistent eval stream (main process only). Advancing past 1000 samples
+    # separates eval data from early training data and ensures each eval call
+    # gets fresh sequences instead of re-evaluating the same 20 every time.
+    if is_main:
+        eval_data_stream = stream_fineweb_edu(tokenizer, config.transformer.sequence_len)
+        for _ in range(1000):
+            next(eval_data_stream)
+    else:
+        eval_data_stream = None
+
     for step in range(start_step, max_steps):
         t0 = time.time()
 
@@ -343,9 +364,13 @@ def train(
         if step == 0 and is_main:
             print(f"\r  Step 0 complete.{' ' * 30}", flush=True)
 
-        # Gradient clipping + optimizer step
+        # Gradient clipping (skip Muon params — Newton-Schulz orthogonalization
+        # produces unit-spectral-norm updates, making pre-clip counterproductive)
         if tc.grad_clip_norm > 0:
-            accelerator.clip_grad_norm_(model.parameters(), tc.grad_clip_norm)
+            adamw = getattr(optimizer, 'adamw', optimizer)  # _CombinedOptimizer or plain AdamW
+            clip_params = [p for g in adamw.param_groups for p in g['params'] if p.grad is not None]
+            if clip_params:
+                torch.nn.utils.clip_grad_norm_(clip_params, tc.grad_clip_norm)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -445,11 +470,13 @@ def train(
         if is_main and step > 0 and step % belief_eval_interval == 0 and alpha > 0:
             base_model.eval()
             with torch.no_grad():
-                # Recompute loss WITH state on the last micro-batch (matches loss_without data)
-                result_with = base_model(input_ids, targets=labels, alpha=alpha)
+                # Use held-out data for unbiased measurement (not the training micro-batch)
+                eval_batch = next(eval_data_stream)
+                eval_ids = eval_batch['input_ids'].unsqueeze(0).to(device)
+                eval_labels = eval_batch['labels'].unsqueeze(0).to(device)
+                result_with = base_model(eval_ids, targets=eval_labels, alpha=alpha)
                 loss_with = result_with['loss_token'].item()
-                # Loss WITHOUT state on the same micro-batch (alpha=0 disables cognitive contributions)
-                result_without = base_model(input_ids, targets=labels, alpha=0.0)
+                result_without = base_model(eval_ids, targets=eval_labels, alpha=0.0)
                 loss_without = result_without['loss_token'].item()
             base_model.train()
             belief_advantage = loss_without - loss_with  # positive = beliefs help
@@ -470,11 +497,15 @@ def train(
             controller_loss = base_model.state.controller.compute_loss()
             if controller_loss.item() > 0:
                 controller_loss.backward()
-                # Note: controller params get stepped with the next optimizer.step()
+                # Step immediately so REINFORCE grads don't bleed into next step's
+                # supervised loss. Only controller params have grads here (others are
+                # None after zero_grad above), so only controller params get updated.
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
         # Periodic eval
         if is_main and step > 0 and step % tc.eval_interval == 0:
-            eval_ppl = _run_eval(base_model, tokenizer, config, device)
+            eval_ppl = _run_eval(base_model, eval_data_stream, device)
             print(f"\n  [eval] step {step}: perplexity = {eval_ppl:.2f}")
             if log_to_wandb:
                 wandb.log({'eval_perplexity': eval_ppl, 'step': step})
@@ -494,8 +525,8 @@ def train(
                 print(f"\nTime budget reached ({time_budget}s) at step {step}")
             break
 
-        # Periodic GC
-        if (step + 1) % 5000 == 0:
+        # Periodic GC (every 500 steps — cognitive state churn creates cycles)
+        if (step + 1) % 500 == 0:
             gc.collect()
 
     # Cleanup
@@ -519,10 +550,13 @@ def train(
     return base_model
 
 
-def _run_eval(model, tokenizer, config, device, n_batches: int = 20) -> float:
-    """Quick eval: compute perplexity on held-out FineWeb samples."""
+def _run_eval(model, eval_stream, device, n_batches: int = 20) -> float:
+    """Quick eval: compute perplexity on held-out FineWeb samples.
+
+    Uses a persistent eval stream so each call evaluates on fresh data
+    instead of re-reading the same first N batches from a new stream.
+    """
     model.eval()
-    eval_stream = stream_fineweb_edu(tokenizer, config.transformer.sequence_len)
     total_loss = 0.0
     with torch.no_grad():
         for _ in range(n_batches):
@@ -557,6 +591,16 @@ def save_checkpoint(model, optimizer, step: int, path: Path,
 
 def _push_to_hub_async(model, step: int, ckpt_path: Path, repo_id: str, token: str, is_final: bool = False):
     """Push checkpoint to HuggingFace Hub in a background thread."""
+    # Snapshot state summary on main thread before spawning — avoids racing
+    # with pass 2 which concurrently mutates model.state
+    summary = {
+        'step': step,
+        'active_beliefs': model.state.num_active_beliefs(),
+        'active_edges': model.state.num_active_edges(),
+        'active_goals': model.state.num_active_goals(),
+        'beta': model.state.beta,
+    }
+
     def _upload():
         try:
             from huggingface_hub import HfApi
@@ -575,13 +619,6 @@ def _push_to_hub_async(model, step: int, ckpt_path: Path, repo_id: str, token: s
                     commit_message=f"Checkpoint at step {step}",
                 )
 
-            summary = {
-                'step': step,
-                'active_beliefs': model.state.num_active_beliefs(),
-                'active_edges': model.state.num_active_edges(),
-                'active_goals': model.state.num_active_goals(),
-                'beta': model.state.beta,
-            }
             with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
                 json.dump(summary, f, indent=2)
                 tmp_path = f.name

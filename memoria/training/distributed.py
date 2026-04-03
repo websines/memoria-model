@@ -37,6 +37,8 @@ def broadcast_state(state, rank: int, world_size: int):
     dist.broadcast(state.belief_access_count, src=0)
     dist.broadcast(state.belief_prev_surprise, src=0)
     dist.broadcast(state.edge_causal_obs, src=0)
+    dist.broadcast(state.goal_status_logits, src=0)
+    dist.broadcast(state.immutable_beliefs, src=0)
 
 
 def sync_ranks(world_size: int):
