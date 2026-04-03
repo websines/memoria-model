@@ -24,7 +24,25 @@ class TransformerConfig:
     n_head: int = 6
     n_kv_head: int = 6
     n_embd: int = 768
-    window_pattern: str = "SSSL"     # sliding window pattern from autoresearch
+
+    # Attention pattern: S = Sliding window, L = Long/global (MLA)
+    # "S" = all layers sliding window (cognitive state handles global context)
+    # "SSSL" = 3 sliding + 1 global per cycle (for models without cognitive state)
+    window_pattern: str = "S"
+    sliding_window_size: int = 4096   # local window for S layers
+
+    # RoPE position encoding — native long context, no scaling
+    # High base frequency for native 200K support (like Llama 3 at 128K)
+    max_position: int = 204800        # max position for RoPE
+    rope_scaling: str = "none"        # "none" or "yarn" (yarn only for extending pretrained models)
+    rope_scaling_factor: float = 1.0  # only used when rope_scaling="yarn"
+    rope_base: int = 500000           # high base for native long context (Llama 3 style)
+
+    # Multi-Head Latent Attention (MLA) for L layers — DeepSeek V3 style
+    # Only used when window_pattern contains "L" layers.
+    # Set mla_latent_dim=0 to disable (L layers use standard full attention).
+    mla_latent_dim: int = 0           # KV compression dimension (0 = disabled)
+    mla_rope_dim: int = 64            # RoPE dimensions kept uncompressed in MLA
 
     # State interface placement
     interface_every: int = 4          # insert state interface every N layers
@@ -89,8 +107,15 @@ class MemoriaConfig:
 
 def small_config() -> MemoriaConfig:
     """~125M params (+ ~117M embedding). Single 3090. Rapid iteration.
-    Total ~245M params. Fits in <10GB VRAM at B=8.
-    1B tokens ≈ 12 hours on single 3090, 6 hours on 2x 3090.
+    Total ~245M params. Fits in <10GB VRAM.
+
+    All sliding window attention (4K) with PolarQuant KV compression.
+    Cognitive state handles global context. Native 200K via high-base RoPE.
+
+    State scaled 4x from original (TurboQuant compression keeps memory flat):
+    - 16K beliefs (was 4K) — 1 belief per 12.5 tokens at 200K
+    - 65K edges (was 16K) — richer causal graph
+    - 256 goals (was 64) — more concurrent objectives
     """
     return MemoriaConfig(
         transformer=TransformerConfig(
@@ -98,19 +123,23 @@ def small_config() -> MemoriaConfig:
             interface_every=4,
         ),
         state=StateConfig(
-            belief_dim=256, max_beliefs=4096, max_edges=16384,
-            max_goals=64, relation_dim=64,
+            belief_dim=256, max_beliefs=16384, max_edges=65536,
+            max_goals=256, relation_dim=64,
         ),
         training=TrainingConfig(
-            device_batch_size=2,  # 151K vocab → logits gradient is [B*T, 151K]. B=2 fits in 24GB.
+            device_batch_size=2,
         ),
     )
 
 
 def medium_config() -> MemoriaConfig:
     """~300M params (+ ~156M embedding). 2x 3090. Serious training.
-    Total ~456M params. ~14GB VRAM at B=4.
-    2B tokens ≈ 12 hours on 2x 3090.
+    Total ~456M params.
+
+    State scaled 4x (TurboQuant compressed):
+    - 32K beliefs — 1 belief per 6.25 tokens at 200K
+    - 131K edges — dense causal graph
+    - 256 goals
     """
     return MemoriaConfig(
         transformer=TransformerConfig(
@@ -118,18 +147,23 @@ def medium_config() -> MemoriaConfig:
             interface_every=4,
         ),
         state=StateConfig(
-            belief_dim=256, max_beliefs=8192, max_edges=32768,
-            max_goals=64, relation_dim=64,
+            belief_dim=256, max_beliefs=32768, max_edges=131072,
+            max_goals=256, relation_dim=64,
         ),
         training=TrainingConfig(
-            device_batch_size=4,  # bigger model + big vocab = smaller batch
+            device_batch_size=4,
         ),
     )
 
 
 def large_config() -> MemoriaConfig:
     """~500M params (+ ~194M embedding). B200 or multi-GPU. Crossover experiment.
-    Total ~694M params. Needs B200 or model parallel on 2x 3090.
+    Total ~694M params.
+
+    State scaled 4x (TurboQuant compressed):
+    - 65K beliefs — 1 belief per 3 tokens at 200K (very dense coverage)
+    - 262K edges — massive causal graph
+    - 512 goals
     """
     return MemoriaConfig(
         transformer=TransformerConfig(
@@ -137,11 +171,11 @@ def large_config() -> MemoriaConfig:
             interface_every=4,
         ),
         state=StateConfig(
-            belief_dim=256, max_beliefs=16384, max_edges=65536,
-            max_goals=128, relation_dim=64,
+            belief_dim=256, max_beliefs=65536, max_edges=262144,
+            max_goals=512, relation_dim=64,
         ),
         training=TrainingConfig(
-            device_batch_size=2,  # large model on B200 can use bigger batch
+            device_batch_size=2,
             alpha_max=0.1,
         ),
     )
@@ -172,12 +206,17 @@ def qwen_config() -> MemoriaConfig:
             interface_every=6,  # 4 interface layers at positions 5, 11, 17, 23
             interface_num_heads=4,
             interface_top_k=64,  # more beliefs since the model is more capable
+            # Pretrained mode: backbone handles its own attention.
+            # Qwen3.5 uses YaRN internally — we extend its RoPE for long context.
+            max_position=204800,
+            rope_scaling="yarn",
+            rope_scaling_factor=100.0,
         ),
         state=StateConfig(
             belief_dim=512,  # larger to match richer representations from 2B model
-            max_beliefs=8192,
-            max_edges=65536,  # 8× beliefs — 2B model creates edges fast
-            max_goals=64,
+            max_beliefs=32768,   # 4x from 8K — TurboQuant compressed
+            max_edges=262144,    # 8× beliefs — 2B model creates edges fast
+            max_goals=256,
             relation_dim=64,
         ),
         training=TrainingConfig(

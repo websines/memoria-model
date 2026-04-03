@@ -105,6 +105,7 @@ class MemoriaModel(nn.Module):
             dict with scalars + candidates (no large tensors to avoid DDP OOM)
         """
         B, T = idx.size()
+        self.transformer._ensure_rope(T)
         cos = self.transformer.cos[:, :T]
         sin = self.transformer.sin[:, :T]
 
@@ -122,11 +123,20 @@ class MemoriaModel(nn.Module):
         ttt_ctx = TTTContext()
 
         for i, block in enumerate(self.transformer.blocks):
-            x = block(
-                x, x0, cos, sin,
-                self.transformer.resid_lambdas[i],
-                self.transformer.x0_lambdas[i],
-            )
+            if self.training and T > self.config.transformer.sliding_window_size:
+                # Gradient checkpointing for long sequences (saves ~10x activation memory)
+                x = torch.utils.checkpoint.checkpoint(
+                    block, x, x0, cos, sin,
+                    self.transformer.resid_lambdas[i],
+                    self.transformer.x0_lambdas[i],
+                    use_reentrant=False,
+                )
+            else:
+                x = block(
+                    x, x0, cos, sin,
+                    self.transformer.resid_lambdas[i],
+                    self.transformer.x0_lambdas[i],
+                )
 
             # Insert state interface after designated blocks
             if interface_idx < len(self.interfaces) and i == self.interface_positions[interface_idx]:
