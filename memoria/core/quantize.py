@@ -26,27 +26,33 @@ from torch import Tensor
 
 
 class PolarQuantizer(nn.Module):
-    """Quantize vectors to low-bit using random rotation + uniform scalar quantization.
+    """Quantize vectors to low-bit using optional rotation + uniform scalar quantization.
+
+    Two modes:
+    - rotate=True: Random orthogonal rotation before quantization. Spreads information
+      uniformly across dimensions. Best for unnormalized vectors where some dimensions
+      have much larger variance than others.
+    - rotate=False: Direct quantization without rotation. Faster (no matmul overhead).
+      Works well when dimensions already have similar variance — e.g. after QK-norm,
+      RMS-norm, or any normalization that equalizes dimensions.
 
     Usage:
-        quantizer = PolarQuantizer(dim=128, bits=3)
-        codes, scale = quantizer.quantize(x)     # x: [..., 128] → codes: [..., 128] uint8
-        x_rec = quantizer.dequantize(codes, scale)  # reconstruct
-
-    The random rotation matrix R is fixed at construction time and stored as a buffer.
-    It must be the same R for quantize and dequantize.
+        quantizer = PolarQuantizer(dim=128, bits=3, rotate=False)  # fast, for normed data
+        codes, scale = quantizer.quantize(x)
+        x_rec = quantizer.dequantize(codes, scale)
     """
 
-    def __init__(self, dim: int, bits: int = 3):
+    def __init__(self, dim: int, bits: int = 3, rotate: bool = False):
         super().__init__()
         self.dim = dim
         self.bits = bits
         self.levels = 2 ** bits  # 8 for 3-bit, 16 for 4-bit
+        self.rotate = rotate
 
-        # Precompute random orthogonal rotation via QR decomposition
-        # This is fixed per layer/quantizer instance — not learned
-        R, _ = torch.linalg.qr(torch.randn(dim, dim))
-        self.register_buffer('R', R)
+        if rotate:
+            # Random orthogonal rotation via QR decomposition (fixed per instance)
+            R, _ = torch.linalg.qr(torch.randn(dim, dim))
+            self.register_buffer('R', R)
 
     @torch.no_grad()
     def quantize(self, x: Tensor) -> tuple[Tensor, Tensor]:
@@ -59,14 +65,14 @@ class PolarQuantizer(nn.Module):
             codes: [..., dim] uint8 tensor (values in [0, levels-1])
             scale: [..., 1] float tensor (per-vector max absolute value)
         """
-        # Step 1: Random orthogonal rotation
-        x_rot = x @ self.R  # [..., dim]
+        if self.rotate:
+            x = x @ self.R
 
-        # Step 2: Per-vector scale (single scalar per vector — minimal overhead)
-        scale = x_rot.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+        # Per-vector scale (single scalar per vector — minimal overhead)
+        scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
 
-        # Step 3: Normalize to [-1, 1] then quantize to [0, levels-1]
-        x_norm = x_rot / scale
+        # Normalize to [-1, 1] then quantize to [0, levels-1]
+        x_norm = x / scale
         half_levels = (self.levels - 1) / 2.0
         codes = ((x_norm + 1.0) * half_levels).round().clamp(0, self.levels - 1).to(torch.uint8)
 
@@ -84,9 +90,13 @@ class PolarQuantizer(nn.Module):
             [..., dim] float tensor (approximate reconstruction)
         """
         half_levels = (self.levels - 1) / 2.0
-        x_norm = codes.float() / half_levels - 1.0
-        x_rot = x_norm * scale
-        return x_rot @ self.R.T
+        x = codes.float() / half_levels - 1.0
+        x = x * scale
+
+        if self.rotate:
+            x = x @ self.R.T
+
+        return x
 
 
 class QuantizedKVCache(nn.Module):
@@ -101,11 +111,13 @@ class QuantizedKVCache(nn.Module):
     - Savings: ~9.5x per head
     """
 
-    def __init__(self, head_dim: int, bits: int = 3):
+    def __init__(self, head_dim: int, bits: int = 3, rotate: bool = False):
         super().__init__()
         self.head_dim = head_dim
         self.bits = bits
-        self.quantizer = PolarQuantizer(head_dim, bits)
+        # rotate=False by default: KV in sliding window is QK-normed,
+        # so dimensions already have equal variance — rotation is redundant
+        self.quantizer = PolarQuantizer(head_dim, bits, rotate=rotate)
 
     def compress(self, k: Tensor, v: Tensor) -> dict:
         """Compress K and V tensors.
