@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from ..core.state import CognitiveState
-from .read_path import ReadPath
+from .read_path import ReadPath, BeliefCache
 from .write_path import WritePath, WriteCandidate
 
 
@@ -38,15 +38,19 @@ class StateInterfaceLayer(nn.Module):
         num_heads: int = 4,
         top_k: int = 32,
         layer_idx: int = 0,
+        n_interfaces: int = 1,
+        read_gate_init_bias: float = 2.0,
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.n_interfaces = n_interfaces
 
         self.read_path = ReadPath(
             hidden_dim=hidden_dim,
             belief_dim=belief_dim,
             num_heads=num_heads,
             top_k=top_k,
+            read_gate_init_bias=read_gate_init_bias,
         )
         self.write_path = WritePath(
             hidden_dim=hidden_dim,
@@ -56,11 +60,18 @@ class StateInterfaceLayer(nn.Module):
         # Pre-norm before read (standard transformer convention)
         self.norm = nn.RMSNorm(hidden_dim)
 
+        # Depth-conditioned retrieval: per-layer learnable temperature bias.
+        # Early interfaces retrieve broadly (high temp), later ones focus (low temp).
+        # Reference: Mamba HaltingHead's loop position scalar — depth encoding
+        # improves retrieval quality by letting the model learn depth-specific behavior.
+        self.depth_bias = nn.Parameter(torch.zeros(1))
+
     def forward(
         self,
         hidden: Tensor,
         state: CognitiveState,
         current_step: int = -1,
+        belief_cache: BeliefCache | None = None,
     ) -> tuple[Tensor, list[WriteCandidate], Tensor, list[int], Tensor, Tensor, Tensor]:
         """Forward pass through the state interface.
 
@@ -68,6 +79,7 @@ class StateInterfaceLayer(nn.Module):
             hidden: [B, T, hidden_dim] from previous transformer block
             state: cognitive state to read from / write to
             current_step: for recency tracking (-1 to skip)
+            belief_cache: pre-computed active belief data (shared across all interfaces)
 
         Returns:
             hidden: [B, T, hidden_dim] with belief information added
@@ -90,10 +102,14 @@ class StateInterfaceLayer(nn.Module):
             goal_embeddings=goal_embeddings if len(goal_indices) > 0 else None,
             goal_priorities=goal_priorities,
             current_step=current_step,
+            belief_cache=belief_cache,
+            depth_bias=self.depth_bias.item(),
         )
         hidden = hidden + belief_info  # residual connection
 
         # Write: project hidden states, match against beliefs, buffer candidates
-        candidates, obs_vectors = self.write_path(normed, state, layer_idx=self.layer_idx)
+        candidates, obs_vectors = self.write_path(
+            normed, state, layer_idx=self.layer_idx, belief_cache=belief_cache,
+        )
 
         return hidden, candidates, utility_logits, read_indices, attn_weights, retrieved, obs_vectors

@@ -49,6 +49,25 @@ class TransformerConfig:
     interface_num_heads: int = 4      # retrieval heads in read path
     interface_top_k: int = 32         # max beliefs to attend over
 
+    # Working memory prefix (Mamba-inspired scratchpad)
+    working_memory_size: int = 8      # M learnable tokens prepended to hidden stream
+
+    # Engram static knowledge cache
+    engram_table_size: int = 50000    # entries per hash table
+    engram_n_heads: int = 4           # hash heads per N-gram order
+    engram_embed_dim: int = 0         # per-head embed dim (0 = auto)
+
+    # Refinement loops (Mamba-inspired iterative reasoning)
+    max_refinement_loops: int = 3     # max loops on upper layers (0 to disable)
+    refinement_halt_threshold: float = 0.7  # P(halt) above this exits the loop
+    refinement_gate_init: float = 0.1       # lifeline gate initial value (per-dim)
+
+    # Read gate initial bias (sigmoid(x) ≈ opening fraction)
+    read_gate_init_bias: float = 2.0        # sigmoid(2.0) ≈ 0.88 — starts mostly open
+
+    # Working memory init scale (small normal around zero)
+    working_memory_init_scale: float = 0.02
+
 
 @dataclass
 class TrainingConfig:
@@ -79,6 +98,11 @@ class TrainingConfig:
     alpha_max: float = 0.1            # max weight for L_fe
     alpha_warmup_steps: int = 1000    # KL annealing: α ramps from 0 to alpha_max
     fe_temperature: float = 5.0       # temperature for energy computation
+
+    # Auxiliary loss weights (relative to alpha)
+    utility_loss_weight: float = 0.1   # weight for L_utility (belief usefulness)
+    surprise_loss_weight: float = 0.1  # weight for L_surprise (telos learning)
+    halt_loss_weight: float = 0.1      # weight for L_halt (refinement probe)
 
     # Training phases
     phase1_steps: int = 2000          # L_token only (language foundation)

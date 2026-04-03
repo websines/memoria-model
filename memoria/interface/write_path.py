@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 from ..core.state import CognitiveState
 from ..core.polar import angular_similarity, belief_is_active, EPSILON
+from .read_path import BeliefCache
 
 
 @dataclass
@@ -135,6 +136,7 @@ class WritePath(nn.Module):
         hidden: Tensor,
         state: CognitiveState,
         layer_idx: int = 0,
+        belief_cache: 'BeliefCache | None' = None,
     ) -> tuple[list[WriteCandidate], Tensor]:
         """Project hidden states and match against existing beliefs.
 
@@ -142,6 +144,7 @@ class WritePath(nn.Module):
             hidden: [B, T, hidden_dim] transformer hidden states
             state: the cognitive state to match against
             layer_idx: which state interface layer this is (for tracking)
+            belief_cache: pre-computed active belief data (avoids redundant computation)
 
         Returns:
             candidates: list of WriteCandidate objects for pass 2
@@ -165,7 +168,9 @@ class WritePath(nn.Module):
         obs_beliefs = obs_angles * gated_precision                   # [B, T, D]
 
         # Batch matching across all B*T positions in one matmul
-        candidates = self._match_and_buffer_batched(obs_beliefs, state, layer_idx, B, T)
+        candidates = self._match_and_buffer_batched(
+            obs_beliefs, state, layer_idx, B, T, belief_cache=belief_cache,
+        )
 
         # Return precision-gated observations for L_fe (not raw obs_vectors).
         # This connects write_gate + precision_head to the computation graph
@@ -179,6 +184,7 @@ class WritePath(nn.Module):
         layer_idx: int,
         B: int,
         T: int,
+        belief_cache: 'BeliefCache | None' = None,
     ) -> list[WriteCandidate]:
         """Match all B*T observations against existing beliefs in one matmul.
 
@@ -188,6 +194,7 @@ class WritePath(nn.Module):
             layer_idx: layer index for tracking
             B: batch size (for position reconstruction)
             T: sequence length
+            belief_cache: pre-computed active belief data (avoids redundant computation)
 
         Returns:
             List of WriteCandidates
@@ -197,18 +204,28 @@ class WritePath(nn.Module):
         obs_flat = obs_beliefs.reshape(-1, D)  # [B*T, D]
         N = obs_flat.shape[0]
 
-        active_mask = state.get_active_mask()
         match_threshold = state.match_threshold
 
         obs_radii = obs_flat.norm(dim=-1)  # [N]
         meaningful = obs_radii > 0.05
 
-        if active_mask.any() and meaningful.any():
-            active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
-            active_beliefs = state.beliefs[active_indices]  # [N_active, D]
-            active_radii = active_beliefs.norm(dim=-1).clamp(min=EPSILON)
-            active_angles = active_beliefs / active_radii.unsqueeze(-1)
+        # Use belief cache if available, otherwise compute from state
+        has_active = False
+        if belief_cache is not None:
+            has_active = belief_cache.n_active > 0
+            if has_active:
+                active_indices = belief_cache.indices
+                active_angles = belief_cache.angles
+        else:
+            active_mask = state.get_active_mask()
+            has_active = active_mask.any()
+            if has_active:
+                active_indices = active_mask.nonzero(as_tuple=False).squeeze(-1)
+                active_beliefs = state.beliefs[active_indices]
+                active_radii = active_beliefs.norm(dim=-1).clamp(min=EPSILON)
+                active_angles = active_beliefs / active_radii.unsqueeze(-1)
 
+        if has_active and meaningful.any():
             obs_angles = obs_flat / obs_radii.unsqueeze(-1).clamp(min=EPSILON)
 
             # One big matmul: [B*T, N_active]
