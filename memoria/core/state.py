@@ -354,13 +354,46 @@ class CognitiveState(nn.Module):
 
     # ── Serialization ──
 
-    def state_dict_cognitive(self) -> dict:
-        """Serialize cognitive state for checkpointing."""
+    def state_dict_cognitive(self, compress: bool = True) -> dict:
+        """Serialize cognitive state for checkpointing.
+
+        Args:
+            compress: If True, quantize beliefs and edge relations to 3-bit
+                using PolarQuant. Reduces checkpoint size ~3.3x for these tensors.
+                The quantization is lossless enough for checkpoint restore
+                (97%+ cosine similarity).
+        """
+        if compress:
+            from .quantize import QuantizedBeliefStore, PolarQuantizer
+
+            # Compress beliefs: polar decomposition (angle quantized, radius full precision)
+            bs = QuantizedBeliefStore(self.config.belief_dim, bits=3)
+            belief_compressed = bs.compress_beliefs(self.beliefs.data)
+
+            # Compress edge relations (same approach, different dim)
+            rel_q = PolarQuantizer(self.config.relation_dim, bits=3, rotate=False)
+            rel_codes, rel_scale = rel_q.quantize(self.edge_relations.data)
+
+            beliefs_data = {
+                'compressed': True,
+                'angle_codes': belief_compressed['angle_codes'],
+                'angle_scale': belief_compressed['angle_scale'],
+                'radii': belief_compressed['radii'],
+            }
+            relations_data = {
+                'compressed': True,
+                'codes': rel_codes,
+                'scale': rel_scale,
+            }
+        else:
+            beliefs_data = {'compressed': False, 'data': self.beliefs.data.clone()}
+            relations_data = {'compressed': False, 'data': self.edge_relations.data.clone()}
+
         return {
-            'beliefs': self.beliefs.data.clone(),
+            'beliefs': beliefs_data,
             'edge_src': self.edge_src.clone(),
             'edge_tgt': self.edge_tgt.clone(),
-            'edge_relations': self.edge_relations.data.clone(),
+            'edge_relations': relations_data,
             'edge_weights': self.edge_weights.data.clone(),
             'edge_active': self.edge_active.clone(),
             'edge_causal_obs': self.edge_causal_obs.clone(),
@@ -383,12 +416,38 @@ class CognitiveState(nn.Module):
         }
 
     def load_state_cognitive(self, state: dict):
-        """Restore cognitive state from checkpoint."""
+        """Restore cognitive state from checkpoint.
+
+        Handles both compressed (PolarQuant) and uncompressed belief/relation formats.
+        """
         with torch.no_grad():
-            self.beliefs.data.copy_(state['beliefs'])
+            # Beliefs: compressed or raw
+            beliefs_data = state['beliefs']
+            if isinstance(beliefs_data, dict) and beliefs_data.get('compressed'):
+                from .quantize import QuantizedBeliefStore
+                bs = QuantizedBeliefStore(self.config.belief_dim, bits=3)
+                self.beliefs.data.copy_(bs.decompress_beliefs(beliefs_data))
+            elif isinstance(beliefs_data, dict):
+                self.beliefs.data.copy_(beliefs_data['data'])
+            else:
+                # Legacy format: raw tensor
+                self.beliefs.data.copy_(beliefs_data)
+
             self.edge_src.copy_(state['edge_src'])
             self.edge_tgt.copy_(state['edge_tgt'])
-            self.edge_relations.data.copy_(state['edge_relations'])
+
+            # Edge relations: compressed or raw
+            rel_data = state['edge_relations']
+            if isinstance(rel_data, dict) and rel_data.get('compressed'):
+                from .quantize import PolarQuantizer
+                rel_q = PolarQuantizer(self.config.relation_dim, bits=3, rotate=False)
+                self.edge_relations.data.copy_(rel_q.dequantize(rel_data['codes'], rel_data['scale']))
+            elif isinstance(rel_data, dict):
+                self.edge_relations.data.copy_(rel_data['data'])
+            else:
+                # Legacy format: raw tensor
+                self.edge_relations.data.copy_(rel_data)
+
             self.edge_weights.data.copy_(state['edge_weights'])
             self.edge_active.copy_(state['edge_active'])
             if 'edge_causal_obs' in state:

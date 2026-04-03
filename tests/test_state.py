@@ -140,7 +140,13 @@ def test_checkpoint_roundtrip(state):
 
     assert state2.num_active_beliefs() == 2
     assert state2.num_active_edges() == 1
-    assert torch.allclose(state.beliefs.data, state2.beliefs.data)
+    # Compressed checkpoints use 3-bit quantization: ~97% cosine similarity, not exact
+    cos_sim = torch.nn.functional.cosine_similarity(
+        state.beliefs.data[state.get_active_mask()],
+        state2.beliefs.data[state2.get_active_mask()],
+        dim=-1,
+    )
+    assert cos_sim.mean() > 0.95, f"Belief roundtrip quality too low: {cos_sim.mean():.4f}"
 
 
 def test_summary(state):

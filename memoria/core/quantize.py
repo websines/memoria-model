@@ -173,28 +173,37 @@ class QuantizedBeliefStore:
     def compress_beliefs(self, beliefs: Tensor) -> dict:
         """Compress belief vectors, preserving polar structure.
 
+        Zero vectors (empty slots) are preserved exactly — no quantization noise.
+
         Args:
             beliefs: [N, D] belief vectors (cartesian form, radius encodes precision)
 
         Returns:
-            dict with quantized angles, radii, and metadata
+            dict with quantized angles, radii, active mask, and metadata
         """
         # Decompose into polar: radius + unit angle
-        radii = beliefs.norm(dim=-1, keepdim=True).clamp(min=1e-10)
-        angles = beliefs / radii  # unit vectors
+        radii = beliefs.norm(dim=-1, keepdim=True)
+        active = (radii.squeeze(-1) > 1e-10)  # track which slots are actually occupied
 
-        # Quantize the angle vectors
+        # For active beliefs: compute unit angles and quantize
+        # For inactive: angles don't matter (will be masked on decompress)
+        safe_radii = radii.clamp(min=1e-10)
+        angles = beliefs / safe_radii
+
         angle_codes, angle_scale = self.quantizer.quantize(angles)
 
         return {
             'angle_codes': angle_codes,
             'angle_scale': angle_scale,
-            'radii': radii,  # keep full precision — radius is the confidence signal
+            'radii': radii,
+            'active': active,  # bool mask: which slots have real beliefs
         }
 
     @torch.no_grad()
     def decompress_beliefs(self, compressed: dict) -> Tensor:
         """Reconstruct belief vectors from compressed form.
+
+        Empty slots (radius ≈ 0) are restored as exact zeros.
 
         Args:
             compressed: dict from compress_beliefs()
@@ -205,7 +214,11 @@ class QuantizedBeliefStore:
         angles = self.quantizer.dequantize(
             compressed['angle_codes'], compressed['angle_scale']
         )
-        # Re-normalize angles (quantization can break unit-norm)
         angles = torch.nn.functional.normalize(angles, dim=-1, eps=1e-10)
-        # Reconstruct cartesian: radius × angle
-        return angles * compressed['radii']
+        beliefs = angles * compressed['radii']
+
+        # Zero out inactive slots (empty beliefs must stay exactly zero)
+        if 'active' in compressed:
+            beliefs[~compressed['active']] = 0.0
+
+        return beliefs
