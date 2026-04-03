@@ -214,7 +214,19 @@ def train(
     samples_consumed = 0
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
-        base_model.load_state_dict(checkpoint['model_state'], strict=False)
+        load_result = base_model.load_state_dict(checkpoint['model_state'], strict=False)
+        if is_main and (load_result.missing_keys or load_result.unexpected_keys):
+            # Filter out expected missing keys (frozen backbone excluded from checkpoint)
+            unexpected_missing = [k for k in load_result.missing_keys
+                                  if not k.startswith('backbone.')]
+            if unexpected_missing:
+                print(f"  Resume: {len(unexpected_missing)} missing keys (new params): "
+                      f"{unexpected_missing[:5]}{'...' if len(unexpected_missing) > 5 else ''}")
+            elif load_result.missing_keys:
+                print(f"  Resume: {len(load_result.missing_keys)} missing backbone keys (expected, backbone loaded from pretrained)")
+            if load_result.unexpected_keys:
+                print(f"  Resume: {len(load_result.unexpected_keys)} unexpected keys (removed params): "
+                      f"{load_result.unexpected_keys[:5]}{'...' if len(load_result.unexpected_keys) > 5 else ''}")
         base_model.state.load_state_cognitive(checkpoint['cognitive_state'])
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_step = checkpoint['step']
@@ -281,9 +293,9 @@ def train(
     # DDP no_sync support
     has_no_sync = hasattr(model, 'no_sync')
 
-    # GC management
+    # GC management: disable automatic GC to avoid mid-step pauses,
+    # but don't freeze (frozen objects can't be cycle-collected later)
     gc.collect()
-    gc.freeze()
     gc.disable()
 
     belief_dim = config.state.belief_dim
@@ -433,9 +445,10 @@ def train(
         if is_main and step > 0 and step % belief_eval_interval == 0 and alpha > 0:
             base_model.eval()
             with torch.no_grad():
-                # Loss WITH state (already computed)
-                loss_with = total_loss_token
-                # Loss WITHOUT state (alpha=0 disables all cognitive contributions)
+                # Recompute loss WITH state on the last micro-batch (matches loss_without data)
+                result_with = base_model(input_ids, targets=labels, alpha=alpha)
+                loss_with = result_with['loss_token'].item()
+                # Loss WITHOUT state on the same micro-batch (alpha=0 disables cognitive contributions)
                 result_without = base_model(input_ids, targets=labels, alpha=0.0)
                 loss_without = result_without['loss_token'].item()
             base_model.train()
@@ -525,9 +538,15 @@ def _run_eval(model, tokenizer, config, device, n_batches: int = 20) -> float:
 def save_checkpoint(model, optimizer, step: int, path: Path,
                     samples_consumed: int = 0, spsa_controller=None):
     """Save model + cognitive state + optimizer + stream position checkpoint."""
+    # In pretrained mode, skip frozen backbone to avoid multi-GB checkpoint bloat
+    model_state = model.state_dict()
+    if hasattr(model, 'backbone'):
+        model_state = {k: v for k, v in model_state.items()
+                       if not k.startswith('backbone.')}
+
     ckpt = {
         'step': step,
-        'model_state': model.state_dict(),
+        'model_state': model_state,
         'cognitive_state': model.state.state_dict_cognitive(),
         'optimizer_state': optimizer.state_dict(),
         'samples_consumed': samples_consumed,

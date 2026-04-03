@@ -25,7 +25,7 @@ def _newton_schulz(G: Tensor, steps: int = 5) -> Tensor:
     assert G.ndim == 2
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
-    X /= (X.norm() + 1e-30)
+    X /= (X.norm() + 1e-7)
 
     transposed = G.shape[0] > G.shape[1]
     if transposed:
@@ -421,6 +421,18 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
             'eps': 1e-8,
             'weight_decay': 0.0,
         })
+
+    # In-Place TTT module (step-size modulators)
+    if hasattr(model, 'ttt'):
+        ttt_params = [p for p in model.ttt.parameters() if p.requires_grad]
+        if ttt_params:
+            param_groups.append({
+                'params': ttt_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
 
     optimizer = torch.optim.AdamW(param_groups)
     for group in optimizer.param_groups:

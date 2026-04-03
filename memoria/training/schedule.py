@@ -1,12 +1,13 @@
 """Learning rate and alpha scheduling.
 
-LR schedule: warmup → constant → warmdown (cosine decay) — from autoresearch.
+LR schedule: warmup → constant → warmdown (linear or cosine) — from autoresearch.
 Alpha schedule: KL annealing for L_fe — ramps from 0 to alpha_max during phase 2.
 
 Reference: β-VAE literature (KL annealing)
 Reference: autoresearch/train.py (LR schedule)
 """
 
+import math
 from ..model.config import TrainingConfig
 
 
@@ -16,7 +17,7 @@ def get_lr_multiplier(step: int, total_steps: int, config: TrainingConfig) -> fl
     Three-phase schedule:
     1. Warmup: 0 → 1 (linear)
     2. Constant: 1
-    3. Warmdown: 1 → final_lr_frac (cosine)
+    3. Warmdown: 1 → final_lr_frac (linear or cosine)
 
     Args:
         step: current training step
@@ -31,16 +32,19 @@ def get_lr_multiplier(step: int, total_steps: int, config: TrainingConfig) -> fl
     if progress < config.warmup_ratio:
         # Linear warmup
         return progress / config.warmup_ratio if config.warmup_ratio > 0 else 1.0
-    elif progress < 1.0 - config.warmdown_ratio:
-        # Constant
+    elif config.warmdown_ratio <= 0 or progress < 1.0 - config.warmdown_ratio:
+        # Constant (also handles warmdown_ratio=0 to avoid division by zero)
         return 1.0
     else:
-        # Warmdown
+        # Warmdown: cooldown_progress goes from 1.0 → 0.0
         cooldown_progress = (1.0 - progress) / config.warmdown_ratio
         if getattr(config, 'warmdown_type', None) == 'linear':
+            # Linear decay: 1.0 → 0.0
             return cooldown_progress
-        # Cosine warmdown (default)
-        return cooldown_progress * 1.0 + (1 - cooldown_progress) * config.final_lr_frac
+        # Cosine warmdown: smooth decay from 1.0 → final_lr_frac
+        return config.final_lr_frac + 0.5 * (1.0 - config.final_lr_frac) * (
+            1.0 + math.cos(math.pi * (1.0 - cooldown_progress))
+        )
 
 
 def get_alpha(step: int, config: TrainingConfig) -> float:

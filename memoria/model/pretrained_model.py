@@ -109,6 +109,12 @@ class PretrainedMemoriaModel(nn.Module):
             n_layers=n_layers,
         )
 
+    def train(self, mode: bool = True):
+        """Override train() to keep frozen backbone in eval mode always."""
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
     @torch.no_grad()
     def init_weights(self):
         """Initialize interface weights. Backbone is already pretrained."""
