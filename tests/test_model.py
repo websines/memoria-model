@@ -174,6 +174,6 @@ def test_gradient_flow_to_beliefs(model):
 def test_cognitive_meta_params_in_model(model):
     """MetaParams should be part of the model and have learnable parameters."""
     meta_params = list(model.state.meta_params.parameters())
-    assert len(meta_params) == 15, f"Expected 15 meta params, got {len(meta_params)}"
+    assert len(meta_params) == 20, f"Expected 20 meta params, got {len(meta_params)}"
     for p in meta_params:
         assert p.requires_grad, "All meta params should be learnable"

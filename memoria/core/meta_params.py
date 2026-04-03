@@ -95,6 +95,26 @@ class MetaParams(nn.Module):
         # meta_learning.py — distance threshold for deduplicating goals
         self._goal_dedup_threshold = nn.Parameter(torch.tensor(0.0))
 
+        # state.py — confidence propagation influence fraction
+        # sigmoid(−2.197) ≈ 0.1 (original hardcoded default)
+        self._confidence_propagation_influence = nn.Parameter(torch.tensor(-2.197225))
+
+        # state.py — adaptive LR scale upper bound (high confidence → fast updates)
+        # softplus(1.3132559) ≈ 1.6265 → we want 2.0; softplus(1.6946) ≈ 2.0
+        self._lr_scale_high = nn.Parameter(torch.tensor(1.694596))
+
+        # state.py — adaptive LR scale lower bound (high surprise → cautious updates)
+        # softplus(−0.3132617) ≈ 0.5 (original hardcoded default)
+        self._lr_scale_low = nn.Parameter(torch.tensor(-0.313262))
+
+        # free_energy.py — weight on epistemic term in Expected Free Energy
+        # softplus(1.0) ≈ 1.313 → starts with mild epistemic bias
+        self._efe_epistemic_weight = nn.Parameter(torch.tensor(1.0))
+
+        # free_energy.py — weight on risk term in Expected Free Energy
+        # softplus(1.0) ≈ 1.313 → symmetric with epistemic at start
+        self._efe_risk_weight = nn.Parameter(torch.tensor(1.0))
+
     # ---------------------------------------------------------------------- #
     # Properties — apply activation to yield constrained values               #
     # ---------------------------------------------------------------------- #
@@ -173,3 +193,28 @@ class MetaParams(nn.Module):
     def goal_dedup_threshold(self) -> torch.Tensor:
         """Distance threshold below which two goals are considered duplicates. Range: (0, 1)."""
         return torch.sigmoid(self._goal_dedup_threshold)
+
+    @property
+    def confidence_propagation_influence(self) -> torch.Tensor:
+        """Fraction of confidence delta propagated to derived beliefs. Range: (0, 1)."""
+        return torch.sigmoid(self._confidence_propagation_influence)
+
+    @property
+    def lr_scale_high(self) -> torch.Tensor:
+        """Upper bound of per-belief LR scale (low surprise). Range: (0, inf)."""
+        return F.softplus(self._lr_scale_high)
+
+    @property
+    def lr_scale_low(self) -> torch.Tensor:
+        """Lower bound of per-belief LR scale (high surprise). Range: (0, inf)."""
+        return F.softplus(self._lr_scale_low)
+
+    @property
+    def efe_epistemic_weight(self) -> torch.Tensor:
+        """Weight on the epistemic value term in EFE. Range: (0, inf)."""
+        return F.softplus(self._efe_epistemic_weight)
+
+    @property
+    def efe_risk_weight(self) -> torch.Tensor:
+        """Weight on the risk term in EFE. Range: (0, inf)."""
+        return F.softplus(self._efe_risk_weight)

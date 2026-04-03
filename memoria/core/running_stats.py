@@ -62,6 +62,9 @@ class RunningStats(nn.Module):
         # Fraction of belief slots that are occupied (active / max_beliefs)
         self.register_buffer("belief_fill_ratio", torch.tensor(0.0))
 
+        # Mean access count across active beliefs (for promotion thresholds)
+        self.register_buffer("mean_access_count", torch.tensor(10.0))
+
         # Track whether we have received at least one real update
         self.register_buffer("_initialised", torch.tensor(False))
 
@@ -122,8 +125,16 @@ class RunningStats(nn.Module):
 
         # --- belief fill ratio ---
         max_beliefs = cognitive_state.config.max_beliefs
-        active_count = cognitive_state.get_active_mask().sum().item()
+        active_mask = cognitive_state.get_active_mask()
+        active_count = active_mask.sum().item()
         _ema(self.belief_fill_ratio, active_count / max(max_beliefs, 1))
+
+        # --- mean access count ---
+        if active_mask.any():
+            _ema(
+                self.mean_access_count,
+                cognitive_state.belief_access_count[active_mask].mean().item(),
+            )
 
         self._initialised.fill_(True)
 
@@ -234,6 +245,28 @@ class RunningStats(nn.Module):
         # 0.1 at fill=0 → 0.3 at fill=1
         threshold = 0.1 + 0.2 * fill
         return float(threshold)
+
+    def promotion_thresholds(self, level: int) -> tuple[float, float]:
+        """Return (min_radius, min_access) for promoting from `level` to `level+1`.
+
+        Thresholds are derived from running statistics, not hardcoded:
+          - min_radius: relative multipliers [0.3, 0.6, 1.0] × mean_precision
+          - min_access: relative multipliers [0.3, 1.0, 3.0] × mean_access_count
+
+        The multipliers express *relative difficulty* of each tier — they are
+        pure ratios, not absolute numbers.
+        """
+        # Relative multipliers per level transition: 0→1, 1→2, 2→3
+        radius_multipliers = (0.3, 0.6, 1.0)
+        access_multipliers = (0.3, 1.0, 3.0)
+        if level < 0 or level >= len(radius_multipliers):
+            return (float("inf"), float("inf"))
+        mean_r = self.mean_precision.item()
+        mean_a = self.mean_access_count.item()
+        return (
+            radius_multipliers[level] * mean_r,
+            access_multipliers[level] * mean_a,
+        )
 
     @property
     def eviction_recency_weight(self) -> float:

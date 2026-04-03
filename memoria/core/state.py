@@ -128,6 +128,25 @@ class CognitiveState(nn.Module):
             'belief_access_count', torch.zeros(config.max_beliefs)
         )
 
+        # ── Belief Abstraction Levels ──
+        # Level 0: raw observations (from write path)
+        # Level 1: reinforced beliefs (survived multiple updates)
+        # Level 2: abstract beliefs (created by consolidation merges)
+        # Level 3: core beliefs (high confidence, high access count, persist across sessions)
+        self.register_buffer('belief_level', torch.zeros(config.max_beliefs, dtype=torch.int8))
+
+        # ── Source Chain Tracking (MemOS-inspired provenance) ──
+        # Each belief can have up to 4 source belief indices (-1 = no source)
+        self.register_buffer('belief_sources', torch.full((config.max_beliefs, 4), -1, dtype=torch.long))
+        # source_type: 0=observation, 1=merge, 2=promotion, 3=ttt_update
+        self.register_buffer('belief_source_type', torch.zeros(config.max_beliefs, dtype=torch.int8))
+        self.register_buffer('belief_created_step', torch.zeros(config.max_beliefs))
+
+        # ── Per-Belief Adaptive Learning Rate (RWKV-7 inspired) ──
+        # LR scale = EMA of inverse surprise. High surprise → lower LR (caution).
+        # Low surprise → higher LR (confident, can update faster).
+        self.register_buffer('belief_lr_scale', torch.ones(config.max_beliefs))
+
         # ── Causal Learning ──
         # Previous step's per-belief surprise (for temporal precedence detection)
         self.register_buffer(
@@ -174,6 +193,18 @@ class CognitiveState(nn.Module):
         # ── SEAL-style cognitive controller ──
         self.controller = CognitiveController(belief_dim=config.belief_dim)
 
+        # ── SleepGate (learned sleep cycle, arXiv:2603.14517) ──
+        from ..cognition.sleep import SleepGate
+        self.sleep_gate = SleepGate(belief_dim=config.belief_dim)
+
+        # ── Factor graph message passing (for dream phase + belief shift) ──
+        # Lazy import to avoid circular: state ↔ message_passing
+        from .message_passing import FactorGraphMessagePassing
+        self.message_passing = FactorGraphMessagePassing(
+            belief_dim=config.belief_dim,
+            relation_dim=config.relation_dim,
+        )
+
     # ── Belief Region Accessors ──
 
     def get_belief_radii(self) -> Tensor:
@@ -204,11 +235,15 @@ class CognitiveState(nn.Module):
         """Count of active beliefs."""
         return self.get_active_mask().sum().item()
 
-    def allocate_belief(self, belief_vector: Tensor) -> int:
+    def allocate_belief(self, belief_vector: Tensor, source_type: int = 0,
+                        source_ids: list[int] | None = None, step: int = 0) -> int:
         """Allocate a new belief in the first empty slot.
 
         Args:
             belief_vector: [D] tensor (cartesian form, radius encodes precision)
+            source_type: provenance type (0=observation, 1=merge, 2=promotion, 3=ttt_update)
+            source_ids: optional list of up to 4 source belief indices
+            step: current training/inference step for creation metadata
 
         Returns:
             slot index, or -1 if full
@@ -220,6 +255,14 @@ class CognitiveState(nn.Module):
         slot = empty[0].item()
         with torch.no_grad():
             self.beliefs.data[slot] = belief_vector
+            # Set provenance
+            self.belief_level[slot] = 0  # raw observation
+            self.belief_source_type[slot] = source_type
+            self.belief_created_step[slot] = float(step)
+            self.belief_sources[slot] = -1  # reset all sources
+            if source_ids:
+                for i, sid in enumerate(source_ids[:4]):
+                    self.belief_sources[slot, i] = sid
         return slot
 
     def touch_beliefs(self, indices: Tensor, step: int):
@@ -243,6 +286,92 @@ class CognitiveState(nn.Module):
             self.beliefs.data[index].zero_()
             self.belief_last_accessed[index] = 0.0
             self.belief_access_count[index] = 0.0
+            self.belief_level[index] = 0
+            self.belief_sources[index] = -1
+            self.belief_source_type[index] = 0
+            self.belief_created_step[index] = 0.0
+            self.belief_lr_scale[index] = 1.0
+
+    def promote_belief(self, index: int):
+        """Promote a belief to the next abstraction level based on evidence.
+
+        Criteria are derived from running statistics via running_stats.promotion_thresholds(),
+        not hardcoded. Relative multipliers [0.3, 0.6, 1.0] × mean_precision for radius and
+        [0.3, 1.0, 3.0] × mean_access_count for access express relative difficulty per tier.
+        """
+        current = self.belief_level[index].item()
+        if current >= 3:
+            return  # already at max level
+        radius = self.beliefs.data[index].norm().item()
+        access = self.belief_access_count[index].item()
+
+        min_r, min_a = self.running_stats.promotion_thresholds(current)
+        if radius >= min_r and access >= min_a:
+            self.belief_level[index] = current + 1
+
+    def propagate_confidence(self, changed_indices: Tensor, old_radii: Tensor, influence: float | None = None):
+        """Propagate confidence changes through source chains (MemOS-inspired).
+
+        When source beliefs change confidence, derived beliefs update proportionally.
+        Influence is a learned parameter (meta_params.confidence_propagation_influence),
+        not a hardcoded constant.
+
+        Args:
+            changed_indices: [N] long tensor of belief indices whose confidence changed
+            old_radii: [N] float tensor of their radii before the change
+            influence: override for learned influence (None = use meta_params)
+        """
+        if influence is None:
+            influence = self.meta_params.confidence_propagation_influence.item()
+        if len(changed_indices) == 0:
+            return
+        with torch.no_grad():
+            new_radii = self.beliefs.data[changed_indices].norm(dim=-1)
+            delta_radii = new_radii - old_radii  # positive = gained confidence
+
+            for i, idx in enumerate(changed_indices.tolist()):
+                if abs(delta_radii[i].item()) < 1e-4:
+                    continue
+                # Find all beliefs that cite idx as a source
+                has_source = (self.belief_sources == idx).any(dim=-1)  # [max_beliefs]
+                has_source = has_source & self.get_active_mask() & ~self.immutable_beliefs
+                if not has_source.any():
+                    continue
+                derived_idx = has_source.nonzero(as_tuple=False).squeeze(-1)
+                for d in derived_idx.tolist():
+                    current = self.beliefs.data[d]
+                    current_r = current.norm().clamp(min=1e-10)
+                    # More sources = less influence per source
+                    n_sources = (self.belief_sources[d] >= 0).sum().item()
+                    scaled_influence = influence / max(n_sources, 1)
+                    new_r = current_r + delta_radii[i] * scaled_influence
+                    new_r = new_r.clamp(min=0.0)
+                    # Scale vector to new radius (preserve direction)
+                    if current_r > 1e-10:
+                        self.beliefs.data[d] = current * (new_r / current_r)
+
+    def update_belief_lr_scale(self, indices: Tensor, surprise_values: Tensor, decay: float = 0.95):
+        """Update per-belief adaptive learning rates based on surprise (RWKV-7 style).
+
+        High surprise → scale down (be cautious with volatile beliefs).
+        Low surprise → scale up (confident updates for stable beliefs).
+
+        Args:
+            indices: [N] long tensor of belief indices to update
+            surprise_values: [N] float tensor of surprise magnitudes for each belief
+            decay: EMA decay factor (default 0.95)
+        """
+        if len(indices) == 0:
+            return
+        with torch.no_grad():
+            # Normalize surprise to [0, 1] range using sigmoid
+            norm_surprise = torch.sigmoid(surprise_values - surprise_values.mean())
+            # Learned scale bounds: low surprise → high LR, high surprise → cautious LR
+            scale_high = self.meta_params.lr_scale_high.item()
+            scale_low = self.meta_params.lr_scale_low.item()
+            new_scale = scale_high * (1.0 - norm_surprise) + scale_low * norm_surprise
+            # EMA update
+            self.belief_lr_scale[indices] = decay * self.belief_lr_scale[indices] + (1 - decay) * new_scale
 
     # ── Relation Region Accessors ──
 
@@ -406,6 +535,11 @@ class CognitiveState(nn.Module):
             'belief_last_accessed': self.belief_last_accessed.clone(),
             'belief_access_count': self.belief_access_count.clone(),
             'belief_prev_surprise': self.belief_prev_surprise.clone(),
+            'belief_level': self.belief_level.clone(),
+            'belief_sources': self.belief_sources.clone(),
+            'belief_source_type': self.belief_source_type.clone(),
+            'belief_created_step': self.belief_created_step.clone(),
+            'belief_lr_scale': self.belief_lr_scale.clone(),
             'goal_status_logits': self.goal_status_logits.clone(),
             'meta_params': self.meta_params.state_dict(),
             'running_stats': {k: v.clone() for k, v in self.running_stats._buffers.items()},
@@ -413,6 +547,8 @@ class CognitiveState(nn.Module):
             'edge_direction': self.edge_direction.data.clone(),
             'edge_proposal': self.edge_proposal.state_dict(),
             'controller': self.controller.state_dict(),
+            'sleep_gate': self.sleep_gate.state_dict(),
+            'message_passing': self.message_passing.state_dict(),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -463,6 +599,16 @@ class CognitiveState(nn.Module):
                 self.belief_access_count.copy_(state['belief_access_count'])
             if 'belief_prev_surprise' in state:
                 self.belief_prev_surprise.copy_(state['belief_prev_surprise'])
+            if 'belief_level' in state:
+                self.belief_level.copy_(state['belief_level'])
+            if 'belief_sources' in state:
+                self.belief_sources.copy_(state['belief_sources'])
+            if 'belief_source_type' in state:
+                self.belief_source_type.copy_(state['belief_source_type'])
+            if 'belief_created_step' in state:
+                self.belief_created_step.copy_(state['belief_created_step'])
+            if 'belief_lr_scale' in state:
+                self.belief_lr_scale.copy_(state['belief_lr_scale'])
             if 'goal_status_logits' in state:
                 self.goal_status_logits.copy_(state['goal_status_logits'])
             if 'meta_params' in state:
@@ -479,14 +625,22 @@ class CognitiveState(nn.Module):
                 self.edge_proposal.load_state_dict(state['edge_proposal'])
             if 'controller' in state:
                 self.controller.load_state_dict(state['controller'])
+            if 'sleep_gate' in state:
+                self.sleep_gate.load_state_dict(state['sleep_gate'])
+            if 'message_passing' in state:
+                self.message_passing.load_state_dict(state['message_passing'])
 
     # ── Summary ──
 
     def summary(self) -> str:
         """Human-readable state summary."""
+        active = self.get_active_mask()
+        levels = self.belief_level[active]
+        level_counts = [(levels == i).sum().item() for i in range(4)]
         return (
             f"CognitiveState: "
-            f"{self.num_active_beliefs()}/{self.config.max_beliefs} beliefs, "
+            f"{self.num_active_beliefs()}/{self.config.max_beliefs} beliefs "
+            f"(L0:{level_counts[0]} L1:{level_counts[1]} L2:{level_counts[2]} L3:{level_counts[3]}), "
             f"{self.num_active_edges()}/{self.config.max_edges} edges, "
             f"{self.num_active_goals()}/{self.config.max_goals} goals, "
             f"β={self.beta:.3f}"

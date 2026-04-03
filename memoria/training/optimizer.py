@@ -275,6 +275,28 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'weight_decay': 0.0,
         })
 
+    # 14. SleepGate (learned sleep cycle consolidation)
+    sleep_params = [p for p in model.state.sleep_gate.parameters() if p.requires_grad]
+    if sleep_params:
+        param_groups.append({
+            'params': sleep_params,
+            'lr': tc.interface_lr * 0.1,  # slow — consolidation should be stable
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # 15. Message passing (learned damping + iteration count for loopy BP)
+    mp_params = [p for p in model.state.message_passing.parameters() if p.requires_grad]
+    if mp_params:
+        param_groups.append({
+            'params': mp_params,
+            'lr': tc.interface_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 
@@ -424,7 +446,7 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
             'weight_decay': 0.0,
         })
 
-    # In-Place TTT module (step-size modulators)
+    # In-Place TTT module (step-size modulators + meta-learned init)
     if hasattr(model, 'ttt'):
         ttt_params = [p for p in model.ttt.parameters() if p.requires_grad]
         if ttt_params:
@@ -435,6 +457,28 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
                 'eps': 1e-8,
                 'weight_decay': 0.0,
             })
+
+    # SleepGate (learned sleep cycle)
+    sleep_params = [p for p in model.state.sleep_gate.parameters() if p.requires_grad]
+    if sleep_params:
+        param_groups.append({
+            'params': sleep_params,
+            'lr': tc.interface_lr * 0.1,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # Message passing (learned damping + iteration count)
+    mp_params = [p for p in model.state.message_passing.parameters() if p.requires_grad]
+    if mp_params:
+        param_groups.append({
+            'params': mp_params,
+            'lr': tc.interface_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
 
     optimizer = torch.optim.AdamW(param_groups)
     for group in optimizer.param_groups:

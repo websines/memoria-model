@@ -20,8 +20,11 @@ What stays frozen at inference time:
 - EdgeProposer, TelosModule (structural policies)
 
 Reference: In-Place TTT (ByteDance/PKU, ICLR 2026)
-Reference: TTT-E2E (NVIDIA/Stanford, Dec 2025) — 25% of MLP layers as mutable
-Reference: Titans (Google, Jan 2025) — surprise-driven memory updates
+Reference: TTT-E2E (NVIDIA/Stanford, arXiv:2512.23675) — meta-learned delta init, 25% of MLP layers as mutable
+Reference: Titans (Google, arXiv:2501.00663) — momentum-based surprise smoothing
+Reference: LaCT (ICLR 2026, arXiv:2505.23884) — large-chunk TTT batching for GPU utilization
+Reference: DeltaProduct (NeurIPS 2025, arXiv:2502.10297) — multi-step inner loop for expressiveness
+Reference: RWKV-7 — per-belief adaptive learning rates
 """
 
 import torch
@@ -43,6 +46,16 @@ class InPlaceTTT(nn.Module):
 
     This is NOT an adapter that's fixed after training. The deltas update
     EVERY TIME the model processes tokens. The model improves with use.
+
+    Improvements over baseline:
+    - Meta-learned initialization (TTT-E2E, arXiv:2512.23675): deltas start from
+      a learned warm point instead of zero.
+    - Momentum-based surprise smoothing (Titans, arXiv:2501.00663): adaptive
+      gating thresholds derived from running variance instead of fixed ratios.
+    - Large-chunk gradient accumulation (LaCT, arXiv:2505.23884): accumulate
+      gradients over multiple chunks before stepping for better GPU utilization.
+    - Multi-step inner loop (DeltaProduct, arXiv:2502.10297): N smaller steps
+      per chunk for more expressive state tracking.
     """
 
     def __init__(
@@ -52,11 +65,29 @@ class InPlaceTTT(nn.Module):
         ttt_layers: list[int] | None = None,
         rank: int = 32,
         ttt_lr: float = 0.001,
+        ttt_accum_steps: int = 1,
+        ttt_inner_steps: int = 1,
     ):
+        """
+        Args:
+            hidden_dim: model hidden dimension
+            n_layers: total number of transformer layers
+            ttt_layers: which layer indices get TTT deltas (default: top 25%)
+            rank: low-rank dimension for delta matrices
+            ttt_lr: base learning rate (overridden per-layer by log_step_size)
+            ttt_accum_steps: accumulate gradients over this many chunks before
+                stepping. 1 = no accumulation (original behaviour).
+                (LaCT, arXiv:2505.23884)
+            ttt_inner_steps: gradient steps per chunk. 1 = single step (original).
+                Step size is divided by ttt_inner_steps so total update magnitude
+                is comparable. (DeltaProduct, arXiv:2502.10297)
+        """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.rank = rank
         self.ttt_lr = ttt_lr
+        self.ttt_accum_steps: int = ttt_accum_steps
+        self.ttt_inner_steps: int = ttt_inner_steps
 
         # Default: top 25% of layers (most abstract representations)
         if ttt_layers is None:
@@ -65,21 +96,31 @@ class InPlaceTTT(nn.Module):
         self.ttt_layers = set(ttt_layers)
         self._ttt_layer_list = sorted(ttt_layers)
 
-        # Per-layer persistent low-rank deltas
-        # These are NOT nn.Parameters (not updated by the main optimizer)
-        # They are updated by the TTT inner loop gradient step
+        # ── Per-layer persistent low-rank deltas ──
+        # These are NOT nn.Parameters in the sense that the main optimizer
+        # trains them. They ARE registered as parameters so they're saved/
+        # loaded with the model. The TTT inner loop updates them via .data.
         self.delta_A = nn.ParameterDict()
         self.delta_B = nn.ParameterDict()
         for layer_idx in ttt_layers:
             key = str(layer_idx)
-            # Register as parameters so they're saved/loaded with the model,
-            # but we'll exclude them from the main optimizer
             self.delta_A[key] = nn.Parameter(
                 torch.zeros(hidden_dim, rank), requires_grad=False,
             )
             self.delta_B[key] = nn.Parameter(
                 torch.zeros(rank, hidden_dim), requires_grad=False,
             )
+
+        # ── Meta-learned initialization (TTT-E2E, arXiv:2512.23675) ──
+        # Instead of always cold-starting deltas at zero, learn an initialization
+        # point that is optimal as a warm start. These ARE trained by the main
+        # optimizer (requires_grad=True), unlike the deltas themselves.
+        self.init_A = nn.ParameterDict()
+        self.init_B = nn.ParameterDict()
+        for layer_idx in ttt_layers:
+            key = str(layer_idx)
+            self.init_A[key] = nn.Parameter(torch.zeros(hidden_dim, rank))
+            self.init_B[key] = nn.Parameter(torch.zeros(rank, hidden_dim))
 
         # Learnable step-size per layer (trained during training, fixed at inference)
         # Controls how much each layer adapts per chunk
@@ -89,25 +130,78 @@ class InPlaceTTT(nn.Module):
             # Init: log(0.001) ≈ -6.9 → step_size ≈ 0.001
             self.log_step_size[key] = nn.Parameter(torch.tensor(-6.9))
 
-        # RND surprise EMA for quality gating (not a parameter, just tracking state)
-        self._surprise_ema: float = 0.0
+        # ── Surprise tracking (Titans-inspired, arXiv:2501.00663) ──
+        # Short-term EMA tracks recent surprise.
+        # Long-term momentum tracks the overall surprise level.
+        # Variance enables adaptive thresholds instead of fixed 0.1/3.0 ratios.
+        self._surprise_ema: float = 0.0         # short-term EMA (fast)
+        self._surprise_momentum: float = 0.0    # long-term momentum (slow)
+        self._surprise_variance: float = 1.0    # variance of surprise deviation
+        self._momentum_decay: float = 0.999     # slower decay → long-term view
+        self._variance_decay: float = 0.99
+
         self._last_ttt_accepted: bool = True
 
-    def is_ttt_layer(self, layer_idx: int) -> bool:
-        return layer_idx in self.ttt_layers
+        # ── Large-chunk gradient accumulation buffers (LaCT) ──
+        self._grad_accum_A: dict[str, Tensor] = {}
+        self._grad_accum_B: dict[str, Tensor] = {}
+        self._accum_count: int = 0
+
+    # ── Meta-learned init ──────────────────────────────────────────────────────
+
+    def reset_deltas(self):
+        """Reset deltas to the meta-learned initialization (not zero).
+
+        Call at the start of a new session or document so the model begins
+        from its learned warm-start point rather than cold zero.
+
+        Reference: TTT-E2E (NVIDIA/Stanford, arXiv:2512.23675).
+        """
+        with torch.no_grad():
+            for key in self.delta_A:
+                self.delta_A[key].data.copy_(self.init_A[key].data)
+                self.delta_B[key].data.copy_(self.init_B[key].data)
+
+    # ── Surprise gating ───────────────────────────────────────────────────────
+
+    def update_surprise_ema(self, surprise: float):
+        """Track running mean with momentum-based smoothing (Titans-inspired).
+
+        Short-term EMA tracks recent surprise.
+        Long-term momentum tracks overall surprise level.
+        Variance enables adaptive thresholds instead of fixed 0.1/3.0.
+
+        Reference: Titans (Google, arXiv:2501.00663).
+
+        Args:
+            surprise: RND surprise value for the current input
+        """
+        # Short-term EMA (fast, α = 0.01)
+        self._surprise_ema = 0.99 * self._surprise_ema + 0.01 * surprise
+        # Long-term momentum (slow, 1 - α = 0.001)
+        self._surprise_momentum = (
+            self._momentum_decay * self._surprise_momentum
+            + (1.0 - self._momentum_decay) * surprise
+        )
+        # Variance tracking: deviation from short-term EMA
+        deviation = surprise - self._surprise_ema
+        self._surprise_variance = (
+            self._variance_decay * self._surprise_variance
+            + (1.0 - self._variance_decay) * deviation * deviation
+        )
 
     def should_update(self, surprise: float) -> bool:
-        """Gate TTT updates using RND surprise from the Telos module.
+        """Gate TTT updates using momentum-smoothed surprise (Titans-inspired).
 
-        If surprise is extremely high (> 3× the running mean), the input
-        is too far out of distribution — updating on it would corrupt the
-        deltas. Skip the TTT step entirely.
+        Instead of fixed 0.1/3.0 ratios, use adaptive thresholds based on
+        the running variance of surprise. Updates proceed when surprise is
+        within 2 standard deviations of the short-term mean.
 
-        If surprise is extremely low (< 0.1× the running mean), the input
-        is fully predicted — updating on it wastes compute. Skip.
+        Too surprising (OOD) → skip to protect deltas from corruption.
+        Too boring (fully predicted) → skip to save compute.
+        Sweet spot: moderate surprise means the input is learnable.
 
-        The sweet spot: moderate surprise means the input is learnable
-        (within distribution but not fully predicted).
+        Reference: Titans (Google, arXiv:2501.00663).
 
         Args:
             surprise: mean RND surprise for the current input's beliefs
@@ -119,13 +213,17 @@ class InPlaceTTT(nn.Module):
         if mean < 1e-8:
             return True  # no history yet, allow all updates
 
-        ratio = surprise / mean
-        # Skip if: too surprising (OOD, ratio > 3) or too boring (ratio < 0.1)
-        return 0.1 < ratio < 3.0
+        std = max(self._surprise_variance ** 0.5, 1e-8)
+        # Adaptive thresholds: mean ± 2*std, floored at 5% of mean
+        lower = max(mean - 2.0 * std, mean * 0.05)
+        upper = mean + 2.0 * std
 
-    def update_surprise_ema(self, surprise: float):
-        """Track running mean of RND surprise for gating."""
-        self._surprise_ema = 0.99 * self._surprise_ema + 0.01 * surprise
+        return lower < surprise < upper
+
+    # ── Delta application ─────────────────────────────────────────────────────
+
+    def is_ttt_layer(self, layer_idx: int) -> bool:
+        return layer_idx in self.ttt_layers
 
     def apply_delta(self, layer_idx: int, hidden: Tensor) -> Tensor:
         """Apply the current persistent delta to hidden states.
@@ -146,10 +244,11 @@ class InPlaceTTT(nn.Module):
         A = self.delta_A[key]  # [hidden_dim, rank]
         B = self.delta_B[key]  # [rank, hidden_dim]
 
-        # delta @ hidden^T → [B, T, hidden_dim]
         # Efficient: hidden @ B^T @ A^T = hidden @ (A @ B)^T
         delta_out = F.linear(F.linear(hidden, B), A)
         return hidden + delta_out
+
+    # ── TTT gradient step ─────────────────────────────────────────────────────
 
     @torch.no_grad()
     def ttt_step(
@@ -160,7 +259,7 @@ class InPlaceTTT(nn.Module):
         lm_head_weight: Tensor,
         vocab_size: int,
     ):
-        """Take one TTT gradient step: update the persistent delta.
+        """Take a TTT gradient step: update the persistent delta.
 
         This is the self-improvement step. It runs at BOTH training and inference.
         Uses next-token prediction loss on the current chunk as the objective.
@@ -169,6 +268,14 @@ class InPlaceTTT(nn.Module):
 
         The gradient is computed analytically for the low-rank delta,
         avoiding full backward() through the transformer.
+
+        Enhancements over baseline:
+        - Large-chunk accumulation (LaCT, arXiv:2505.23884): accumulate
+          gradients over ttt_accum_steps chunks before applying. Set
+          ttt_accum_steps=1 to restore original single-step behaviour.
+        - Multi-step inner loop (DeltaProduct, arXiv:2502.10297): take
+          ttt_inner_steps gradient steps of size step_size/ttt_inner_steps.
+          Set ttt_inner_steps=1 to restore original single-step behaviour.
 
         Args:
             layer_idx: which layer's delta to update
@@ -220,33 +327,81 @@ class InPlaceTTT(nn.Module):
             reduction='mean',
         ).item()
 
-        # ── Compute gradient ──
+        # ── Shared setup for gradient computation ──
         probs = F.softmax(logits, dim=-1)
         one_hot = torch.zeros_like(probs)
         one_hot.scatter_(2, t_sample.clamp(min=0).unsqueeze(-1), 1.0)
-        # Zero out gradient for invalid positions
         mask = valid.unsqueeze(-1).float()
-        grad_logits = (probs - one_hot) * mask / max(valid.sum().item(), 1)
-        grad_h = grad_logits @ lm_head_weight  # [B, max_pos, D]
+        n = max(h_for_grad.reshape(-1, D).shape[0], 1)
 
-        h_flat = h_for_grad.reshape(-1, D)
-        grad_flat = grad_h.reshape(-1, D)
-        n = max(h_flat.shape[0], 1)
+        # ── Multi-step inner loop (DeltaProduct, arXiv:2502.10297) ──
+        # Take ttt_inner_steps smaller gradient steps instead of one large step.
+        # Dividing step_size keeps total update magnitude comparable to single step.
+        # Set ttt_inner_steps=1 to reproduce original single-step behaviour.
+        inner_step_size = step_size / max(self.ttt_inner_steps, 1)
 
-        hB = h_flat @ B.T  # [N, R]
-        grad_A = grad_flat.T @ hB / n
-        grad_B = A.T @ (grad_flat.T @ h_flat) / n
+        if self.ttt_inner_steps <= 1:
+            # Original single-step path — compute gradient once
+            grad_logits = (probs - one_hot) * mask / max(valid.sum().item(), 1)
+            grad_h = grad_logits @ lm_head_weight  # [B, max_pos, D]
 
-        # ── Apply update ──
-        A.data -= step_size * grad_A
-        B.data -= step_size * grad_B
+            h_flat = h_for_grad.reshape(-1, D)
+            grad_flat = grad_h.reshape(-1, D)
+
+            hB = h_flat @ B.T  # [N, R]
+            grad_A = grad_flat.T @ hB / n
+            grad_B = A.T @ (grad_flat.T @ h_flat) / n
+
+            # ── Large-chunk accumulation (LaCT, arXiv:2505.23884) ──
+            # Accumulate gradients over ttt_accum_steps chunks; apply once.
+            # Set ttt_accum_steps=1 to reproduce original immediate-step behaviour.
+            if self.ttt_accum_steps > 1:
+                if key not in self._grad_accum_A:
+                    self._grad_accum_A[key] = torch.zeros_like(grad_A)
+                    self._grad_accum_B[key] = torch.zeros_like(grad_B)
+                self._grad_accum_A[key] += grad_A
+                self._grad_accum_B[key] += grad_B
+                self._accum_count += 1
+
+                n_layers = len(self._ttt_layer_list)
+                if self._accum_count < self.ttt_accum_steps * n_layers:
+                    # Not enough chunks accumulated yet — defer the step
+                    return
+
+                # Average accumulated gradients and apply
+                grad_A = self._grad_accum_A[key] / self.ttt_accum_steps
+                grad_B = self._grad_accum_B[key] / self.ttt_accum_steps
+                self._grad_accum_A[key].zero_()
+                self._grad_accum_B[key].zero_()
+                # Reset counter only after the last layer has been processed
+                if key == str(self._ttt_layer_list[-1]):
+                    self._accum_count = 0
+
+            A.data -= inner_step_size * grad_A
+            B.data -= inner_step_size * grad_B
+
+        else:
+            # Multi-step path: recompute gradient at each updated position
+            for _inner in range(self.ttt_inner_steps):
+                h_delta_curr = h_for_grad + F.linear(F.linear(h_for_grad, B), A)
+                logits_curr = F.linear(h_delta_curr, lm_head_weight)
+                probs_curr = F.softmax(logits_curr, dim=-1)
+                grad_logits_curr = (probs_curr - one_hot) * mask / max(valid.sum().item(), 1)
+                grad_h_curr = grad_logits_curr @ lm_head_weight
+
+                h_flat_curr = h_for_grad.reshape(-1, D)
+                grad_flat_curr = grad_h_curr.reshape(-1, D)
+
+                hB_curr = h_flat_curr @ B.T           # [N, R]
+                grad_A_inner = grad_flat_curr.T @ hB_curr / n
+                grad_B_inner = A.T @ (grad_flat_curr.T @ h_flat_curr) / n
+
+                A.data -= inner_step_size * grad_A_inner
+                B.data -= inner_step_size * grad_B_inner
 
         # ── Rollback check: did the update help? ──
-        h_delta_new = h + F.linear(F.linear(h_for_grad, B), A)
-        if T_size > max_positions:
-            logits_new = F.linear(h_delta_new, lm_head_weight)
-        else:
-            logits_new = F.linear(h_delta_new, lm_head_weight)
+        h_delta_new = h_for_grad + F.linear(F.linear(h_for_grad, B), A)
+        logits_new = F.linear(h_delta_new, lm_head_weight)
         loss_after = F.cross_entropy(
             logits_new.reshape(-1, vocab_size),
             t_sample.reshape(-1),
@@ -262,12 +417,15 @@ class InPlaceTTT(nn.Module):
         else:
             self._last_ttt_accepted = True
 
+    # ── Belief updates ────────────────────────────────────────────────────────
+
     def ttt_step_beliefs(
         self,
         beliefs: Tensor,
         candidates_from_write: list,
         active_mask: Tensor,
         belief_lr: float = 0.0001,
+        belief_lr_scale: Tensor | None = None,
     ):
         """Update belief vectors using prediction error signal.
 
@@ -282,7 +440,11 @@ class InPlaceTTT(nn.Module):
             beliefs: [max_beliefs, D] belief parameter (modified in-place)
             candidates_from_write: write candidates from the current pass
             active_mask: [max_beliefs] boolean mask of active beliefs
-            belief_lr: step size for belief updates
+            belief_lr: base step size for belief updates
+            belief_lr_scale: [max_beliefs] per-belief adaptive LR scale
+                (RWKV-7 inspired). If None, uniform scale of 1.0 is used.
+                Allows different beliefs to adapt at different rates based
+                on their uncertainty or recency.
         """
         if not candidates_from_write or not active_mask.any():
             return
@@ -303,8 +465,14 @@ class InPlaceTTT(nn.Module):
                 # Kalman-like gain: how much to trust the observation vs existing belief
                 gain = obs_radius / (obs_radius + current_radius)
 
+                # Per-belief adaptive LR scale (RWKV-7 inspired)
+                # Allows each belief to adapt at its own rate
+                lr_scale = 1.0
+                if belief_lr_scale is not None:
+                    lr_scale = belief_lr_scale[slot].item()
+
                 # Update: move belief toward observation
-                beliefs.data[slot] = current + belief_lr * gain * (obs - current)
+                beliefs.data[slot] = current + belief_lr * lr_scale * gain * (obs - current)
 
 
 class TTTContext:

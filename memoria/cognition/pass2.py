@@ -11,6 +11,11 @@ Pass 2 handles only discrete structural operations that gradients cannot:
 5. Differentiable goal generation via TelosModule
 6. Beta computation and running statistics update
 7. CognitiveController makes structural decisions (merge/prune/connect rates)
+8. Per-belief adaptive LR updates (RWKV-7)
+9. Confidence propagation through source chains (MemOS)
+10. Belief promotion through abstraction hierarchy (SDFT)
+11. Periodic sleep cycle (SleepGate) + dream phase (NeuroDream)
+12. Belief shift from message passing (confidence cascade)
 
 This runs ONCE per step after optimizer.step() and detach_state().
 The cognitive state is modified in-place via .data access (no gradients).
@@ -20,12 +25,14 @@ import torch
 import torch.nn as nn
 from ..core.state import CognitiveState
 from ..core.polar import EPSILON
+from ..core.message_passing import FactorGraphMessagePassing, apply_belief_shift
 from ..interface.write_path import WriteCandidate
 from .surprise import compute_surprise_batch
 from .belief_update import allocate_new_beliefs
 from .hebbian import extract_co_activations
 from .consolidation import soft_consolidation, periodic_hard_cleanup
 from .meta_learning import compute_beta
+from .sleep import SleepGate, run_sleep_cycle, run_dream_phase
 
 
 class Pass2Probe(nn.Module):
@@ -187,13 +194,29 @@ def run_pass2(
         stats['belief_updated'] = 0
         stats['belief_skipped'] = len(candidates)
 
-    # Collect indices for edge creation
+    # Collect indices for edge creation + per-belief adaptive LR
     updated_indices = []
     surprise_values = []
     for sr in surprise_results:
         if sr.slot >= 0:
             updated_indices.append(sr.slot)
             surprise_values.append(sr.surprise)
+
+    # ── 2b. Per-belief adaptive LR update (RWKV-7) ──
+    if updated_indices:
+        idx_t = torch.tensor(updated_indices, device=state.beliefs.device)
+        surp_t = torch.tensor(surprise_values, device=state.beliefs.device)
+        state.update_belief_lr_scale(idx_t, surp_t)
+        stats['beliefs_lr_updated'] = len(updated_indices)
+
+    # ── 2c. Confidence propagation through source chains (MemOS) ──
+    if updated_indices and hasattr(state, 'belief_sources'):
+        with torch.no_grad():
+            idx_t = torch.tensor(updated_indices, device=state.beliefs.device, dtype=torch.long)
+            # Snapshot radii before pass2 belief changes for propagation
+            old_radii = state.beliefs.data[idx_t].norm(dim=-1)
+            state.propagate_confidence(idx_t, old_radii)
+        stats['confidence_propagated'] = len(updated_indices)
 
     # ── 3. Learned edge proposal ──
     if need_edges:
@@ -297,8 +320,59 @@ def run_pass2(
 
     state.telos.anneal_temperature(current_step, total_steps)
 
+    # ── 7. Belief promotion (SDFT-inspired abstraction hierarchy) ──
+    # Check all updated beliefs for promotion eligibility. Cheap: just compares
+    # radius + access count against stats-derived thresholds.
+    if hasattr(state, 'belief_level'):
+        n_promoted = 0
+        for idx in updated_indices:
+            old_level = state.belief_level[idx].item()
+            state.promote_belief(idx)
+            if state.belief_level[idx].item() > old_level:
+                n_promoted += 1
+        stats['beliefs_promoted'] = n_promoted
+
+    # ── 8. Periodic sleep cycle (SleepGate, arXiv:2603.14517) ──
+    # Run when the consolidation timer fires AND the state has a sleep gate.
+    # The sleep cycle scores each belief for strengthen/maintain/forget.
+    sleep_interval = state.running_stats.hard_consolidation_interval
+    if (hasattr(state, 'sleep_gate') and state.sleep_gate is not None
+            and consolidation_timer >= sleep_interval):
+        sleep_stats = run_sleep_cycle(state, state.sleep_gate, current_step)
+        stats['sleep_strengthened'] = sleep_stats['strengthened']
+        stats['sleep_forgotten'] = sleep_stats['forgotten']
+        stats['sleep_deallocated'] = sleep_stats['deallocated']
+
+    # ── 9. Periodic dream phase (NeuroDream, SSRN 5377250) ──
+    # Run at sequence boundaries when there are enough beliefs and edges to
+    # make internal propagation meaningful. The dream phase converges the
+    # belief graph toward internal consistency without external input.
+    if (is_sequence_boundary and hasattr(state, 'message_passing')
+            and state.message_passing is not None
+            and state.num_active_beliefs() > 10
+            and state.num_active_edges() > 5):
+        dream_stats = run_dream_phase(state, state.message_passing)
+        stats['dream_iterations'] = dream_stats['iterations']
+        stats['dream_converged'] = dream_stats['converged']
+
+        # ── 9b. Belief shift from message passing (confidence cascade) ──
+        # After dream propagation, shift beliefs toward their messages.
+        if dream_stats['iterations'] > 0:
+            mp_result = state.message_passing(state)
+            shifted = apply_belief_shift(state, mp_result['messages'], mp_result['precisions'])
+            stats['beliefs_shifted'] = len(shifted)
+
     stats['active_beliefs'] = state.num_active_beliefs()
     stats['active_edges'] = state.num_active_edges()
+
+    # Level distribution for logging
+    if hasattr(state, 'belief_level'):
+        active = state.get_active_mask()
+        if active.any():
+            levels = state.belief_level[active]
+            stats['level_distribution'] = {
+                f'L{i}': (levels == i).sum().item() for i in range(4)
+            }
 
     return stats
 

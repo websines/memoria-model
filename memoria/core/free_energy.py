@@ -1,20 +1,27 @@
-"""Bethe Free Energy computation over the cognitive state.
+"""Bethe Free Energy and Expected Free Energy (EFE) over the cognitive state.
 
-Two computations:
+Three computations:
 1. compute_bethe_free_energy(): Proper Bethe free energy on the belief factor graph.
    F_B = Σ_factors U_a - Σ_factors H_a + Σ_variables (d_i - 1) × H_i
    Uses Power Spherical entropy (closed-form via digamma, no Bessel functions).
    Fully differentiable — gradients flow into beliefs, edge weights, and relations.
 
-2. compute_free_energy(): Legacy computation for beta/stats (kept for backward compat).
+2. compute_expected_free_energy(): Full Active Inference EFE decomposition.
+   EFE = -pragmatic + w_e * epistemic + w_r * risk
+   Weights w_e, w_r are learned nn.Parameters (via MetaParams).
+
+3. compute_free_energy(): Legacy computation for beta/stats (kept for backward compat).
 
 Reference: Yedidia, Freeman, Weiss "Constructing Free Energy Approximations" (2005)
 Reference: De Cao & Aziz "Power Spherical Distribution" (2020) — entropy formula
+Reference: Friston et al., "Active Inference and Epistemic Value"
+Reference: "The Missing Reward" (arXiv:2508.05619)
 Reference: RxInfer.jl (Bethe free energy on factor graphs)
 """
 
 import math
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from .polar import angular_similarity, belief_is_active, EPSILON
@@ -50,6 +57,105 @@ def power_spherical_entropy(kappa: Tensor, d: int) -> Tensor:
         math.log(2) + torch.digamma(alpha) - torch.digamma(alpha + torch.tensor(beta_val, device=kappa.device))
     )
     return entropy
+
+
+def compute_expected_free_energy(
+    state: CognitiveState,
+    retrieved_beliefs: Tensor | None = None,
+    observation: Tensor | None = None,
+) -> dict:
+    """Full Expected Free Energy decomposition (Active Inference).
+
+    EFE = -pragmatic + w_epistemic * epistemic + w_risk * risk
+
+    Where:
+    - pragmatic_value: alignment of current beliefs with active goals
+      (how much does this state serve our objectives?)
+    - epistemic_value: expected information gain from the current belief state
+      measured by Power Spherical entropy (high entropy = more to learn)
+    - risk: cosine disagreement between retrieved beliefs and current observations
+      (how far is the model's prediction from what we actually see?)
+
+    The combination weights w_epistemic and w_risk are learned nn.Parameters
+    (softplus-constrained, stored in state.meta_params) — never hardcoded.
+
+    Reference: Friston et al., "Active Inference and Epistemic Value"
+    Reference: "The Missing Reward" (arXiv:2508.05619)
+
+    Args:
+        state: cognitive state with beliefs, goals, and meta_params
+        retrieved_beliefs: [B, T, D] beliefs retrieved during read path (optional)
+        observation: [B, T, D] current observation from write path (optional)
+
+    Returns:
+        dict with scalar tensors: efe, pragmatic, epistemic, risk
+    """
+    device = state.beliefs.device
+    D = state.config.belief_dim
+
+    active_mask = state.get_active_mask()
+    if not active_mask.any():
+        zero = torch.tensor(0.0, device=device)
+        return {'efe': zero, 'pragmatic': zero, 'epistemic': zero, 'risk': zero}
+
+    active_beliefs = state.beliefs[active_mask]          # [N_active, D]
+    active_radii = active_beliefs.norm(dim=-1)            # [N_active]
+
+    # ── Pragmatic value: goal alignment ──────────────────────────────────────
+    # How well does the current belief state serve active goals?
+    # Computed as the mean over active beliefs of their best-matching goal cosine sim,
+    # weighted by goal priority. Range: [-1, 1]; higher = better goal alignment.
+    indices, goal_embeds, goal_meta = state.get_active_goals()
+    if len(indices) > 0:
+        goal_angles = F.normalize(goal_embeds, dim=-1, eps=EPSILON)   # [G, D]
+        belief_angles = F.normalize(active_beliefs, dim=-1, eps=EPSILON)  # [N, D]
+        # Similarity matrix: [N_active, N_goals]
+        sim = belief_angles @ goal_angles.T
+        # Priority column vector: goal_meta[:, 0] = priority
+        priority = goal_meta[:, 0].clamp(min=EPSILON)                 # [N_goals]
+        # Weight similarities by goal priority; take best-matching goal per belief
+        weighted_sim = sim * priority.unsqueeze(0)                    # [N, G]
+        pragmatic = weighted_sim.max(dim=-1).values.mean()            # scalar
+    else:
+        pragmatic = torch.tensor(0.0, device=device)
+
+    # ── Epistemic value: expected information gain ────────────────────────────
+    # Measured by the Power Spherical entropy of active beliefs.
+    # High entropy (uncertain beliefs, small radius) = high epistemic value.
+    # The gradient through this term incentivises the system to seek states
+    # that reduce uncertainty (the "Bayesian surprise" drive).
+    kappa = active_radii.clamp(min=EPSILON)
+    H_per_belief = power_spherical_entropy(kappa, D)      # [N_active]
+    epistemic = H_per_belief.mean()                       # scalar (mean over active)
+
+    # ── Risk: prediction-observation disagreement ─────────────────────────────
+    # If we have retrieved beliefs (model prediction) and the actual observation,
+    # risk is the mean cosine disagreement — how wrong is the model right now?
+    # Range: [0, 2]; 0 = perfect agreement, 2 = complete opposition.
+    if retrieved_beliefs is not None and observation is not None:
+        ret_flat = retrieved_beliefs.reshape(-1, D)       # [N, D]
+        obs_flat = observation.reshape(-1, D)             # [N, D]
+        cos_sim = F.cosine_similarity(ret_flat, obs_flat, dim=-1)   # [N]
+        risk = (1.0 - cos_sim).mean()                    # scalar
+    else:
+        risk = torch.tensor(0.0, device=device)
+
+    # ── Combine with learned weights from meta_params ─────────────────────────
+    # w_epistemic and w_risk are softplus(raw_param) — strictly positive, no upper bound.
+    # They are trained by the main optimizer alongside all other parameters.
+    # EFE = -pragmatic + w_e * epistemic + w_r * risk
+    # The negative sign on pragmatic: higher goal alignment = lower free energy (good).
+    w_epistemic = state.meta_params.efe_epistemic_weight  # learned, (0, ∞)
+    w_risk = state.meta_params.efe_risk_weight            # learned, (0, ∞)
+
+    efe = -pragmatic + w_epistemic * epistemic + w_risk * risk
+
+    return {
+        'efe': efe,
+        'pragmatic': pragmatic,
+        'epistemic': epistemic,
+        'risk': risk,
+    }
 
 
 def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -> dict:

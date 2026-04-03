@@ -66,6 +66,27 @@ def soft_consolidation(
     upper = torch.triu(torch.ones(n, n, dtype=torch.bool, device=sim_matrix.device), diagonal=1)
     merge_mask = upper & (sim_matrix > similarity_threshold) & eligible
 
+    # Level-aware thresholds: higher-level beliefs need higher similarity to merge.
+    # Penalty per level = remaining gap to 1.0, divided equally across 3 levels.
+    # E.g., threshold=0.95 → gap=0.05 → per_level=0.05/3 ≈ 0.017
+    # This is derived, not hardcoded: tighter threshold at higher levels.
+    # Level 3 (core beliefs) never merge — they are immutable abstractions.
+    if hasattr(state, 'belief_level'):
+        gap_to_max = 1.0 - similarity_threshold
+        per_level_penalty = gap_to_max / 3.0  # 3 non-core levels
+        levels = state.belief_level[active_indices]  # [N]
+        pair_candidates = merge_mask.nonzero(as_tuple=False)  # [P, 2]
+        for pair_idx in range(pair_candidates.shape[0]):
+            i = pair_candidates[pair_idx, 0].item()
+            j = pair_candidates[pair_idx, 1].item()
+            max_level = max(levels[i].item(), levels[j].item())
+            if max_level >= 3:
+                merge_mask[i, j] = False  # core beliefs are immutable abstractions
+                continue
+            level_penalty = max_level * per_level_penalty
+            if sim_matrix[i, j] < similarity_threshold + level_penalty:
+                merge_mask[i, j] = False
+
     if not merge_mask.any():
         return 0
 
@@ -93,6 +114,28 @@ def soft_consolidation(
 
             state.beliefs.data[idx_i] = new_angle * new_radius
             state.beliefs.data[idx_j].zero_()  # free slot
+
+            # SDFT-inspired abstraction metadata: merged belief is promoted one level.
+            if hasattr(state, 'belief_level'):
+                new_level = min(
+                    max(state.belief_level[idx_i].item(), state.belief_level[idx_j].item()) + 1,
+                    3,
+                )
+                state.belief_level[idx_i] = new_level
+            if hasattr(state, 'belief_sources'):
+                state.belief_sources[idx_i] = torch.tensor(
+                    [-1, -1, -1, -1], dtype=torch.long, device=state.beliefs.device
+                )
+                state.belief_sources[idx_i, 0] = idx_i  # self (as continuation)
+                state.belief_sources[idx_i, 1] = idx_j  # merged partner
+            if hasattr(state, 'belief_source_type'):
+                state.belief_source_type[idx_i] = 1  # merge
+
+            # Merged belief inherits the higher access count of its two sources.
+            state.belief_access_count[idx_i] = max(
+                state.belief_access_count[idx_i].item(),
+                state.belief_access_count[idx_j].item(),
+            )
 
             # Redirect edges from j to i (no dedup per-merge; dedup once after all merges)
             _redirect_edges(state, from_idx=idx_j, to_idx=idx_i)
@@ -151,7 +194,43 @@ def periodic_hard_cleanup(
         for idx in remove_indices.tolist():
             state.deallocate_belief(idx)
 
+    # Promote beliefs that have accumulated enough evidence for their next level.
+    if hasattr(state, 'belief_level'):
+        _promote_eligible_beliefs(state)
+
     return removed
+
+
+def _promote_eligible_beliefs(state: CognitiveState) -> None:
+    """Promote beliefs whose radius and access count justify a higher abstraction level.
+
+    Thresholds tighten at each level so that only the most stable, frequently-used
+    beliefs advance to level 3 (which is thereafter protected from merging).
+
+    Level 3 beliefs are never promoted further (they are permanent abstractions).
+    """
+    active = state.get_active_mask()
+    if not active.any():
+        return
+
+    active_idx = active.nonzero(as_tuple=False).squeeze(-1)
+
+    # Thresholds derived from running_stats.promotion_thresholds() — same
+    # method used by state.promote_belief(). No hardcoded constants.
+    with torch.no_grad():
+        for idx in active_idx.tolist():
+            current_level = state.belief_level[idx].item()
+            if current_level >= 3:
+                continue  # already at maximum abstraction level
+
+            radius = state.beliefs.data[idx].norm().item()
+            access = state.belief_access_count[idx].item()
+
+            min_r, min_a = state.running_stats.promotion_thresholds(current_level)
+            if radius >= min_r and access >= min_a:
+                state.belief_level[idx] = current_level + 1
+                if hasattr(state, 'belief_source_type'):
+                    state.belief_source_type[idx] = 2  # promotion
 
 
 def _redirect_edges(state: CognitiveState, from_idx: int, to_idx: int):
