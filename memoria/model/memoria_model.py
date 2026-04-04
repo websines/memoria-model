@@ -337,6 +337,15 @@ class MemoriaModel(nn.Module):
                 torch.full((config.transformer.n_embd,), config.transformer.refinement_gate_init)
             )
 
+        # Kendall/Gal uncertainty weighting (CVPR 2018, arXiv:1705.07115)
+        # Learns optimal per-loss-group weighting automatically.
+        # Three groups: token loss, free energy loss, auxiliary losses
+        self.log_sigma = nn.ParameterDict({
+            'token': nn.Parameter(torch.tensor(0.0)),
+            'fe': nn.Parameter(torch.tensor(0.0)),
+            'aux': nn.Parameter(torch.tensor(0.0)),
+        })
+
     @torch.no_grad()
     def init_weights(self):
         """Initialize all weights."""
@@ -772,14 +781,29 @@ class MemoriaModel(nn.Module):
                 if hasattr(self.state, 'message_passing') else 0
             )
 
-            result['loss'] = (
-                result['loss_token']
-                + alpha * loss_fe
-                + alpha * w_util * loss_utility
-                + alpha * w_surp * result['loss_surprise']
-                + alpha * w_halt * loss_halt
-                + alpha * 0.01 * jac_loss
+            # Kendall/Gal uncertainty weighting (CVPR 2018)
+            def _uw(loss_term: Tensor, log_s: Tensor) -> Tensor:
+                """Uncertainty-weighted loss: L/(2*exp(2s)) + s"""
+                return loss_term / (2.0 * torch.exp(2.0 * log_s)) + log_s
+
+            L_token_w = _uw(result['loss_token'], self.log_sigma['token'])
+
+            L_fe_w = _uw(loss_fe, self.log_sigma['fe'])
+
+            L_aux = (
+                w_util * loss_utility
+                + w_surp * result['loss_surprise']
+                + w_halt * loss_halt
+                + 0.01 * jac_loss
             )
+            L_aux_w = _uw(L_aux, self.log_sigma['aux'])
+
+            # Alpha gating preserved: phase 1 = token only, phase 2-3 = all terms
+            result['loss'] = L_token_w + alpha * L_fe_w + alpha * L_aux_w
+
+            result['log_sigma_token'] = self.log_sigma['token'].item()
+            result['log_sigma_fe'] = self.log_sigma['fe'].item()
+            result['log_sigma_aux'] = self.log_sigma['aux'].item()
         else:
             logits = self.transformer.head(x)
             result['logits'] = logits

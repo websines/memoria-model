@@ -384,6 +384,26 @@ def train(
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
+        # Per-component NaN/Inf detection (zeroes out bad components to prevent cascade)
+        nan_components = []
+        for lname in ['loss_token', 'loss_fe', 'loss_fe_proxy', 'loss_fe_bethe',
+                      'loss_surprise', 'loss_halt', 'loss_jac']:
+            val = result.get(lname)
+            if val is not None and isinstance(val, torch.Tensor):
+                if torch.isnan(val).any() or torch.isinf(val).any():
+                    nan_components.append(lname)
+                    result[lname] = torch.tensor(0.0, device=val.device)
+        if nan_components and is_main:
+            print(f"\n  WARNING: NaN/Inf in {nan_components} at step {step}, zeroed out")
+            if log_to_wandb:
+                import wandb
+                wandb.alert(
+                    title="NaN/Inf in loss components",
+                    text=f"Step {step}: NaN/Inf in {nan_components}",
+                    level=wandb.AlertLevel.ERROR,
+                    wait_duration=300,
+                )
+
         # Fast fail
         if math.isnan(total_loss) or total_loss > 100:
             if is_main:
@@ -493,7 +513,64 @@ def train(
             if 'pass2_skip' in pass2_stats:
                 for op, skipped in pass2_stats['pass2_skip'].items():
                     log_dict[f'pass2_skip/{op}'] = int(skipped)
+            # Cognitive health metrics (TTT deltas, belief store, uncertainty sigmas)
+            if hasattr(base_model, 'ttt'):
+                ttt = base_model.ttt
+                for key in ttt.delta_A:
+                    log_dict[f'ttt/delta_A_{key}_norm'] = ttt.delta_A[key].data.norm().item()
+                    log_dict[f'ttt/delta_B_{key}_norm'] = ttt.delta_B[key].data.norm().item()
+                if hasattr(ttt, '_last_decay_alpha'):
+                    log_dict['ttt/decay_alpha'] = ttt._last_decay_alpha
+                log_dict['ttt/update_accepted'] = float(ttt._last_ttt_accepted)
+
+            if hasattr(base_model, 'state'):
+                _state = base_model.state
+                _radii = _state.beliefs.data.norm(dim=-1)
+                _active = _state.get_active_mask()
+                log_dict['cognitive/fill_ratio'] = _active.float().mean().item()
+                if _active.any():
+                    _ar = _radii[_active]
+                    log_dict['cognitive/mean_radius'] = _ar.mean().item()
+                    log_dict['cognitive/radius_std'] = _ar.std().item() if _active.sum() > 1 else 0.0
+                    log_dict['cognitive/max_radius'] = _ar.max().item()
+                log_dict['cognitive/active_edges'] = _state.num_active_edges()
+                log_dict['cognitive/active_goals'] = _state.num_active_goals()
+
+            if hasattr(base_model, 'log_sigma'):
+                for sname, sparam in base_model.log_sigma.items():
+                    log_dict[f'sigma/{sname}'] = sparam.item()
+
             wandb.log(log_dict)
+
+            # Cognitive health alerts
+            if hasattr(base_model, 'state'):
+                _fill = log_dict.get('cognitive/fill_ratio', 0)
+                if _fill > 0.95:
+                    wandb.alert(
+                        title="Belief store near capacity",
+                        text=f"Step {step}: fill_ratio={_fill:.3f}",
+                        level=wandb.AlertLevel.WARN,
+                        wait_duration=600,
+                    )
+            if hasattr(base_model, 'ttt'):
+                _max_delta = max(
+                    (base_model.ttt.delta_A[k].data.norm().item() for k in base_model.ttt.delta_A),
+                    default=0,
+                )
+                if _max_delta > 10.0:
+                    wandb.alert(
+                        title="TTT delta explosion",
+                        text=f"Step {step}: max_delta_norm={_max_delta:.4f}",
+                        level=wandb.AlertLevel.ERROR,
+                        wait_duration=300,
+                    )
+            if step > 100 and debiased > 0 and total_loss > 3 * debiased:
+                wandb.alert(
+                    title="Loss spike detected",
+                    text=f"Step {step}: loss={total_loss:.4f}, smoothed={debiased:.4f}",
+                    level=wandb.AlertLevel.WARN,
+                    wait_duration=300,
+                )
 
         # Belief advantage evaluation: with-state vs without-state loss delta
         # Measures whether the cognitive state is actually helping predictions.

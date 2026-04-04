@@ -130,6 +130,14 @@ class InPlaceTTT(nn.Module):
             # Init: log(0.001) ≈ -6.9 → step_size ≈ 0.001
             self.log_step_size[key] = nn.Parameter(torch.tensor(-6.9))
 
+        # ── Titans-style learned adaptive decay gate (arXiv:2501.00663) ──
+        # Decides how much of the previous delta to retain each step.
+        # The decay gate is the single largest contributor to Titans performance.
+        # sigmoid(2.0) ≈ 0.88 — default: mostly preserve deltas.
+        self.decay_gate = nn.Linear(hidden_dim, 1)
+        nn.init.constant_(self.decay_gate.bias, 2.0)
+        self._last_decay_alpha: float = 1.0
+
         # ── Surprise tracking (Titans-inspired, arXiv:2501.00663) ──
         # Short-term EMA tracks recent surprise.
         # Long-term momentum tracks the overall surprise level.
@@ -161,6 +169,27 @@ class InPlaceTTT(nn.Module):
             for key in self.delta_A:
                 self.delta_A[key].data.copy_(self.init_A[key].data)
                 self.delta_B[key].data.copy_(self.init_B[key].data)
+                # LaCT-style L2 normalization on reset (arXiv:2505.23884)
+                self.delta_A[key].data = F.normalize(self.delta_A[key].data, dim=0)
+                self.delta_B[key].data = F.normalize(self.delta_B[key].data, dim=0)
+
+    def apply_decay(self, hidden: Tensor):
+        """Apply learned Titans-style decay to all deltas before TTT step.
+
+        The decay gate learns when to forget vs retain delta adaptations.
+        High alpha (near 1) = preserve deltas. Low alpha (near 0) = forget.
+
+        Reference: Titans (Google, arXiv:2501.00663) — learned decay is the
+        single largest contributor to Titans performance.
+        """
+        with torch.no_grad():
+            pooled = hidden.mean(dim=(0, 1))  # [D]
+            alpha = torch.sigmoid(self.decay_gate(pooled))  # scalar in (0, 1)
+            for key in self.delta_A:
+                self.delta_A[key].data.mul_(alpha)
+                self.delta_B[key].data.mul_(alpha)
+            self._last_decay_alpha = alpha.item()
+        return alpha.item()
 
     # ── Surprise gating ───────────────────────────────────────────────────────
 
@@ -288,6 +317,9 @@ class InPlaceTTT(nn.Module):
         if key not in self.delta_A:
             return
 
+        # Apply learned decay before update (Titans-style, arXiv:2501.00663)
+        self.apply_decay(hidden_pre_delta)
+
         A = self.delta_A[key]  # [D, R]
         B = self.delta_B[key]  # [R, D]
         step_size = self.log_step_size[key].exp().item()
@@ -379,6 +411,9 @@ class InPlaceTTT(nn.Module):
 
             A.data -= inner_step_size * grad_A
             B.data -= inner_step_size * grad_B
+            # LaCT-style L2 normalization constrains delta magnitude (arXiv:2505.23884)
+            A.data = F.normalize(A.data, dim=0)
+            B.data = F.normalize(B.data, dim=0)
 
         else:
             # Multi-step path: recompute gradient at each updated position
@@ -398,6 +433,9 @@ class InPlaceTTT(nn.Module):
 
                 A.data -= inner_step_size * grad_A_inner
                 B.data -= inner_step_size * grad_B_inner
+                # LaCT-style L2 normalization (arXiv:2505.23884)
+                A.data = F.normalize(A.data, dim=0)
+                B.data = F.normalize(B.data, dim=0)
 
         # ── Rollback check: did the update help? ──
         h_delta_new = h_for_grad + F.linear(F.linear(h_for_grad, B), A)

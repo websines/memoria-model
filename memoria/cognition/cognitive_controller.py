@@ -117,16 +117,25 @@ class CognitiveController(nn.Module):
         self.register_buffer('reward_var', torch.tensor(1.0))
         self.register_buffer('belief_advantage_ema', torch.tensor(0.0))
 
-        # Entropy bonus coefficient: prevents premature collapse by encouraging
-        # exploration. Critical for sparse reward signals (belief_advantage every ~100 steps).
-        # 0.01–0.05 is standard; we use 0.02 as default.
-        self.entropy_coeff = 0.02
+        # SAC-style adaptive entropy temperature (Haarnoja 2018, arXiv:1812.05905)
+        # Learns optimal entropy coefficient automatically. Replaces fixed 0.02.
+        self.log_alpha_entropy = nn.Parameter(torch.tensor(0.0))
+        self.target_entropy = -float(NUM_ACTIONS)  # -5.0
 
-        # Trajectory buffers for REINFORCE
+        # PPO clipping epsilon (Petrazzini & Antonelo 2021, arXiv:2111.02202)
+        self.ppo_clip_eps = 0.2
+
+        # Trajectory buffers for PPO
         self._saved_log_probs: list[Tensor] = []
+        self._saved_old_log_probs: list[Tensor] = []
         self._saved_entropies: list[Tensor] = []
         self._saved_values: list[Tensor] = []
         self._saved_rewards: list[float] = []
+
+        # Dense reward tracking (state-delta auxiliary signals)
+        self._prev_fill_ratio: float = 0.0
+        self._prev_mean_radius: float = 0.0
+        self._prev_edge_count: float = 0.0
 
     def _get_beta_dist(self, features: Tensor) -> tuple[Beta, Tensor, Tensor]:
         """Compute Beta distribution parameters from state features.
@@ -198,6 +207,7 @@ class CognitiveController(nn.Module):
         value = self.value_head(features)
 
         self._saved_log_probs.append(log_prob)
+        self._saved_old_log_probs.append(log_prob.detach())  # PPO: detached copy
         self._saved_entropies.append(entropy)
         self._saved_values.append(value.squeeze())
 
@@ -244,7 +254,7 @@ class CognitiveController(nn.Module):
         else:
             normalized = rewards
 
-        # REINFORCE with baseline + entropy bonus
+        # PPO clipped surrogate + value loss + adaptive entropy
         n = min(len(self._saved_log_probs), len(normalized))
         policy_loss = torch.tensor(0.0, device=device)
         value_loss = torch.tensor(0.0, device=device)
@@ -252,21 +262,58 @@ class CognitiveController(nn.Module):
 
         for i in range(n):
             advantage = normalized[i] - self._saved_values[i].detach()
-            policy_loss = policy_loss - self._saved_log_probs[i] * advantage
+            # PPO clipped surrogate (Petrazzini & Antonelo 2021)
+            if i < len(self._saved_old_log_probs):
+                ratio = torch.exp(self._saved_log_probs[i] - self._saved_old_log_probs[i])
+                clipped = torch.clamp(ratio, 1.0 - self.ppo_clip_eps, 1.0 + self.ppo_clip_eps)
+                policy_loss = policy_loss - torch.min(ratio * advantage, clipped * advantage)
+            else:
+                policy_loss = policy_loss - self._saved_log_probs[i] * advantage
             value_loss = value_loss + F.mse_loss(
                 self._saved_values[i], normalized[i].detach()
             )
             if i < len(self._saved_entropies):
                 entropy_bonus = entropy_bonus + self._saved_entropies[i]
 
-        # L = policy_grad + 0.5 * value_mse - entropy_coeff * H[π]
-        # Negative sign on entropy: maximizing entropy = minimizing -H
-        total_loss = (policy_loss + 0.5 * value_loss - self.entropy_coeff * entropy_bonus) / max(n, 1)
+        # SAC-style adaptive entropy (Haarnoja 2018)
+        alpha_ent = self.log_alpha_entropy.exp().detach()
+        total_loss = (policy_loss + 0.5 * value_loss - alpha_ent * entropy_bonus) / max(n, 1)
+
+        # Alpha entropy loss: adjust temperature toward target entropy
+        mean_entropy = entropy_bonus.detach() / max(n, 1)
+        alpha_loss = -(self.log_alpha_entropy * (mean_entropy - self.target_entropy))
+        total_loss = total_loss + alpha_loss
 
         # Clear buffers
         self._saved_log_probs.clear()
+        self._saved_old_log_probs.clear()
         self._saved_entropies.clear()
         self._saved_values.clear()
         self._saved_rewards.clear()
 
         return total_loss
+
+    def compute_dense_reward(self, state, belief_advantage: float) -> float:
+        """Combine sparse belief_advantage with dense state-delta signals.
+
+        Uses cognitive state feature deltas as auxiliary rewards to densify
+        the sparse belief_advantage signal.
+
+        Reference: SASR (ICLR 2025, arXiv:2408.03029)
+        """
+        with torch.no_grad():
+            fill_ratio = state.get_active_mask().float().mean().item()
+            radii = state.get_belief_radii()
+            active = state.get_active_mask()
+            mean_radius = radii[active].mean().item() if active.any() else 0.0
+            edge_count = state.num_active_edges() / max(state.config.max_edges, 1)
+
+        d_fill = fill_ratio - self._prev_fill_ratio
+        d_radius = mean_radius - self._prev_mean_radius
+        d_edges = edge_count - self._prev_edge_count
+
+        self._prev_fill_ratio = fill_ratio
+        self._prev_mean_radius = mean_radius
+        self._prev_edge_count = edge_count
+
+        return belief_advantage + 0.1 * d_fill + 0.1 * d_radius + 0.05 * d_edges

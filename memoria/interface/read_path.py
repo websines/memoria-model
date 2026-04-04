@@ -23,6 +23,18 @@ from torch import Tensor
 from ..core.state import CognitiveState
 from ..core.polar import belief_is_active, angular_similarity, EPSILON
 
+try:
+    from entmax import entmax15
+    HAS_ENTMAX = True
+except ImportError:
+    HAS_ENTMAX = False
+
+try:
+    import faiss
+    HAS_FAISS = True
+except ImportError:
+    HAS_FAISS = False
+
 
 class BeliefCache:
     """Pre-computed active belief data, shared across all interface layers per forward pass.
@@ -146,6 +158,24 @@ class ReadPath(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.utility_head.weight)
 
+    @torch.no_grad()
+    def _faiss_prefilter(self, query: Tensor, keys: Tensor, k: int) -> Tensor:
+        """FAISS IndexFlatIP for fast top-k when N_active is large.
+
+        Args:
+            query: [D] mean query vector (unit normalized)
+            keys: [N, D] belief angle vectors (unit normalized)
+            k: number of top results
+        Returns:
+            [k] long tensor of indices into keys
+        """
+        keys_np = keys.float().cpu().numpy()
+        query_np = query.float().cpu().unsqueeze(0).numpy()
+        index = faiss.IndexFlatIP(keys_np.shape[1])
+        index.add(keys_np)
+        _, indices = index.search(query_np, min(k, len(keys_np)))
+        return torch.from_numpy(indices[0]).long().to(keys.device)
+
     def forward(
         self,
         hidden: Tensor,
@@ -201,9 +231,14 @@ class ReadPath(nn.Module):
             mean_query = hidden.mean(dim=(0, 1))
             rough_query = self.query_proj(mean_query).view(self.num_heads, self.belief_dim)
             rough_query = rough_query.mean(dim=0)
-            rough_scores = active_angles @ rough_query
 
-            _, topk_local = rough_scores.topk(self.top_k)
+            if HAS_FAISS and N_active > self.top_k * 4:
+                # FAISS prefilter for large belief sets: O(log N) approximate top-k
+                topk_local = self._faiss_prefilter(rough_query, active_angles, self.top_k)
+            else:
+                rough_scores = active_angles @ rough_query
+                _, topk_local = rough_scores.topk(self.top_k)
+
             active_indices = active_indices[topk_local]
             active_beliefs = active_beliefs[topk_local]
             active_angles = active_angles[topk_local]
@@ -249,8 +284,12 @@ class ReadPath(nn.Module):
             )  # [num_heads, N_active]
             scores = scores + goal_bias.unsqueeze(0).unsqueeze(0)  # broadcast over B, T
 
-        # Softmax attention
-        attn = F.softmax(scores, dim=-1)  # [B, T, H_n, N_active]
+        # Sparse quality gating: entmax15 zeros out low-relevance beliefs
+        # (SSHN, ICML 2024 — deep-spin/SSHN). Falls back to softmax.
+        if HAS_ENTMAX:
+            attn = entmax15(scores, dim=-1)  # [B, T, H_n, N_active]
+        else:
+            attn = F.softmax(scores, dim=-1)  # [B, T, H_n, N_active]
 
         # Track which beliefs were attended to (recency update)
         with torch.no_grad():

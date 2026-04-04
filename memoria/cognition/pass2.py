@@ -115,7 +115,8 @@ def run_pass2(
 
     # ── 0. Controller actions (learned structural decisions) ──
     actions = state.controller.get_actions(state)
-    state.controller.record_reward(belief_advantage)
+    dense_reward = state.controller.compute_dense_reward(state, belief_advantage)
+    state.controller.record_reward(dense_reward)
     stats['controller_actions'] = actions
 
     # ── 0b. Adaptive depth — decide which operations are needed this step ──

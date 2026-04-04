@@ -298,6 +298,18 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'weight_decay': 0.0,
         })
 
+    # 16. Kendall/Gal uncertainty weighting parameters (log_sigma per loss group)
+    if hasattr(model, 'log_sigma'):
+        sigma_params = list(model.log_sigma.parameters())
+        if sigma_params:
+            param_groups.append({
+                'params': sigma_params,
+                'lr': tc.scalar_lr if hasattr(tc, 'scalar_lr') else 0.5,
+                'betas': (0.8, 0.95),
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 
@@ -480,6 +492,18 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
             'eps': 1e-8,
             'weight_decay': 0.0,
         })
+
+    # Kendall/Gal uncertainty weighting parameters (log_sigma per loss group)
+    if hasattr(model, 'log_sigma'):
+        sigma_params = list(model.log_sigma.parameters())
+        if sigma_params:
+            param_groups.append({
+                'params': sigma_params,
+                'lr': tc.scalar_lr if hasattr(tc, 'scalar_lr') else 0.5,
+                'betas': (0.8, 0.95),
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
 
     optimizer = torch.optim.AdamW(param_groups)
     for group in optimizer.param_groups:
