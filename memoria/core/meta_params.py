@@ -235,6 +235,44 @@ class MetaParams(nn.Module):
         # sigmoid(1.386) ≈ 0.8 → 80% cosine similarity required
         self._skill_similarity_threshold = nn.Parameter(torch.tensor(1.386294))
 
+        # ── E1: Two-Factor Sleep Consolidation ──
+        # Homeostatic target: desired total precision budget (sum of radii).
+        # softplus(4.605) ≈ 100.0 → default budget of 100 precision units
+        self._homeostatic_target = nn.Parameter(torch.tensor(4.605170))
+        # Homeostatic rate: how fast to normalize toward target per sleep cycle.
+        # sigmoid(-2.197) ≈ 0.1 → 10% correction per cycle
+        self._homeostatic_rate = nn.Parameter(torch.tensor(-2.197225))
+        # Conflict threshold: angular cosine above which beliefs are in conflict.
+        # sigmoid(1.735) ≈ 0.85 → 85% cosine similarity = near-duplicate conflict
+        self._sleep_conflict_threshold = nn.Parameter(torch.tensor(1.735085))
+
+        # ── E2: Self-Verification Pass ──
+        # Divergence threshold: message vs stored belief disagreement for inconsistency.
+        # sigmoid(-0.847) ≈ 0.3 → flag if cosine similarity < 0.3
+        self._verification_divergence_threshold = nn.Parameter(torch.tensor(-0.847298))
+        # Precision decay on inconsistency: how much to weaken the weakest link.
+        # sigmoid(-1.386) ≈ 0.2 → reduce radius by 20% on inconsistency
+        self._verification_precision_decay = nn.Parameter(torch.tensor(-1.386294))
+        # Supersession similarity: threshold for conflict-aware supersession.
+        # sigmoid(1.735) ≈ 0.85 → beliefs with >85% cosine similarity may supersede
+        self._supersession_similarity = nn.Parameter(torch.tensor(1.735085))
+
+        # ── E3: Empirical Precision Recalibration ──
+        # Recalibration rate: how fast stored radius decays toward empirical precision.
+        # sigmoid(-2.197) ≈ 0.1 → 10% correction per recalibration cycle
+        self._recalibration_rate = nn.Parameter(torch.tensor(-2.197225))
+        # Minimum samples: confirmed+contradicted count before recalibrating.
+        # softplus(1.609) ≈ 5.0 → need at least 5 observations
+        self._recalibration_min_samples = nn.Parameter(torch.tensor(1.609438))
+
+        # ── E4: Interleaved Replay ──
+        # Replay ratio: fraction of replay set that are old high-precision beliefs.
+        # sigmoid(-0.847) ≈ 0.3 → 30% old beliefs, 70% recent high-surprise
+        self._replay_ratio = nn.Parameter(torch.tensor(-0.847298))
+        # Contradiction threshold: message disagreement for cross-temporal contradiction.
+        # sigmoid(0.0) = 0.5 → moderate threshold for flagging contradictions
+        self._replay_contradiction_threshold = nn.Parameter(torch.tensor(0.0))
+
     # ---------------------------------------------------------------------- #
     # Properties — apply activation to yield constrained values               #
     # ---------------------------------------------------------------------- #
@@ -522,3 +560,61 @@ class MetaParams(nn.Module):
     def skill_similarity_threshold(self) -> torch.Tensor:
         """Cosine similarity threshold for skill matching. Range: (0, 1)."""
         return torch.sigmoid(self._skill_similarity_threshold)
+
+    # ── E1: Two-Factor Sleep Consolidation ──
+
+    @property
+    def homeostatic_target(self) -> torch.Tensor:
+        """Target total precision budget (sum of radii). Range: (0, inf)."""
+        return F.softplus(self._homeostatic_target)
+
+    @property
+    def homeostatic_rate(self) -> torch.Tensor:
+        """Correction rate toward homeostatic target per sleep cycle. Range: (0, 1)."""
+        return torch.sigmoid(self._homeostatic_rate)
+
+    @property
+    def sleep_conflict_threshold(self) -> torch.Tensor:
+        """Angular cosine threshold for conflict detection. Range: (0, 1)."""
+        return torch.sigmoid(self._sleep_conflict_threshold)
+
+    # ── E2: Self-Verification Pass ──
+
+    @property
+    def verification_divergence_threshold(self) -> torch.Tensor:
+        """Cosine similarity threshold for inconsistency detection. Range: (0, 1)."""
+        return torch.sigmoid(self._verification_divergence_threshold)
+
+    @property
+    def verification_precision_decay(self) -> torch.Tensor:
+        """Radius reduction fraction on inconsistency. Range: (0, 1)."""
+        return torch.sigmoid(self._verification_precision_decay)
+
+    @property
+    def supersession_similarity(self) -> torch.Tensor:
+        """Cosine threshold for conflict-aware supersession. Range: (0, 1)."""
+        return torch.sigmoid(self._supersession_similarity)
+
+    # ── E3: Empirical Precision Recalibration ──
+
+    @property
+    def recalibration_rate(self) -> torch.Tensor:
+        """Rate of stored precision decay toward empirical. Range: (0, 1)."""
+        return torch.sigmoid(self._recalibration_rate)
+
+    @property
+    def recalibration_min_samples(self) -> torch.Tensor:
+        """Min observations before recalibrating. Range: (0, inf)."""
+        return F.softplus(self._recalibration_min_samples)
+
+    # ── E4: Interleaved Replay ──
+
+    @property
+    def replay_ratio(self) -> torch.Tensor:
+        """Fraction of replay set that are old high-precision beliefs. Range: (0, 1)."""
+        return torch.sigmoid(self._replay_ratio)
+
+    @property
+    def replay_contradiction_threshold(self) -> torch.Tensor:
+        """Message disagreement threshold for cross-temporal contradiction. Range: (0, 1)."""
+        return torch.sigmoid(self._replay_contradiction_threshold)

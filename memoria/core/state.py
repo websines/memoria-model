@@ -170,6 +170,15 @@ class CognitiveState(nn.Module):
             'belief_reinforcement_count', torch.zeros(config.max_beliefs, dtype=torch.long)
         )
 
+        # ── E3: Empirical Precision Recalibration ──
+        # Track prediction accuracy per belief for recalibration.
+        self.register_buffer(
+            'belief_confirmed_count', torch.zeros(config.max_beliefs, dtype=torch.long)
+        )
+        self.register_buffer(
+            'belief_contradicted_count', torch.zeros(config.max_beliefs, dtype=torch.long)
+        )
+
         # ── Causal Learning ──
         # Previous step's per-belief surprise (for temporal precedence detection)
         self.register_buffer(
@@ -248,7 +257,7 @@ class CognitiveState(nn.Module):
         # ── C1: Self-Referential Weight Matrix ──
         from ..cognition.srwm import SRWM
         # n_meta_params matches the total count of MetaParams properties
-        self.srwm = SRWM(state_dim=min(config.belief_dim, 64), n_meta_params=52, rank=32)
+        self.srwm = SRWM(state_dim=min(config.belief_dim, 64), n_meta_params=62, rank=32)
 
         # ── C2: Meta-Learned Update Function ──
         from ..cognition.learned_update import LearnedUpdateFunction
@@ -651,6 +660,8 @@ class CognitiveState(nn.Module):
             'belief_provisional_radius': self.belief_provisional_radius.clone(),
             'belief_precision_var': self.belief_precision_var.clone(),
             'belief_reinforcement_count': self.belief_reinforcement_count.clone(),
+            'belief_confirmed_count': self.belief_confirmed_count.clone(),
+            'belief_contradicted_count': self.belief_contradicted_count.clone(),
             'goal_status_logits': self.goal_status_logits.clone(),
             'meta_params': self.meta_params.state_dict(),
             'running_stats': {k: v.clone() for k, v in self.running_stats._buffers.items()},
@@ -776,6 +787,9 @@ class CognitiveState(nn.Module):
             if 'belief_precision_var' in state:
                 self.belief_precision_var.copy_(state['belief_precision_var'])
                 self.belief_reinforcement_count.copy_(state['belief_reinforcement_count'])
+            if 'belief_confirmed_count' in state:
+                self.belief_confirmed_count.copy_(state['belief_confirmed_count'])
+                self.belief_contradicted_count.copy_(state['belief_contradicted_count'])
             if 'goal_status_logits' in state:
                 self.goal_status_logits.copy_(state['goal_status_logits'])
             if 'meta_params' in state:

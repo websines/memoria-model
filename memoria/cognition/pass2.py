@@ -38,6 +38,10 @@ from .cascade_revision import cascade_revision
 from .autoresearch import run_autoresearch_step
 from .planning import run_planning_step
 from .structural_plasticity import run_structural_plasticity
+from .two_factor_sleep import run_two_factor_sleep
+from .self_verification import run_self_verification
+from .precision_recalibration import run_precision_recalibration
+from .interleaved_replay import run_interleaved_replay
 
 
 class Pass2Probe(nn.Module):
@@ -453,6 +457,38 @@ def run_pass2(
             mp_result = state.message_passing(state)
             shifted = apply_belief_shift(state, mp_result['messages'], mp_result['precisions'])
             stats['beliefs_shifted'] = len(shifted)
+
+    # ── 9c. E1: Two-factor sleep consolidation ──
+    # Runs during sleep cycle: homeostatic precision normalization +
+    # conflict scanning + replay candidate identification.
+    if (consolidation_timer >= sleep_interval
+            and state.num_active_beliefs() > 0):
+        tfs_stats = run_two_factor_sleep(state, current_step)
+        stats['two_factor_sleep'] = tfs_stats
+
+    # ── 9d. E2: Self-verification pass ──
+    # Runs during sleep: causal consistency check, weakest-link precision
+    # reduction, conflict-aware supersession.
+    if (consolidation_timer >= sleep_interval
+            and state.num_active_beliefs() > 2
+            and state.num_active_edges() > 0):
+        sv_stats = run_self_verification(state)
+        stats['self_verification'] = sv_stats
+
+    # ── 9e. E3: Empirical precision recalibration ──
+    # Runs during sleep: decay overconfident beliefs toward empirical precision.
+    if (consolidation_timer >= sleep_interval
+            and state.num_active_beliefs() > 0):
+        recal_stats = run_precision_recalibration(state)
+        stats['precision_recalibration'] = recal_stats
+
+    # ── 9f. E4: Interleaved replay ──
+    # Runs during sleep: cross-temporal contradiction detection between
+    # recent high-surprise and old high-precision beliefs.
+    if (consolidation_timer >= sleep_interval
+            and state.num_active_beliefs() >= 4):
+        replay_stats = run_interleaved_replay(state)
+        stats['interleaved_replay'] = replay_stats
 
     # ── 10. Planning step (B1-B4) ──
     # Run at sequence boundaries when there are active goals and beliefs.
