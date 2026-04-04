@@ -245,6 +245,43 @@ class CognitiveState(nn.Module):
         self.register_buffer('_planning_epist_precisions',
                              torch.zeros(config.max_beliefs))
 
+        # ── C1: Self-Referential Weight Matrix ──
+        from ..cognition.srwm import SRWM
+        # n_meta_params matches the total count of MetaParams properties
+        self.srwm = SRWM(state_dim=min(config.belief_dim, 64), n_meta_params=52, rank=32)
+
+        # ── C2: Meta-Learned Update Function ──
+        from ..cognition.learned_update import LearnedUpdateFunction
+        self.learned_update = LearnedUpdateFunction(belief_dim=config.belief_dim)
+
+        # ── C3: Structural Plasticity ──
+        from ..cognition.structural_plasticity import StructuralPlasticity
+        self.structural_plasticity = StructuralPlasticity(
+            belief_dim=config.belief_dim, max_beliefs=config.max_beliefs,
+        )
+
+        # ── C4: Adaptive Depth ──
+        from ..cognition.adaptive_depth import AdaptiveDepth
+        self.adaptive_depth = AdaptiveDepth(belief_dim=config.belief_dim, max_depth=8)
+
+        # ── D1: Daemon Loop ──
+        from ..agency.daemon import DaemonLoop
+        self.daemon = DaemonLoop(belief_dim=config.belief_dim)
+
+        # ── D2: Action Selection ──
+        from ..agency.action_selection import ActionSelector
+        self.action_selector = ActionSelector(belief_dim=config.belief_dim)
+
+        # ── D3: Curiosity Module ──
+        from ..agency.curiosity import CuriosityModule
+        self.curiosity = CuriosityModule(belief_dim=config.belief_dim)
+
+        # ── D4: Skill Bank ──
+        from ..agency.skills import SkillBank, SkillDetector, SkillComposer
+        self.skill_bank = SkillBank(belief_dim=config.belief_dim, max_skills=128)
+        self.skill_detector = SkillDetector(belief_dim=config.belief_dim)
+        self.skill_composer = SkillComposer(belief_dim=config.belief_dim)
+
     # ── Belief Region Accessors ──
 
     def get_belief_radii(self) -> Tensor:
@@ -639,6 +676,38 @@ class CognitiveState(nn.Module):
             '_planning_pref_messages': self._planning_pref_messages.clone(),
             '_planning_pref_precisions': self._planning_pref_precisions.clone(),
             '_planning_epist_precisions': self._planning_epist_precisions.clone(),
+            # C1: SRWM
+            'srwm': self.srwm.state_dict(),
+            'srwm_W_fast': self.srwm.W_fast.clone(),
+            # C2: Learned Update
+            'learned_update': self.learned_update.state_dict(),
+            # C3: Structural Plasticity
+            'structural_plasticity': self.structural_plasticity.state_dict(),
+            'structural_plasticity_buffers': {
+                'activation_count': self.structural_plasticity.activation_count.clone(),
+                'activation_entropy': self.structural_plasticity.activation_entropy.clone(),
+                'context_signatures': self.structural_plasticity.context_signatures.clone(),
+                '_total_steps': self.structural_plasticity._total_steps.clone(),
+            },
+            # C4: Adaptive Depth
+            'adaptive_depth': self.adaptive_depth.state_dict(),
+            # D1: Daemon
+            'daemon': self.daemon.state_dict(),
+            # D2: Action Selector
+            'action_selector': self.action_selector.state_dict(),
+            # D3: Curiosity
+            'curiosity': self.curiosity.state_dict(),
+            # D4: Skills
+            'skill_bank': self.skill_bank.state_dict(),
+            'skill_bank_buffers': {
+                'skill_active': self.skill_bank.skill_active.clone(),
+                'skill_utility': self.skill_bank.skill_utility.clone(),
+                'skill_use_count': self.skill_bank.skill_use_count.clone(),
+                'skill_created_step': self.skill_bank.skill_created_step.clone(),
+                'skill_last_used': self.skill_bank.skill_last_used.clone(),
+            },
+            'skill_detector': self.skill_detector.state_dict(),
+            'skill_composer': self.skill_composer.state_dict(),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -745,6 +814,49 @@ class CognitiveState(nn.Module):
                 self._planning_pref_messages.copy_(state['_planning_pref_messages'])
                 self._planning_pref_precisions.copy_(state['_planning_pref_precisions'])
                 self._planning_epist_precisions.copy_(state['_planning_epist_precisions'])
+            # C1: SRWM
+            if 'srwm' in state:
+                self.srwm.load_state_dict(state['srwm'])
+            if 'srwm_W_fast' in state:
+                self.srwm.W_fast.copy_(state['srwm_W_fast'])
+            # C2: Learned Update
+            if 'learned_update' in state:
+                self.learned_update.load_state_dict(state['learned_update'])
+            # C3: Structural Plasticity
+            if 'structural_plasticity' in state:
+                self.structural_plasticity.load_state_dict(state['structural_plasticity'])
+            if 'structural_plasticity_buffers' in state:
+                sp = state['structural_plasticity_buffers']
+                self.structural_plasticity.activation_count.copy_(sp['activation_count'])
+                self.structural_plasticity.activation_entropy.copy_(sp['activation_entropy'])
+                self.structural_plasticity.context_signatures.copy_(sp['context_signatures'])
+                self.structural_plasticity._total_steps.copy_(sp['_total_steps'])
+            # C4: Adaptive Depth
+            if 'adaptive_depth' in state:
+                self.adaptive_depth.load_state_dict(state['adaptive_depth'])
+            # D1: Daemon
+            if 'daemon' in state:
+                self.daemon.load_state_dict(state['daemon'])
+            # D2: Action Selector
+            if 'action_selector' in state:
+                self.action_selector.load_state_dict(state['action_selector'])
+            # D3: Curiosity
+            if 'curiosity' in state:
+                self.curiosity.load_state_dict(state['curiosity'])
+            # D4: Skills
+            if 'skill_bank' in state:
+                self.skill_bank.load_state_dict(state['skill_bank'])
+            if 'skill_bank_buffers' in state:
+                sb = state['skill_bank_buffers']
+                self.skill_bank.skill_active.copy_(sb['skill_active'])
+                self.skill_bank.skill_utility.copy_(sb['skill_utility'])
+                self.skill_bank.skill_use_count.copy_(sb['skill_use_count'])
+                self.skill_bank.skill_created_step.copy_(sb['skill_created_step'])
+                self.skill_bank.skill_last_used.copy_(sb['skill_last_used'])
+            if 'skill_detector' in state:
+                self.skill_detector.load_state_dict(state['skill_detector'])
+            if 'skill_composer' in state:
+                self.skill_composer.load_state_dict(state['skill_composer'])
 
     # ── Summary ──
 

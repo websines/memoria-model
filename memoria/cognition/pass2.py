@@ -37,6 +37,7 @@ from .provisional import evaluate_provisional_beliefs
 from .cascade_revision import cascade_revision
 from .autoresearch import run_autoresearch_step
 from .planning import run_planning_step
+from .structural_plasticity import run_structural_plasticity
 
 
 class Pass2Probe(nn.Module):
@@ -461,6 +462,28 @@ def run_pass2(
             and state.num_active_beliefs() > 0):
         planning_stats = run_planning_step(state, current_step)
         stats['planning'] = planning_stats
+
+    # ── 11. C1: SRWM update (self-referential fast-weight matrix) ──
+    # Update the fast-weight matrix with current state features.
+    # This adapts meta-parameter modulations based on cognitive state.
+    if hasattr(state, 'srwm') and state.srwm is not None:
+        features = state.srwm.extract_state_features(state)
+        state.srwm.update(
+            features,
+            lr=state.meta_params.srwm_lr,
+            decay=state.meta_params.srwm_decay,
+        )
+        stats['srwm_updated'] = True
+
+    # ── 12. C3: Structural plasticity (split/prune/grow) ──
+    # Run periodically when there's enough activation data.
+    # Splits polysemantic beliefs, prunes dead ones.
+    if (hasattr(state, 'structural_plasticity')
+            and state.structural_plasticity is not None
+            and is_sequence_boundary
+            and state.structural_plasticity._total_steps.item() > 10):
+        sp_stats = run_structural_plasticity(state, state.structural_plasticity)
+        stats['structural_plasticity'] = sp_stats
 
     stats['active_beliefs'] = state.num_active_beliefs()
     stats['active_edges'] = state.num_active_edges()

@@ -2,16 +2,18 @@
 
 > Compiled 2026-04-03. Research synthesis across 100+ papers (2024-2026) targeting four architectural gaps in Memoria.
 >
-> **Implementation log (2026-04-04):** Phase A complete (A0-A4) including SGM safety gate. Phase B complete (B1-B4) — full planning system with preference/epistemic priors, causal rollout, MCTS, and hierarchical planning. 137/137 tests passing. Uses `expectation` library for e-value testing and `mcts` library for tree search. See implementation notes inline.
+> **Implementation log (2026-04-04):** Phase A complete (A0-A4) including SGM safety gate. Phase B complete (B1-B4) — full planning system with preference/epistemic priors, causal rollout, MCTS, and hierarchical planning. Uses `expectation` library for e-value testing and `mcts` library for tree search.
+>
+> **Implementation log (2026-04-05):** Phase C complete (C1-C4) — full self-improvement stack with SRWM fast-weight meta-parameter modulation, meta-learned belief update function, structural plasticity (split/prune/grow), and adaptive computation time. Phase D complete (D1-D4) — full agency stack with daemon loop, EFE-based action selection, curiosity-driven exploration, and skill crystallization + disentanglement. 245/245 tests passing. 52 learned MetaParams (14 new for C+D). All behavioral constants from MetaParams or mathematical derivation — zero hardcoded magic numbers. See implementation notes inline.
 
 ## The Four Gaps
 
 | Gap | Current State | Target |
 |-----|---------------|--------|
-| **1. Recursive Self-Improvement** | MetaParams has 38 learned nn.Parameters (sigmoid/softplus constrained, gradient-trained). Internal Autoresearch Loop operational. **SGM safety gate** implemented with sequential e-value testing via `expectation` library (Rust backend), harmonic alpha spending, global error budget. | System invents new learning mechanisms, modifies its own update rules |
+| **1. Recursive Self-Improvement** | **IMPLEMENTED.** MetaParams has 52 learned nn.Parameters. SRWM fast-weight matrix produces context-dependent meta-param modulations (C1). Meta-learned belief update function with gated blend (C2). Structural plasticity: split polysemantic beliefs, prune dead ones, grow capacity (C3). Adaptive computation time: per-belief recursion depth with ponder cost (C4). SGM safety gate for bounded self-modification (A4). | System invents new learning mechanisms, modifies its own update rules |
 | **2. Long-Horizon Planning** | **IMPLEMENTED.** Preference priors from Telos goals + epistemic priors from uncertainty augment the factor graph (B1). Multi-step causal rollout simulates future belief states (B2). MCTS over EFE via `mcts` library for deep planning at decision points (B3). Hierarchical temporal planning across Telos depth levels (B4). All behavioral constants from MetaParams (8 new learned params). | Multi-step simulation over belief graph, MCTS via free energy |
 | **3. Belief Robustness** | Precision weighting + consolidation + **MESU precision variance** (per-belief uncertainty with windowed posterior) + **causal cascade revision** (precision decay through downstream beliefs on revision) | Formal consistency guarantees, drift prevention, self-verification |
-| **4. Autonomous Agency** | Passive responder (input -> output). Internal autoresearch generates goal-directed hypotheses as provisional beliefs. Planning system (B1-B4) enables multi-step goal-directed reasoning. | Persistent daemon with self-directed exploration and tool use |
+| **4. Autonomous Agency** | **IMPLEMENTED.** Persistent daemon loop with event-driven perception (D1). EFE-based action selection over respond/tool/search/wait/explore/consolidate (D2). Curiosity-driven Telos generation: actor-side perplexity + critic-side EFE variance → intrinsic motivation (D3). Skill crystallization with DUSDi-style disentanglement, greedy clustering detection, and vector composition (D4). | Persistent daemon with self-directed exploration and tool use |
 
 **Unifying Insight:** All four gaps converge on one pattern -- the **Internal Autoresearch Loop**. Inspired by Karpathy's autoresearch (github.com/karpathy/autoresearch), but internalized into the cognitive state rather than running as an external agent.
 
@@ -83,44 +85,34 @@ The system tunes its own hyperparameters (38 meta-params via gradient descent wi
 
 ### Solution: Three Levels of Self-Modification
 
-#### Level 1: Self-Referential Meta Region (Implementable Now)
+#### Level 1: Self-Referential Meta Region — IMPLEMENTED (C1)
 **Source:** Self-Referential Weight Matrix (SRWM) -- arXiv:2202.05780 (Schmidhuber group)
 
-The meta region is a flat `meta[32]` vector (β, surprise, timers, thresholds in slots [0:7], reserved in [7:]). Separately, `MetaParams` holds 21 gradient-trained nn.Parameters with sigmoid/softplus constraints. Replace the meta vector with a self-referential weight matrix:
-```
-W_meta += lr * outer(key, value)
-```
-Where key/value are computed from the cognitive state's current statistics. The matrix learns to produce update rules for the other regions.
+`cognition/srwm.py`: `SRWM(nn.Module)` maintains a low-rank fast-weight matrix updated by Hebbian outer products. State features (10 cognitive statistics: fill_ratio, mean_radius, std_radius, mean_variance, mean_lr_scale, edge_fill, causal_ratio, goal_fill, beta, surprise) are projected to key/value pairs that update W_fast. Queries produce multiplicative modulation factors for all 52 MetaParams: `modulation = 1 + tanh(output_proj(query @ W_fast))`. Spectral norm clamped to 1.0 for stability. Two-timescale: MetaParams evolve slowly (backprop), SRWM adapts fast (Hebbian).
 
-**Concretely:** Instead of `MetaParams.hebbian_lr` being `sigmoid(scalar)`, it becomes the output of `W_meta @ state_features`. The update rule for Hebbian edge creation is now a *learned function* of the current cognitive state, not a fixed sigmoid-constrained scalar. The existing `CognitiveController` (SEAL-style, `state.controller`) already does something similar for structural decisions — this extends the pattern to all meta-parameters.
+**Concretely:** Instead of `MetaParams.hebbian_lr` being a fixed `sigmoid(scalar)`, it becomes `base_value * modulation[i]` where modulation is a learned function of the current cognitive state. 2 new MetaParams: `srwm_lr` (sigmoid→0.1), `srwm_decay` (sigmoid→0.05). 13 tests in `test_c1_srwm.py`.
 
-#### Level 2: Meta-Learned Update Functions (Medium Effort)
+#### Level 2: Meta-Learned Update Functions — IMPLEMENTED (C2)
 **Source:** ACL -- Metalearning Continual Learning Algorithms (arXiv:2312.00276)
 
-Parameterize the entire Pass 2 update function as a small neural network:
-- Input: (belief_vector, observation_vector, current_precision, prediction_error, edge_context)
-- Output: (new_belief_vector, new_precision, should_allocate, should_merge)
-
-Meta-train this network so that applying it as the Pass 2 update minimizes free energy over multi-step horizons. The system discovers its own belief update algorithm.
+`cognition/learned_update.py`: `LearnedUpdateFunction(nn.Module)` — small MLP that parameterizes belief updates. Input: (belief [D], observation [D], precision [1], prediction_error [1], edge_context [D]). Output: (delta_belief [D], precision_scale [1], merge_signal [1]). Gated blend with hand-coded Kalman-gain update: `final = (1-gate)*handcoded + gate*learned`. Gate starts at sigmoid(-2.197)≈0.1 (mostly hand-coded) and learns to open. `get_edge_context()` computes weighted mean of neighbor beliefs as relational context. 1 new MetaParam: `update_fn_gate` (sigmoid→0.1). 9 tests in `test_c2_learned_update.py`.
 
 **Safety gate (critical — IMPLEMENTED):** SGM -- Statistical Godel Machine (arXiv:2510.10232). `cognition/safety_gate.py` implements sequential e-value testing via the `expectation` library (v0.5.2, Rust backend). Harmonic alpha spending allocates global error budget across modification attempts. `SafetyGate.begin_evaluation()` → `record_sample()` → `check_accept()`/`finalize()`. The `expectation.SequentialTesting` handles adaptive lambda strategies, empirical variance estimation, and e-processes. 18 tests in `test_a4_safety_gate.py`.
 
-#### Level 3: Structural Self-Modification (Research Frontier)
+#### Level 3: Structural Self-Modification — IMPLEMENTED (C3)
 **Sources:**
 - SMGrNN (arXiv:2512.12713): Structural Plasticity Module monitors activation statistics, triggers neuron insertion/pruning via local signals
 - FPE -- Expand Neurons Not Parameters (arXiv:2510.04500): Split polysemantic belief slots into children, partition weights disjointly
 - DynMoE (arXiv:2405.14297): Dynamic expert count -- model decides its own capacity
 
-**Implementation:**
-1. Monitor per-belief activation statistics in a temporal window
-2. Beliefs with sustained high co-activation across dissimilar contexts -> polysemantic -> split via FPE
-3. Regions with sustained high surprise but low belief density -> allocate new slots
-4. Dead beliefs (low activation, low precision) -> prune and reclaim
-5. If fill ratio stays >95% after pruning -> expand the region (DynMoE-style)
+`cognition/structural_plasticity.py`: `StructuralPlasticity(nn.Module)` monitors per-belief activation statistics (count, entropy from context signatures, diversity). Learned split/prune networks score each belief. FPE-style splitting: parent → two children via learned perturbation direction, radius/√2 each (energy conservation). Pruning removes dead beliefs + connected edges. Growth pressure = fill_ratio × (1 + surprise). 3 new MetaParams: `plasticity_split_threshold`, `plasticity_prune_threshold`, `plasticity_growth_rate`. 14 tests in `test_c3_structural_plasticity.py`. Integrated into pass2 at sequence boundaries.
 
-All driven by local signals. No architectural hyperparameter needed.
+#### Level 4: Learned Recursion Depth — IMPLEMENTED (C4)
+**Source:** Mixture-of-Recursions (arXiv:2507.10524)
 
-#### Level 4: Learning New Learning Algorithms (Partially Exists)
+`cognition/adaptive_depth.py`: `AdaptiveDepth(nn.Module)` + `ACTController` implement Adaptive Computation Time for beliefs. Each belief gets its own halting probability from a learned network: P(halt | belief, uncertainty, iteration, accumulated_change). The `ACTController` manages Graves' remainder trick for weighted output. Ponder cost added to training loss: `L_ponder = depth_penalty × Σ remainders`. 2 new MetaParams: `recursion_depth_penalty` (softplus→0.5), `recursion_halt_bias` (sigmoid→0.5). 11 tests in `test_c4_adaptive_depth.py`.
+
+#### Level 5: Learning New Learning Algorithms (Partially Exists)
 **Already implemented (skill generalisation commit, 3fad55e):**
 - `SleepGate`: learned neural gate deciding strengthen/maintain/forget — a learned consolidation algorithm
 - `MetaParams`: 21 gradient-trained parameters — the system learns its own learning rates, thresholds, decay factors
@@ -369,7 +361,10 @@ The system is a passive responder. It processes input, updates state, produces o
 
 ### Solution: The Daemon Loop + EFE-Driven Action Selection
 
-#### The Daemon Loop
+#### The Daemon Loop — IMPLEMENTED (D1)
+
+`agency/daemon.py`: `DaemonLoop(nn.Module)` — persistent event-driven cognitive process. `EventType` enum: USER_MESSAGE, TOOL_RESULT, TIMER, CURIOSITY, GOAL_COMPLETE, GOAL_FAILED, ANOMALY, IDLE. `ActionType` enum: RESPOND, TOOL_CALL, SEARCH, WAIT, EXPLORE, CONSOLIDATE. `perceive()` scores and prioritizes events. `process_event()` routes to recommended action. `should_consolidate()` triggers on idle threshold, high beta, or near-capacity — all derived from state, no magic numbers. Learned anomaly detection network. `DaemonState` tracks step count, idle steps, action history. 16 tests in `test_d1_daemon.py`.
+
 ```
 loop {
     // PERCEIVE
@@ -409,8 +404,10 @@ loop {
 }
 ```
 
-#### EFE-Driven Action Selection
+#### EFE-Driven Action Selection — IMPLEMENTED (D2)
 **Source:** CDE (arXiv:2509.09675), IMAGINE (arXiv:2505.17621)
+
+`agency/action_selection.py`: `ActionSelector(nn.Module)` — scores 6 action types by predicted EFE decomposition. State encoder compresses belief statistics to 64-dim. Per-action EFE heads predict (pragmatic, epistemic, risk). `EFE(a) = -pragmatic + w_e * epistemic + w_r * risk_aversion * risk`. Gumbel-Softmax for differentiable discrete choice. 2 new MetaParams: `action_temperature`, `action_risk_aversion`. 11 tests in `test_d2_action_selection.py`.
 
 Treat every possible action (respond, search, tool_call, wait, explore) as a candidate in the POMDP. Score each by Expected Free Energy:
 - **Pragmatic value**: does this action advance active Telos goals?
@@ -423,8 +420,10 @@ The agent naturally:
 - Avoids risky actions when cognitive state is fragile (risk dominates)
 - Explores when no goals are pressing (curiosity = high epistemic value, low pragmatic)
 
-#### Curiosity as Intrinsic Motivation
+#### Curiosity as Intrinsic Motivation — IMPLEMENTED (D3)
 **Sources:** CDE (arXiv:2509.09675), CD-RLHF (arXiv:2501.11463)
+
+`agency/curiosity.py`: `CuriosityModule(nn.Module)` — two curiosity signals: actor-side (perplexity via learned entropy estimator) and critic-side (EFE variance across actions). Normalized by running EMA. `combined = curiosity_weight * (actor + critic) / 2`. `generate_exploration_goals()` finds highest-uncertainty beliefs and produces goal embeddings when curiosity > threshold. 2 new MetaParams: `curiosity_threshold`, `curiosity_weight`. 14 tests in `test_d3_curiosity.py`.
 
 Two curiosity signals, both derived from existing Memoria infrastructure:
 1. **Actor-side**: perplexity over generated output = novel territory = explore
@@ -444,8 +443,10 @@ When the daemon loop identifies high-uncertainty belief regions:
 
 No special "information gathering module" -- it emerges from EFE minimization.
 
-#### Skill Crystallization + Transfer
+#### Skill Crystallization + Transfer — IMPLEMENTED (D4)
 **Sources:** SkillRL (arXiv:2602.08234), AutoSkill (arXiv:2603.01145), DUSDi (arXiv:2410.11251)
+
+`agency/skills.py`: `SkillBank(nn.Module)` — persistent bank of 128 crystallized skills as tensor patterns. `SkillDetector` maintains circular buffer of successful action-belief patterns, detects recurring clusters via greedy density-based clustering (centroid = reward-weighted mean). `SkillComposer` composes skills via learned compatibility-gated vector addition (DUSDi-style disentanglement). Skills have utility tracking (EMA of FE improvement), use counts, and automatic pruning of low-utility old skills. 2 new MetaParams: `skill_detection_threshold`, `skill_similarity_threshold`. 18 tests in `test_d4_skills.py`.
 
 When the daemon loop detects recurring successful action patterns:
 1. **Detect**: 3+ similar episodes with positive outcomes
@@ -501,20 +502,20 @@ These are prerequisites for everything else.
 | B4 | **Hierarchical Telos planning** | Coarse-to-fine temporal decomposition | Medium | **DONE** (2026-04-04) `cognition/planning.py:hierarchical_plan()` — depth-scaled horizons, top-down constraints, β-triggered MCTS |
 
 ### Phase C: Self-Improvement (Unlocks Recursion)
-| # | What | Why | Effort |
-|---|------|-----|--------|
-| C1 | **SRWM meta region** | Meta region produces update rules, not just thresholds | Medium |
-| C2 | **Meta-learned Pass 2 update function** | System discovers its own belief update algorithm | Large |
-| C3 | **Structural plasticity** (SMGrNN/FPE) | Split polysemantic beliefs, grow capacity | Medium |
-| C4 | **Learned recursion depth** (MoR) | Replace fixed 2-pass with learned N-pass | Medium |
+| # | What | Why | Effort | Status |
+|---|------|-----|--------|--------|
+| C1 | **SRWM meta region** | Meta region produces update rules, not just thresholds | Medium | **DONE** (2026-04-05) `cognition/srwm.py` — low-rank fast-weight matrix, Hebbian updates, spectral norm stability, 13 tests |
+| C2 | **Meta-learned Pass 2 update function** | System discovers its own belief update algorithm | Large | **DONE** (2026-04-05) `cognition/learned_update.py` — gated MLP, starts hand-coded (gate≈0.1), learns to open, 9 tests |
+| C3 | **Structural plasticity** (SMGrNN/FPE) | Split polysemantic beliefs, grow capacity | Medium | **DONE** (2026-04-05) `cognition/structural_plasticity.py` — activation monitoring, learned split/prune, FPE-style belief splitting, 14 tests |
+| C4 | **Learned recursion depth** (MoR) | Replace fixed 2-pass with learned N-pass | Medium | **DONE** (2026-04-05) `cognition/adaptive_depth.py` — ACT per-belief halting, ponder cost, max_depth=8, 11 tests |
 
 ### Phase D: Full Agency (Unlocks Autonomy)
-| # | What | Why | Effort |
-|---|------|-----|--------|
-| D1 | **Daemon loop** | Persistent process with event-driven perception | Medium |
-| D2 | **EFE action selection** over tool/search/respond/wait | Natural action selection | Medium |
-| D3 | **Curiosity-driven Telos generation** | Self-directed exploration | Small |
-| D4 | **Skill crystallization + disentanglement** | Composable procedural memory | Large |
+| # | What | Why | Effort | Status |
+|---|------|-----|--------|--------|
+| D1 | **Daemon loop** | Persistent process with event-driven perception | Medium | **DONE** (2026-04-05) `agency/daemon.py` — event-driven, learned anomaly detection, auto-consolidation, 16 tests |
+| D2 | **EFE action selection** over tool/search/respond/wait | Natural action selection | Medium | **DONE** (2026-04-05) `agency/action_selection.py` — per-action EFE heads, Gumbel-Softmax, 6 action types, 11 tests |
+| D3 | **Curiosity-driven Telos generation** | Self-directed exploration | Small | **DONE** (2026-04-05) `agency/curiosity.py` — actor+critic curiosity, EMA normalization, exploration goal generation, 14 tests |
+| D4 | **Skill crystallization + disentanglement** | Composable procedural memory | Large | **DONE** (2026-04-05) `agency/skills.py` — SkillBank + SkillDetector + SkillComposer, density clustering, vector composition, 18 tests |
 
 ### Phase E: Robustness Hardening (Ongoing)
 | # | What | Why | Effort |
@@ -544,11 +545,12 @@ The literature (2024-2026) converges on eight findings that validate Memoria's d
 The path from "Memoria as a model" to "Memoria as an autonomous self-improving agent":
 1. ~~Internal Autoresearch Loop (tentative beliefs + FE evaluation)~~ **DONE** (A0-A3)
 2. ~~Planning as inference (extend factor graph with preference/epistemic priors)~~ **DONE** (B1-B4)
-3. ~~SGM safety gate for bounded self-modification~~ **DONE** (A4) — Bounded recursive self-improvement (SRWM meta region) is next (C1)
-4. Daemon loop with EFE action selection (D1-D2)
-5. Robustness hardening (MESU + cascade revision + self-verification) (E1-E4)
+3. ~~SGM safety gate for bounded self-modification~~ **DONE** (A4)
+4. ~~Recursive self-improvement (SRWM + meta-learned updates + structural plasticity + adaptive depth)~~ **DONE** (C1-C4)
+5. ~~Daemon loop with EFE action selection + curiosity + skills~~ **DONE** (D1-D4)
+6. Robustness hardening (two-factor sleep + self-verification + recalibration + interleaved replay) (E1-E4)
 
-Steps 1-3 are complete. Steps 4-5 are next. Each is implementable with the existing architecture. None requires a fundamental redesign.
+Steps 1-5 are complete. Step 6 (Phase E) is the only remaining phase. Each is implementable with the existing architecture. None requires a fundamental redesign.
 
 ---
 

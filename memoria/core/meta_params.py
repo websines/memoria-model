@@ -179,6 +179,62 @@ class MetaParams(nn.Module):
         # softplus(0.0) ≈ 0.693
         self._epistemic_prior_strength = nn.Parameter(torch.tensor(0.0))
 
+        # ── C1: SRWM (Self-Referential Weight Matrix) ──
+        # Learning rate for fast-weight Hebbian updates: W += lr * outer(k, v).
+        # sigmoid(-2.197) ≈ 0.1 → conservative initial fast-weight learning
+        self._srwm_lr = nn.Parameter(torch.tensor(-2.197225))
+        # Decay rate for fast weights each step (prevents unbounded growth).
+        # sigmoid(-2.944) ≈ 0.05 → slow decay, fast weights persist ~20 steps
+        self._srwm_decay = nn.Parameter(torch.tensor(-2.944439))
+
+        # ── C2: Meta-Learned Update Function ──
+        # Gate controlling blend between learned update and hand-coded update.
+        # sigmoid(-2.197) ≈ 0.1 → starts mostly hand-coded, learns to trust NN
+        self._update_fn_gate = nn.Parameter(torch.tensor(-2.197225))
+
+        # ── C3: Structural Plasticity ──
+        # Activation entropy threshold for splitting polysemantic beliefs.
+        # sigmoid(0.847) ≈ 0.7 → beliefs with entropy > 70% of max are split candidates
+        self._plasticity_split_threshold = nn.Parameter(torch.tensor(0.847298))
+        # Activation frequency threshold for pruning dead beliefs.
+        # sigmoid(-2.197) ≈ 0.1 → beliefs accessed < 10% of mean are prune candidates
+        self._plasticity_prune_threshold = nn.Parameter(torch.tensor(-2.197225))
+        # Growth rate: fraction of capacity to add when growing.
+        # sigmoid(-2.197) ≈ 0.1 → grow by 10% of current capacity
+        self._plasticity_growth_rate = nn.Parameter(torch.tensor(-2.197225))
+
+        # ── C4: Learned Recursion Depth ──
+        # Ponder cost: penalty per additional recursion step (ACT-style).
+        # softplus(-0.693) ≈ 0.5 → mild penalty, allows ~3-5 extra steps
+        self._recursion_depth_penalty = nn.Parameter(torch.tensor(-0.693147))
+        # Halt bias: initial tendency to halt early.
+        # sigmoid(0.0) = 0.5 → neutral start, learns when to continue
+        self._recursion_halt_bias = nn.Parameter(torch.tensor(0.0))
+
+        # ── D2: EFE Action Selection ──
+        # Temperature for Gumbel-Softmax action selection.
+        # softplus(0.0) ≈ 0.693 → moderate stochasticity
+        self._action_temperature = nn.Parameter(torch.tensor(0.0))
+        # Risk aversion: multiplier on risk term in action EFE.
+        # softplus(0.0) ≈ 0.693 → balanced risk sensitivity
+        self._action_risk_aversion = nn.Parameter(torch.tensor(0.0))
+
+        # ── D3: Curiosity ──
+        # Curiosity threshold: above this, generate exploration goals.
+        # softplus(0.0) ≈ 0.693 → triggers on moderate novelty
+        self._curiosity_threshold = nn.Parameter(torch.tensor(0.0))
+        # Curiosity weight: relative importance of exploration vs pragmatic goals.
+        # softplus(-0.693) ≈ 0.5 → exploration is half as important as exploitation
+        self._curiosity_weight = nn.Parameter(torch.tensor(-0.693147))
+
+        # ── D4: Skill Crystallization ──
+        # Detection threshold: minimum recurrence count for crystallization.
+        # softplus(0.693) ≈ 1.0 → multiply by 3 → need 3 recurrences
+        self._skill_detection_threshold = nn.Parameter(torch.tensor(0.693147))
+        # Similarity threshold for matching actions to existing skills.
+        # sigmoid(1.386) ≈ 0.8 → 80% cosine similarity required
+        self._skill_similarity_threshold = nn.Parameter(torch.tensor(1.386294))
+
     # ---------------------------------------------------------------------- #
     # Properties — apply activation to yield constrained values               #
     # ---------------------------------------------------------------------- #
@@ -382,3 +438,87 @@ class MetaParams(nn.Module):
     def epistemic_prior_strength(self) -> torch.Tensor:
         """How strongly uncertainty drives exploration planning. Range: (0, inf)."""
         return F.softplus(self._epistemic_prior_strength)
+
+    # ── C1: SRWM ──
+
+    @property
+    def srwm_lr(self) -> torch.Tensor:
+        """Fast-weight Hebbian learning rate. Range: (0, 1)."""
+        return torch.sigmoid(self._srwm_lr)
+
+    @property
+    def srwm_decay(self) -> torch.Tensor:
+        """Fast-weight decay rate per step. Range: (0, 1)."""
+        return torch.sigmoid(self._srwm_decay)
+
+    # ── C2: Meta-Learned Update Function ──
+
+    @property
+    def update_fn_gate(self) -> torch.Tensor:
+        """Blend between learned and hand-coded update. Range: (0, 1)."""
+        return torch.sigmoid(self._update_fn_gate)
+
+    # ── C3: Structural Plasticity ──
+
+    @property
+    def plasticity_split_threshold(self) -> torch.Tensor:
+        """Entropy threshold for splitting polysemantic beliefs. Range: (0, 1)."""
+        return torch.sigmoid(self._plasticity_split_threshold)
+
+    @property
+    def plasticity_prune_threshold(self) -> torch.Tensor:
+        """Frequency threshold for pruning dead beliefs. Range: (0, 1)."""
+        return torch.sigmoid(self._plasticity_prune_threshold)
+
+    @property
+    def plasticity_growth_rate(self) -> torch.Tensor:
+        """Capacity growth fraction when expanding. Range: (0, 1)."""
+        return torch.sigmoid(self._plasticity_growth_rate)
+
+    # ── C4: Learned Recursion Depth ──
+
+    @property
+    def recursion_depth_penalty(self) -> torch.Tensor:
+        """Ponder cost per additional recursion step. Range: (0, inf)."""
+        return F.softplus(self._recursion_depth_penalty)
+
+    @property
+    def recursion_halt_bias(self) -> torch.Tensor:
+        """Initial halt tendency (0.5 = neutral). Range: (0, 1)."""
+        return torch.sigmoid(self._recursion_halt_bias)
+
+    # ── D2: EFE Action Selection ──
+
+    @property
+    def action_temperature(self) -> torch.Tensor:
+        """Gumbel-Softmax temperature for action selection. Range: (0, inf)."""
+        return F.softplus(self._action_temperature)
+
+    @property
+    def action_risk_aversion(self) -> torch.Tensor:
+        """Multiplier on risk term in action EFE. Range: (0, inf)."""
+        return F.softplus(self._action_risk_aversion)
+
+    # ── D3: Curiosity ──
+
+    @property
+    def curiosity_threshold(self) -> torch.Tensor:
+        """Novelty level above which exploration goals are generated. Range: (0, inf)."""
+        return F.softplus(self._curiosity_threshold)
+
+    @property
+    def curiosity_weight(self) -> torch.Tensor:
+        """Relative weight of exploration vs exploitation goals. Range: (0, inf)."""
+        return F.softplus(self._curiosity_weight)
+
+    # ── D4: Skill Crystallization ──
+
+    @property
+    def skill_detection_threshold(self) -> torch.Tensor:
+        """Min recurrence count for skill crystallization. Range: (0, inf). Use int(3*x)."""
+        return F.softplus(self._skill_detection_threshold)
+
+    @property
+    def skill_similarity_threshold(self) -> torch.Tensor:
+        """Cosine similarity threshold for skill matching. Range: (0, 1)."""
+        return torch.sigmoid(self._skill_similarity_threshold)
