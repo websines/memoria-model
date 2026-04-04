@@ -374,25 +374,25 @@ On resume, the backbone is re-loaded from HuggingFace. Only interface layers
 ## Implementation Order
 
 ```
-Phase 1: Core Integration (get it running)
-  1. Add lfm2_config() preset to config.py + __main__.py
-  2. Refactor PretrainedMemoriaModel.__init__() for backbone detection
-  3. Fix final norm (.embedding_norm vs .norm)
-  4. Fix layer output handling (tensor vs tuple)
-  5. Set interface_positions to attention layer indices [2,5,8,10,12,14]
-  6. Update tokenizer auto-detection for pretrained mode
+Phase 1: Core Integration (get it running) ✅ DONE
+  1. ✅ Add lfm2_config() preset to config.py + __main__.py
+  2. ✅ Refactor PretrainedMemoriaModel.__init__() for backbone detection
+  3. ✅ Fix final norm (.embedding_norm vs .norm)
+  4. ✅ Fix layer output handling (tensor vs tuple) — already handled by isinstance check
+  5. ✅ Set interface_positions to attention layer indices (derived from hf_config.layer_types)
+  6. ✅ Update tokenizer auto-detection for pretrained mode
   7. Test: model builds, forward pass runs, loss computes
 
 Phase 2: Training Validation (get it learning)
-  8. Update optimizer for LFM2 param groups
-  9. Adjust training phases (short phase 1)
+  8. ✅ Optimizer — no changes needed, _setup_pretrained_optimizer already works
+  9. ✅ Training phases — lfm2_config sets phase1_steps=200, alpha_warmup=300
   10. Run 100 steps, verify loss decreases and beliefs populate
   11. Verify belief advantage measurement works
 
 Phase 3: Optimizations (get it fast)
-  12. torch.compile per-layer
-  13. TTT layer selection (attention layers only)
-  14. Conservative read gate init (-8.0)
+  12. ✅ torch.compile per-layer — already handled by train.py pretrained path
+  13. ✅ TTT layer selection — upper attention layers via ttt_layers param
+  14. ✅ Conservative read gate init (-8.0) — in PretrainedMemoriaModel.__init__
   15. Gradient checkpointing strategy (checkpoint conv layers, not attention)
 
 Phase 4: Enhancements (port from scratch model)

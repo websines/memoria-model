@@ -20,18 +20,25 @@ TOKENIZER_PREFERENCES = [
 ]
 
 
-def get_tokenizer(name: str | None = None, vocab_size: int | None = None):
+def get_tokenizer(name: str | None = None, vocab_size: int | None = None,
+                   pretrained_model: str | None = None):
     """Load a tokenizer.
 
     Args:
-        name: explicit HuggingFace tokenizer name. If None, tries TOKENIZER_PREFERENCES in order.
+        name: explicit HuggingFace tokenizer name. If None, tries auto-detection.
         vocab_size: if set, verify tokenizer vocab fits config (warning, not assert)
+        pretrained_model: pretrained backbone model name. When set, loads the
+            tokenizer from this model (best match for its vocab/encoding).
 
     Returns:
         tokenizer object
     """
     if name is not None:
         return _load_tokenizer(name, vocab_size)
+
+    # In pretrained mode, use the backbone's own tokenizer
+    if pretrained_model:
+        return _load_tokenizer(pretrained_model, vocab_size)
 
     # Try preferred tokenizers in order
     for candidate in TOKENIZER_PREFERENCES:

@@ -36,6 +36,10 @@ class PretrainedMemoriaModel(nn.Module):
     The HF model is loaded in eval mode with all params frozen.
     We hook into its forward pass to insert interface layers between
     transformer blocks, giving the model access to persistent cognitive state.
+
+    Supports multiple backbone architectures:
+    - "standard" (Qwen, Llama, etc.): uniform transformer layers, tuple returns
+    - "lfm2" (LiquidAI LFM2): hybrid conv+attention, plain tensor returns
     """
 
     def __init__(self, config: MemoriaConfig):
@@ -63,21 +67,52 @@ class PretrainedMemoriaModel(nn.Module):
             f"pretrained num_hidden_layers ({n_layers})"
         )
 
+        # Detect backbone architecture before loading weights
+        self._backbone_type = self._detect_backbone_type(hf_config)
+
+        # Load backbone with architecture-appropriate settings
+        load_kwargs = dict(dtype=torch.bfloat16)
+        if self._backbone_type != "lfm2":
+            load_kwargs['attn_implementation'] = 'sdpa'
         self.backbone = AutoModelForCausalLM.from_pretrained(
-            config.pretrained_model,
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
+            config.pretrained_model, **load_kwargs,
         )
         # Freeze everything
         for param in self.backbone.parameters():
             param.requires_grad = False
         self.backbone.eval()
 
+        # Configure backbone-specific details
+        if self._backbone_type == "lfm2":
+            self._final_norm_attr = "embedding_norm"
+            # Interface after attention layers only (conv layers are local-only).
+            # Derived from the model's own layer_types config, not hardcoded.
+            layer_types = hf_config.layer_types
+            attn_indices = [i for i, lt in enumerate(layer_types)
+                           if lt == "full_attention"]
+            self.interface_positions = attn_indices
+            n_interfaces = len(attn_indices)
+            # TTT on the upper attention layers (last 3 of 6 attention layers)
+            self._ttt_layers = attn_indices[len(attn_indices) // 2:]
+            print(f"  LFM2 backbone: {len(layer_types)} layers "
+                  f"({layer_types.count('conv')} conv + {len(attn_indices)} attn)")
+            print(f"  Interface positions (after attn): {self.interface_positions}")
+            print(f"  TTT layers (upper attn): {self._ttt_layers}")
+        else:
+            # Standard transformer (Qwen, Llama, etc.)
+            self._final_norm_attr = "norm"
+            n_interfaces = n_layers // config.transformer.interface_every
+            self.interface_positions = [
+                (i + 1) * config.transformer.interface_every - 1
+                for i in range(n_interfaces)
+            ]
+            # TTT on upper 25% of layers (default)
+            self._ttt_layers = None
+
         # Cognitive state (persistent, not updated by optimizer)
         self.state = CognitiveState(config.state)
 
-        # State interface layers, inserted every K transformer blocks
-        n_interfaces = n_layers // config.transformer.interface_every
+        # State interface layers
         self.interfaces = nn.ModuleList([
             StateInterfaceLayer(
                 hidden_dim=hidden_dim,
@@ -89,16 +124,16 @@ class PretrainedMemoriaModel(nn.Module):
             for i in range(n_interfaces)
         ])
 
-        # Track which transformer block each interface sits after
-        self.interface_positions = [
-            (i + 1) * config.transformer.interface_every - 1
-            for i in range(n_interfaces)
-        ]
-
         # Read path gate: learned scalar controlling belief injection strength.
-        # sigmoid(-5) ≈ 0.007 — near-zero initial gating prevents disrupting
-        # pretrained representations before interfaces learn useful projections.
-        self.read_gate = nn.Parameter(torch.full((n_interfaces,), -5.0))
+        # LFM2 (350M) is more sensitive to perturbation than Qwen (2B),
+        # so we start the gate more conservatively.
+        if self._backbone_type == "lfm2":
+            # sigmoid(-8) ≈ 0.0003 — near-zero for fragile small backbone
+            gate_init = -8.0
+        else:
+            # sigmoid(-5) ≈ 0.007 — small but not as extreme for larger backbones
+            gate_init = -5.0
+        self.read_gate = nn.Parameter(torch.full((n_interfaces,), gate_init))
 
         self._hidden_dim = hidden_dim
         self._n_layers = n_layers
@@ -107,7 +142,16 @@ class PretrainedMemoriaModel(nn.Module):
         self.ttt = InPlaceTTT(
             hidden_dim=hidden_dim,
             n_layers=n_layers,
+            ttt_layers=self._ttt_layers,
         )
+
+    @staticmethod
+    def _detect_backbone_type(hf_config) -> str:
+        """Detect backbone architecture from HuggingFace config."""
+        model_type = getattr(hf_config, 'model_type', '')
+        if model_type == 'lfm2':
+            return 'lfm2'
+        return 'standard'
 
     def train(self, mode: bool = True):
         """Override train() to keep frozen backbone in eval mode always."""
@@ -215,8 +259,9 @@ class PretrainedMemoriaModel(nn.Module):
                 ttt_ctx.save_pre_delta(i, hidden)
                 hidden = self.ttt.apply_delta(layer_idx=i, hidden=hidden)
 
-        # Final norm
-        hidden = backbone_model.norm(hidden)
+        # Final norm (LFM2 uses .embedding_norm, standard uses .norm)
+        final_norm = getattr(backbone_model, self._final_norm_attr)
+        hidden = final_norm(hidden)
 
         result = {
             'candidates': all_candidates,

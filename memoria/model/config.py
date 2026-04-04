@@ -218,6 +218,59 @@ def large_config() -> MemoriaConfig:
     )
 
 
+def lfm2_config() -> MemoriaConfig:
+    """LFM2.5-350M with cognitive state bolted on.
+
+    Backbone is frozen. Only interface layers (~15M params) are trained.
+    LFM2: 16 layers (10 conv + 6 attn), 1024 hidden, 65536 vocab.
+    Interface layers inserted after attention layers [2, 5, 8, 10, 12, 14].
+
+    Why LFM2.5-350M:
+    - 350M params — small enough that cognitive state must earn its keep
+    - 28T tokens training — best language capability per parameter at this scale
+    - Hybrid conv+attention — conv handles local, cognitive state handles global
+    - 1024 hidden dim — matches Memoria medium config
+    - 128K native context
+    """
+    return MemoriaConfig(
+        backbone="pretrained",
+        pretrained_model="LiquidAI/LFM2.5-350M",
+        transformer=TransformerConfig(
+            vocab_size=65536,
+            sequence_len=2048,
+            n_layer=16,
+            n_head=16,
+            n_kv_head=8,
+            n_embd=1024,
+            # Interface placement is overridden to attention-only positions
+            # in PretrainedMemoriaModel when backbone_type == "lfm2".
+            # interface_every is approximate — actual positions: [2,5,8,10,12,14]
+            interface_every=3,
+            interface_num_heads=4,
+            interface_top_k=48,
+            max_position=128000,
+            rope_scaling="none",   # LFM2 handles its own RoPE
+            rope_base=1000000,     # from LFM2 config.json rope_theta
+        ),
+        state=StateConfig(
+            belief_dim=256,
+            max_beliefs=16384,
+            max_edges=65536,
+            max_goals=256,
+            relation_dim=64,
+        ),
+        training=TrainingConfig(
+            total_batch_size=2**13,   # 8192 tokens/step
+            device_batch_size=2,      # 350M fits easily on 24GB GPU
+            interface_lr=0.001,
+            phase1_steps=200,         # very short — backbone already knows language
+            alpha_warmup_steps=300,
+            alpha_max=0.1,
+            fe_temperature=5.0,
+        ),
+    )
+
+
 def qwen_config() -> MemoriaConfig:
     """Qwen3.5-2B-Base with cognitive state bolted on.
 

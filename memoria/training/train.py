@@ -165,8 +165,11 @@ def train(
             print("WARNING: push_to_hub=True but HF_REPO or HF_TOKEN not set. Disabling hub push.")
         push_to_hub = False
 
-    # Tokenizer
-    tokenizer = get_tokenizer(vocab_size=config.transformer.vocab_size)
+    # Tokenizer (in pretrained mode, use the backbone's own tokenizer)
+    tokenizer = get_tokenizer(
+        vocab_size=config.transformer.vocab_size,
+        pretrained_model=config.pretrained_model if config.backbone == "pretrained" else None,
+    )
 
     # Model
     if is_main:
