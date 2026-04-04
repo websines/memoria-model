@@ -30,7 +30,6 @@ from ..model.memoria_model import MemoriaModel
 from ..model.pretrained_model import PretrainedMemoriaModel
 from ..cognition.pass2 import run_pass2
 from ..data.tokenizer import get_tokenizer
-from ..data.interleave import interleaved_stream
 from ..data.curated import curated_stream
 from ..data.streaming import stream_fineweb_edu
 from ..data.synthetic import generate_all_synthetic
@@ -558,6 +557,19 @@ def train(
 
                 # A3: Cascade revision
                 log_dict['cascade/beliefs_decayed'] = pass2_stats.get('cascade_beliefs_decayed', 0)
+
+                # Autoresearch loop
+                log_dict['autoresearch/hypotheses_generated'] = pass2_stats.get('hypotheses_generated', 0)
+                log_dict['autoresearch/hypotheses_gated_out'] = pass2_stats.get('hypotheses_gated_out', 0)
+                if hasattr(_state, 'hypothesis_tracker'):
+                    _ht = _state.hypothesis_tracker
+                    total_hyp = _ht.hypothesis_count.sum().item()
+                    total_prom = _ht.hypothesis_promoted.sum().item()
+                    log_dict['autoresearch/total_hypotheses'] = total_hyp
+                    log_dict['autoresearch/total_promoted'] = total_prom
+                    log_dict['autoresearch/success_rate'] = (
+                        total_prom / max(total_hyp, 1)
+                    )
 
             if hasattr(base_model, 'log_sigma'):
                 for sname, sparam in base_model.log_sigma.items():

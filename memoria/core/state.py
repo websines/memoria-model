@@ -228,6 +228,11 @@ class CognitiveState(nn.Module):
             relation_dim=config.relation_dim,
         )
 
+        # ── Internal Autoresearch Loop ──
+        from ..cognition.autoresearch import HypothesisGenerator, HypothesisTracker
+        self.hypothesis_gen = HypothesisGenerator(belief_dim=config.belief_dim)
+        self.hypothesis_tracker = HypothesisTracker(max_goals=config.max_goals)
+
     # ── Belief Region Accessors ──
 
     def get_belief_radii(self) -> Tensor:
@@ -606,6 +611,13 @@ class CognitiveState(nn.Module):
             'controller': self.controller.state_dict(),
             'sleep_gate': self.sleep_gate.state_dict(),
             'message_passing': self.message_passing.state_dict(),
+            'hypothesis_gen': self.hypothesis_gen.state_dict(),
+            'hypothesis_tracker': {
+                'hypothesis_count': self.hypothesis_tracker.hypothesis_count.clone(),
+                'hypothesis_promoted': self.hypothesis_tracker.hypothesis_promoted.clone(),
+                'hypothesis_evicted': self.hypothesis_tracker.hypothesis_evicted.clone(),
+                'goal_success_ema': self.hypothesis_tracker.goal_success_ema.clone(),
+            },
         }
 
     def load_state_cognitive(self, state: dict):
@@ -694,6 +706,14 @@ class CognitiveState(nn.Module):
                 self.sleep_gate.load_state_dict(state['sleep_gate'])
             if 'message_passing' in state:
                 self.message_passing.load_state_dict(state['message_passing'])
+            if 'hypothesis_gen' in state:
+                self.hypothesis_gen.load_state_dict(state['hypothesis_gen'])
+            if 'hypothesis_tracker' in state:
+                ht = state['hypothesis_tracker']
+                self.hypothesis_tracker.hypothesis_count.copy_(ht['hypothesis_count'])
+                self.hypothesis_tracker.hypothesis_promoted.copy_(ht['hypothesis_promoted'])
+                self.hypothesis_tracker.hypothesis_evicted.copy_(ht['hypothesis_evicted'])
+                self.hypothesis_tracker.goal_success_ema.copy_(ht['goal_success_ema'])
 
     # ── Summary ──
 

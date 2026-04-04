@@ -35,6 +35,7 @@ from .meta_learning import compute_beta
 from .sleep import SleepGate, run_sleep_cycle, run_dream_phase
 from .provisional import evaluate_provisional_beliefs
 from .cascade_revision import cascade_revision
+from .autoresearch import run_autoresearch_step
 
 
 class Pass2Probe(nn.Module):
@@ -83,6 +84,16 @@ class Pass2Probe(nn.Module):
             [4] probabilities: allocation, edges, consolidation, goals
         """
         return self.net(features)
+
+
+def _make_tracker_callback(state: CognitiveState):
+    """Create a callback that feeds provisional outcomes to the hypothesis tracker."""
+    tracker = state.hypothesis_tracker
+
+    def callback(belief_idx: int, promoted: bool):
+        tracker.record_outcome(belief_idx, promoted)
+
+    return callback
 
 
 def run_pass2(
@@ -349,6 +360,29 @@ def run_pass2(
     else:
         stats['goals_generated'] = 0
 
+    # ── 5b. Internal Autoresearch Loop: generate hypothesis beliefs from goals ──
+    # After goals are generated/updated, synthesize candidate beliefs that might
+    # reduce free energy in goal directions. Allocate as provisional (A1).
+    # Only runs when there are active goals and room for hypotheses.
+    if (need_goals and state.num_active_goals() > 0
+            and hasattr(state, 'hypothesis_gen')
+            and state.hypothesis_gen is not None):
+        fill_ratio = state.num_active_beliefs() / max(state.config.max_beliefs, 1)
+        # Don't generate hypotheses if state is near capacity
+        if fill_ratio < 0.85:
+            ar_stats = run_autoresearch_step(
+                state, state.hypothesis_gen, state.hypothesis_tracker,
+                current_step, current_fe,
+            )
+            stats['hypotheses_generated'] = ar_stats['hypotheses_generated']
+            stats['hypotheses_gated_out'] = ar_stats['hypotheses_gated_out']
+        else:
+            stats['hypotheses_generated'] = 0
+            stats['hypotheses_gated_out'] = 0
+    else:
+        stats['hypotheses_generated'] = 0
+        stats['hypotheses_gated_out'] = 0
+
     # ── 6. Beta computation + running stats ──
     beta = compute_beta(state, state.meta_params.fe_temperature.item())
     stats['beta'] = beta
@@ -367,8 +401,11 @@ def run_pass2(
 
     # ── 6b. A1: Evaluate provisional beliefs (internal autoresearch loop) ──
     # Every step, check if any provisional beliefs have passed their evaluation
-    # window. Promote winners, evict losers.
-    prov_stats = evaluate_provisional_beliefs(state, current_step, current_fe)
+    # window. Promote winners, evict losers. Feed outcomes to tracker.
+    prov_stats = evaluate_provisional_beliefs(
+        state, current_step, current_fe,
+        outcome_callback=_make_tracker_callback(state) if hasattr(state, 'hypothesis_tracker') else None,
+    )
     stats['provisional_promoted'] = prov_stats['promoted']
     stats['provisional_evicted'] = prov_stats['evicted']
     stats['provisional_pending'] = prov_stats['still_provisional']

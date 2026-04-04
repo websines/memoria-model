@@ -1,1 +1,1 @@
-"""Data loading: tokenizer, streaming, synthetic tasks, interleaving."""
+"""Data loading: tokenizer, streaming, synthetic tasks, curated multi-tier mix, formatters."""

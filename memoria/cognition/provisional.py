@@ -22,6 +22,7 @@ def evaluate_provisional_beliefs(
     state: CognitiveState,
     current_step: int,
     current_fe: float,
+    outcome_callback: 'callable | None' = None,
 ) -> dict:
     """Evaluate all provisional beliefs that have passed their evaluation window.
 
@@ -34,6 +35,9 @@ def evaluate_provisional_beliefs(
         state: cognitive state (modified in-place)
         current_step: current training step
         current_fe: current global free energy (from last computed Bethe FE)
+        outcome_callback: optional function(belief_idx, promoted: bool) called
+                          for each evaluated belief. Used by HypothesisTracker
+                          to record which goals produce successful hypotheses.
 
     Returns:
         dict with statistics: promoted, evicted, still_provisional counts
@@ -77,8 +81,12 @@ def evaluate_provisional_beliefs(
                 state.belief_provisional_fe[idx] = 0.0
                 state.belief_provisional_radius[idx] = 0.0
                 stats['promoted'] += 1
+                if outcome_callback:
+                    outcome_callback(idx, True)
             else:
                 # Evict: hypothesis failed
+                if outcome_callback:
+                    outcome_callback(idx, False)
                 state.deallocate_belief(idx)
                 stats['evicted'] += 1
 

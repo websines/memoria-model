@@ -310,6 +310,18 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
+    # 17. Hypothesis generator (autoresearch loop)
+    if hasattr(model.state, 'hypothesis_gen'):
+        hyp_params = [p for p in model.state.hypothesis_gen.parameters() if p.requires_grad]
+        if hyp_params:
+            param_groups.append({
+                'params': hyp_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 
@@ -501,6 +513,18 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
                 'params': sigma_params,
                 'lr': tc.scalar_lr if hasattr(tc, 'scalar_lr') else 0.5,
                 'betas': (0.8, 0.95),
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
+    # Hypothesis generator (autoresearch loop)
+    if hasattr(model.state, 'hypothesis_gen'):
+        hyp_params = [p for p in model.state.hypothesis_gen.parameters() if p.requires_grad]
+        if hyp_params:
+            param_groups.append({
+                'params': hyp_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
                 'eps': 1e-8,
                 'weight_decay': 0.0,
             })

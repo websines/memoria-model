@@ -2,33 +2,40 @@
 
 > Compiled from exhaustive HuggingFace research. ~115 datasets evaluated, ~50 selected.
 > **Status:** Fully implemented in `memoria/data/curated.py` + `memoria/data/formatters.py`.
-> 32 streaming sources registered across 5 tiers. All stream from HF, zero local disk.
-> Used automatically for pretrained backbone training (`--config lfm2` or `--config qwen`).
+> 32 streaming sources registered across 8 tiers. All stream from HF, zero local disk.
+> Used automatically for all training modes via `curated_stream()`.
 > Failed sources gracefully redistribute weight at startup.
 
 ## Design Principle
 
 Memoria trains with next-token prediction (L_token). The cognitive state earns its keep
 only when **remembering, revising, or chaining facts is load-bearing for prediction**.
-The current mix (90% generic web text) doesn't reward persistent state.
 
-Target: **40-50% of training data should genuinely require persistent state** to predict well.
+The mix is deliberately **code-heavy** (~45% code + code agents) because:
+- Code has strong sequential dependencies that exercise persistent state
+- Terminal/SWE agent trajectories require multi-step belief tracking
+- Competitive programming exercises long-chain causal reasoning
+
+State-essential data (~25% combined) ensures beliefs are load-bearing for prediction.
+Reasoning, tool calling, and general language round out the mix.
 
 All QA/task datasets are converted to continuous text (`context + question + answer`)
 so L_token naturally rewards having correct beliefs in state when reaching the answer tokens.
 
 ---
 
-## Proposed Training Mix
+## Actual Training Mix (as implemented in `curated.py`)
 
 ```
-Tier 1 — State Essential:           25%
-Tier 2 — State Helps Significantly: 20%
-Tier 3 — General Language:          15%
-Tier 4 — NVIDIA Reasoning:          15%
-Tier 5 — Tool Calling / Agentic:    10%
-Tier 6 — Enhanced Synthetic:         5%
-Reserve / Tuning:                   10%
+Code (raw + competitive + instruction):     30%
+Code Agents (terminal, SWE, agentic):       15%
+State Essential (belief, ToM, revision):     15%
+State Helps (multi-hop, causal, verify):     10%
+Reasoning (math, cross-domain):             10%
+Tool Calling (function calling, agentic):     8%
+General Language (web text baseline):         5%
+Synthetic (belief/causal tasks):              2%
++ FineWeb-Edu & StarCoderData via streaming
 ```
 
 ---

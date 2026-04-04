@@ -1,15 +1,17 @@
 # Closing the Gaps: From Self-Improving AI to Autonomous Intelligence
 
 > Compiled 2026-04-03. Research synthesis across 100+ papers (2024-2026) targeting four architectural gaps in Memoria.
+>
+> **Implementation log (2026-04-04):** Phase A foundations (A1-A3) and the Internal Autoresearch Loop (Section 0) are implemented and tested. 93/93 tests passing. See implementation notes inline.
 
 ## The Four Gaps
 
 | Gap | Current State | Target |
 |-----|---------------|--------|
-| **1. Recursive Self-Improvement** | MetaParams has 21 learned nn.Parameters (sigmoid/softplus constrained, gradient-trained); meta vector slots [7:] reserved | System invents new learning mechanisms, modifies its own update rules |
+| **1. Recursive Self-Improvement** | MetaParams has 31 learned nn.Parameters (sigmoid/softplus constrained, gradient-trained); meta vector slots [7:] reserved. Internal Autoresearch Loop operational (HypothesisGenerator + HypothesisTracker). | System invents new learning mechanisms, modifies its own update rules |
 | **2. Long-Horizon Planning** | Telos tracks goals, EFE scores 1-step | Multi-step simulation over belief graph, MCTS via free energy |
-| **3. Belief Robustness** | Precision weighting + consolidation | Formal consistency guarantees, drift prevention, self-verification |
-| **4. Autonomous Agency** | Passive responder (input -> output) | Persistent daemon with self-directed exploration and tool use |
+| **3. Belief Robustness** | Precision weighting + consolidation + **MESU precision variance** (per-belief uncertainty with windowed posterior) + **causal cascade revision** (precision decay through downstream beliefs on revision) | Formal consistency guarantees, drift prevention, self-verification |
+| **4. Autonomous Agency** | Passive responder (input -> output). Internal autoresearch generates goal-directed hypotheses as provisional beliefs. | Persistent daemon with self-directed exploration and tool use |
 
 **Unifying Insight:** All four gaps converge on one pattern -- the **Internal Autoresearch Loop**. Inspired by Karpathy's autoresearch (github.com/karpathy/autoresearch), but internalized into the cognitive state rather than running as an external agent.
 
@@ -41,12 +43,43 @@ Karpathy's autoresearch: an external agent edits code, runs a 5-min experiment, 
 
 This turns Pass 2 from reactive cleanup into **deliberate experimentation**.
 
+### Implementation Status: DONE (2026-04-04)
+
+All seven steps of the autoresearch loop are implemented:
+
+| Autoresearch Step | Implementation | File |
+|-------------------|----------------|------|
+| Read `program.md` (research direction) | Active Telos goal with highest EFE | `cognition/telos_module.py` (existing) |
+| Propose hypothesis | `HypothesisGenerator`: learned MLP (goal + belief summary + progress + β → hypothesis vector). Gated: starts mostly closed (bias=-1.0), learns to open for productive goals. | `cognition/autoresearch.py` |
+| Modify `train.py` | `state.allocate_belief(..., provisional=True, current_fe=...)` | `core/state.py` |
+| Run experiment (5 min) | Forward passes naturally test hypotheses — gradients from L_token + L_fe flow through provisional beliefs | (automatic) |
+| Extract `val_bpb` | `evaluate_provisional_beliefs()`: compares current FE vs stored FE at allocation time, checks precision retention | `cognition/provisional.py` |
+| Keep/discard via git | Promote (clear provisional flag) or evict (deallocate slot) | `cognition/provisional.py` |
+| Log to `results.tsv` | `HypothesisTracker`: per-goal hypothesis_count, promoted, evicted, EMA success rate. Goals with success EMA < 0.2 stop producing hypotheses. | `cognition/autoresearch.py` |
+
+**Tentative Belief Mode** adds 6 buffers to `CognitiveState`:
+- `belief_provisional` (bool): is this belief a hypothesis under evaluation?
+- `belief_provisional_step` (float): when was it allocated?
+- `belief_provisional_fe` (float): global FE at allocation time
+- `belief_provisional_radius` (float): initial radius for retention check
+- `belief_precision_var` (float): MESU precision variance (A2, used by evaluation)
+- `belief_reinforcement_count` (long): windowed posterior count (A2)
+
+Provisional beliefs do NOT increment `access_count` when touched (no reinforcement before evaluation).
+
+**All thresholds are learned** via MetaParams (10 new nn.Parameters):
+- `provisional_eval_window`, `provisional_fe_threshold`, `provisional_precision_retention` (A1)
+- `mesu_min_variance`, `mesu_variance_shrink`, `mesu_window_size`, `mesu_gain_boost` (A2)
+- `cascade_decay_factor`, `cascade_max_depth`, `cascade_variance_boost` (A3)
+
+Tests: 32 tests across `test_a1_provisional.py`, `test_a2_mesu.py`, `test_a3_cascade.py`, `test_autoresearch.py`.
+
 ---
 
 ## 1. Recursive Self-Improvement
 
 ### Problem
-The system tunes its own hyperparameters (21 meta-params via gradient descent with sigmoid/softplus constraints) but can't invent new learning mechanisms. The update rules for beliefs, edges, and goals are hand-coded.
+The system tunes its own hyperparameters (31 meta-params via gradient descent with sigmoid/softplus constraints, up from 21 after A1-A3 implementation) but can't invent new learning mechanisms. The update rules for beliefs, edges, and goals are hand-coded.
 
 ### Solution: Three Levels of Self-Modification
 
@@ -221,32 +254,67 @@ The cognitive state could drift, accumulate errors, develop false beliefs that r
 
 ### Solution: Five Defense Layers
 
-#### Layer 1: MESU -- Uncertainty-Scaled Learning Rates (Highest Priority)
-**Source:** Bayesian Metaplasticity from Synaptic Uncertainty -- arXiv:2312.10153 (Nature Communications 2025)
+#### Layer 1: MESU -- Uncertainty-Scaled Learning Rates (Highest Priority) -- IMPLEMENTED
 
-**The single most relevant algorithm.** Extend each belief slot with a precision *variance* (not just point estimate):
+**Source:** Bayesian Metaplasticity from Synaptic Uncertainty -- arXiv:2312.10153 (Nature Communications 2025)
+**Additional source:** Palimpsa (arXiv:2602.09075) -- MESU applied to attention states (closest existing work to Memoria's belief store)
+
+**The single most relevant algorithm.** Each belief slot now has a precision *variance* (`belief_precision_var`) alongside its radius:
 - High variance = uncertain = high learning rate (belief can shift easily)
 - Low variance = confident = low learning rate (belief resists change)
-- **Windowed posterior**: don't let precision accumulate without bound. Retain only the last K reinforcements. This prevents the "overconfident and rigid" failure mode.
+- **Windowed posterior**: `belief_reinforcement_count` caps how much variance can shrink. Beyond the learned window size, the variance floor rises.
 
-Implementation: change belief radius from scalar to (mean, variance) pair. Update via:
+**Implementation (2026-04-04):**
+
+In `cognition/surprise.py` — MESU-modulated Kalman gain:
 ```python
-gain = obs_precision / (belief_precision + obs_precision)
-new_mean = (1 - gain) * belief_mean + gain * obs_mean
-new_variance = (1 - gain^2) * belief_variance  # shrinks with evidence
-# But cap: variance >= min_variance (prevents overconfidence)
-# And window: only count last K reinforcements toward precision
+# Base gain (standard Kalman)
+gain_raw = obs_radii / (existing_radii + obs_radii)
+# MESU modulation: high variance amplifies gain
+precision_var = state.belief_precision_var[matched_slots]
+gain_boost = state.meta_params.mesu_gain_boost  # learned, (0, inf)
+mesu_factor = (1.0 + precision_var * gain_boost).clamp(max=3.0)
+gain = (gain_raw * mesu_factor).clamp(max=1.0)
 ```
 
-#### Layer 2: Causal Cascade Revision (AGM-Darwiche-Pearl)
+In `cognition/pass2.py` — variance update per observation:
+```python
+new_var = var * (1.0 - gain^2 * shrink_rate)  # shrink_rate is learned
+# Windowed posterior: if reinforcement_count > window_size, floor rises
+effective_floor = min_var * (1.0 + max(0, count - window) / window)
+belief_precision_var[idx] = max(new_var, effective_floor)
+```
+
+In `cognition/consolidation.py` — merge variances via harmonic mean:
+```python
+combined_var = (var_i * var_j) / (var_i + var_j)  # two estimates reduce uncertainty
+```
+
+All parameters learned (MetaParams): `mesu_min_variance`, `mesu_variance_shrink`, `mesu_window_size`, `mesu_gain_boost`.
+Tests: `tests/test_a2_mesu.py` (7 tests).
+
+#### Layer 2: Causal Cascade Revision (AGM-Darwiche-Pearl) -- IMPLEMENTED
+
 **Source:** Machine Learning as Iterated Belief Change -- arXiv:2506.13157
+**Additional sources:** Reactive message passing (arXiv:2603.20927), BP functoriality (arXiv:2503.15705)
 
-When a belief is revised (contradicted by high-precision evidence), propagate precision decay through downstream beliefs in the causal graph:
-1. Identify all beliefs reachable from the revised belief via causal edges
-2. For each downstream belief: decay precision proportional to edge weight * causal distance
-3. This prevents orphaned high-precision beliefs that were derived from a now-corrected source
+When a belief is revised (contradicted by high-precision evidence), propagate precision decay through downstream beliefs in the causal graph.
 
-Already have the causal graph + propagation mechanism. Just need to trigger cascade on revision, not just on initial observation.
+**Implementation (2026-04-04) — `cognition/cascade_revision.py`:**
+
+BFS-based cascade from each reconsolidated belief through causal edges:
+1. Identify all beliefs reachable from the revised belief via causal edges (BFS frontier)
+2. For each downstream belief at depth d: precision *= (1 - decay_factor^d), variance += variance_boost * decay_factor^d
+3. Visited set prevents cycles. Immutable beliefs are skipped. Max depth is learned.
+
+Two effects per downstream belief:
+- **Precision decay**: radius shrinks (downstream becomes less confident)
+- **Variance increase**: MESU variance grows (downstream becomes more plastic, ready to re-learn)
+
+Triggered automatically in pass2 when any belief has `should_reconsolidate=True` from surprise computation.
+
+All parameters learned (MetaParams): `cascade_decay_factor`, `cascade_max_depth`, `cascade_variance_boost`.
+Tests: `tests/test_a3_cascade.py` (7 tests).
 
 #### Layer 3: Two-Factor Consolidation During Sleep
 **Source:** Two-Factor Synaptic Consolidation -- PNAS 2025
@@ -423,12 +491,13 @@ Memoria doesn't reinvent tool connectivity. It uses MCP (Model Context Protocol)
 ### Phase A: Foundations (Implement First)
 These are prerequisites for everything else.
 
-| # | What | Why | Effort |
-|---|------|-----|--------|
-| A1 | **Tentative Belief Mode** | Enables internal autoresearch loop. Add `provisional` flag to belief slots. | Small |
-| A2 | **MESU precision variance** | Prevents runaway false beliefs. Extend radius to (mean, variance). | Medium |
-| A3 | **Causal cascade revision** | When a belief changes, downstream beliefs must update. | Small |
-| A4 | **SGM safety gate** | Required before any self-modification. Statistical confidence tests. | Medium |
+| # | What | Why | Effort | Status |
+|---|------|-----|--------|--------|
+| A1 | **Tentative Belief Mode** | Enables internal autoresearch loop. Add `provisional` flag to belief slots. | Small | **DONE** (2026-04-04) `cognition/provisional.py`, 9 tests |
+| A2 | **MESU precision variance** | Prevents runaway false beliefs. Extend radius to (mean, variance). | Medium | **DONE** (2026-04-04) `cognition/surprise.py` + `core/state.py`, 7 tests |
+| A3 | **Causal cascade revision** | When a belief changes, downstream beliefs must update. | Small | **DONE** (2026-04-04) `cognition/cascade_revision.py`, 7 tests |
+| A0 | **Internal Autoresearch Loop** | Cross-cutting: goal-directed hypothesis generation + evaluation cycle. | Medium | **DONE** (2026-04-04) `cognition/autoresearch.py`, 9 tests |
+| A4 | **SGM safety gate** | Required before any self-modification. Statistical confidence tests. | Medium | NOT STARTED — prerequisite for Phase C only |
 
 ### Phase B: Planning (Unlocks Agency)
 | # | What | Why | Effort |
