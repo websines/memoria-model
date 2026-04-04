@@ -1,12 +1,15 @@
-"""GPT Transformer blocks with hybrid attention (SSSL pattern).
+"""GPT Transformer blocks with hybrid attention (SSSL/Mamba pattern).
 
 Attention types:
 - S (Sliding window): local attention within a fixed window, O(T×W) cost.
   Uses FlashAttention-2 native window_size if available, otherwise blockwise fallback.
 - L (Long/global): full causal attention with MLA (Multi-Head Latent Attention)
   for KV compression. O(T²) but with ~3-10x smaller KV cache.
+- M (Mamba): Mamba-2 selective scan, O(T) linear recurrence. No KV cache.
+  Replaces sliding-window attention for local context processing.
 
-Position encoding: YaRN-scaled RoPE for 200K+ positions.
+Position encoding: YaRN-scaled RoPE for 200K+ positions (attention layers only;
+Mamba layers handle sequence ordering through recurrent state).
 
 Also includes: QK-Norm, ReLU², value embeddings, per-layer residual scalars,
 logit softcapping. Muon optimizer setup.
@@ -15,6 +18,8 @@ Reference: github.com/karpathy/autoresearch (train.py)
 Reference: github.com/KellerJordan/modded-nanogpt
 Reference: DeepSeek-V3 (MLA architecture)
 Reference: YaRN (arxiv.org/abs/2309.00071)
+Reference: Mamba-2 (github.com/state-spaces/mamba)
+Reference: Jamba (arxiv.org/abs/2403.19887) — hybrid Mamba-Attention
 """
 
 import math
@@ -226,6 +231,56 @@ class SlidingWindowAttention(nn.Module):
         return out
 
 
+# ── Mamba-2 Selective Scan (M layers) ──
+
+# Try to import mamba-ssm for Mamba-2 support
+_mamba_available = False
+try:
+    from mamba_ssm import Mamba2
+    _mamba_available = True
+except ImportError:
+    pass
+
+
+class MambaBlock(nn.Module):
+    """Mamba-2 selective scan block. O(T) linear recurrence — no KV cache.
+
+    Drop-in replacement for SlidingWindowAttention on S layers.
+    Input/output shape: (B, T, D) → (B, T, D), identical to attention blocks.
+
+    Mamba handles sequence ordering through its recurrent state — no positional
+    encoding needed. The cos/sin args in forward() are accepted but ignored
+    so the Block class can call all attention types with the same signature.
+
+    Parameter count: ~3 × expand × d_model² per block.
+
+    Reference: Mamba-2 (arxiv.org/abs/2405.21060)
+    Reference: Jamba (arxiv.org/abs/2403.19887) — 7:1 Mamba:Attention hybrid
+    Reference: Nemotron-H (NVIDIA) — 5:1 Mamba:Attention hybrid
+    """
+
+    def __init__(self, config: TransformerConfig, layer_idx: int):
+        super().__init__()
+        if not _mamba_available:
+            raise ImportError(
+                "mamba-ssm is required for Mamba layers. "
+                "Install with: pip install mamba-ssm --no-build-isolation"
+            )
+        self.mamba = Mamba2(
+            d_model=config.n_embd,
+            d_state=config.mamba_d_state,
+            d_conv=config.mamba_d_conv,
+            expand=config.mamba_expand,
+        )
+        self.layer_idx = layer_idx
+        # Dummy attribute for compatibility with YaRN scale setting loop
+        self._yarn_scale = 1.0
+
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        # cos/sin ignored — Mamba uses recurrent state for sequence ordering
+        return self.mamba(x)
+
+
 # ── MLA: Multi-Head Latent Attention (L layers) ──
 
 class MLACausalSelfAttention(nn.Module):
@@ -396,8 +451,9 @@ class MLP(nn.Module):
 class Block(nn.Module):
     """Transformer block with attention type dispatch based on window_pattern.
 
+    M (Mamba)   → MambaBlock (selective scan, O(T) linear)
     S (Sliding) → SlidingWindowAttention (local, O(T×W))
-    L (Long)    → MLACausalSelfAttention (global, MLA-compressed KV)
+    L (Long)    �� MLACausalSelfAttention (global, MLA-compressed KV)
     Fallback    → CausalSelfAttention (standard full attention)
     """
 
@@ -406,12 +462,14 @@ class Block(nn.Module):
         pattern = config.window_pattern
         attn_type = pattern[layer_idx % len(pattern)] if pattern else 'F'
 
-        if attn_type == 'S':
+        if attn_type == 'M' and _mamba_available:
+            self.attn = MambaBlock(config, layer_idx)
+        elif attn_type == 'M' or attn_type == 'S':
             self.attn = SlidingWindowAttention(config, layer_idx)
         elif attn_type == 'L' and config.mla_latent_dim > 0:
             self.attn = MLACausalSelfAttention(config, layer_idx)
         elif attn_type == 'L':
-            # L layer but MLA disabled — use standard full attention
+            # L layer but MLA disabled ��� use standard full attention
             self.attn = CausalSelfAttention(config, layer_idx)
         else:
             self.attn = CausalSelfAttention(config, layer_idx)
@@ -554,7 +612,10 @@ class Transformer(nn.Module):
 
         for block in self.blocks:
             attn = block.attn
-            if isinstance(attn, MLACausalSelfAttention):
+            if isinstance(attn, MambaBlock):
+                # Mamba-2 uses its own internal initialization — skip
+                pass
+            elif isinstance(attn, MLACausalSelfAttention):
                 # MLA: init compression/decompression near-orthogonal
                 nn.init.uniform_(attn.c_q.weight, -s, s)
                 nn.init.uniform_(attn.c_kv_compress.weight, -s, s)

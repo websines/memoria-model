@@ -208,13 +208,17 @@ def run_dream_phase(
     message_passing: FactorGraphMessagePassing,
     n_iterations: int | None = None,
     dream_lr: float | None = None,
-    damping: float | None = None,
 ) -> dict:
     """Run a dream phase: internal belief propagation without external input.
 
     Disconnects from the input stream and runs N iterations of message passing
     on the belief graph, allowing beliefs to converge toward internal consistency.
     This is analogous to offline consolidation in complementary learning systems.
+
+    Message passing uses DEQ (Anderson acceleration) internally when available,
+    so each call to message_passing(state) already finds the BP fixed point.
+    The outer loop here iterates the dream cycle: pass messages → shift beliefs
+    → pass messages again on the shifted beliefs → repeat until convergence.
 
     During dreaming:
     1. Run message passing to compute per-belief messages
@@ -230,7 +234,6 @@ def run_dream_phase(
         message_passing: the factor graph message passing module
         n_iterations: number of dream iterations
         dream_lr: step size for belief updates during dreaming
-        damping: momentum factor for stability (0 = no damping, 1 = full damping)
 
     Returns:
         dict with statistics
@@ -245,12 +248,6 @@ def run_dream_phase(
     if dream_lr is None:
         # Scale with beta: high exploration → larger dream steps
         dream_lr = state.meta.data[0].item() * 0.02 + 0.001  # beta-scaled
-    if damping is None:
-        # Use the learned damping from message passing if available
-        if hasattr(message_passing, 'damping'):
-            damping = message_passing.damping.item()
-        else:
-            damping = state.meta_params.precision_decay_factor.item()  # reuse a learned param
 
     active_mask = state.get_active_mask()
     if not active_mask.any() or not state.edge_active.any():

@@ -91,7 +91,6 @@ def run_pass2(
     is_sequence_boundary: bool = True,
     total_steps: int = 1,
     belief_advantage: float = 0.0,
-    spsa_controller=None,  # deprecated
 ) -> dict:
     """Structural cleanup pass after gradient-based updates.
 
@@ -107,7 +106,7 @@ def run_pass2(
         is_sequence_boundary: whether we're at a sequence boundary
         total_steps: total training steps (for temperature annealing)
         belief_advantage: current belief advantage for controller reward
-        spsa_controller: deprecated, ignored
+
 
     Returns:
         dict with statistics

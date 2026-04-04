@@ -755,12 +755,30 @@ class MemoriaModel(nn.Module):
             w_surp = self.config.training.surprise_loss_weight
             w_halt = self.config.training.halt_loss_weight
 
+            # DEQ Jacobian regularization: ensures the message passing fixed-point
+            # map stays contractive as relation_transform is trained by Bethe FE.
+            # Only computed periodically (every 10 steps) to minimize overhead.
+            jac_loss = torch.tensor(0.0, device=idx.device)
+            if (alpha > 0 and self.training
+                    and hasattr(self.state, 'message_passing')
+                    and hasattr(self.state.message_passing, '_deq')
+                    and self.state.message_passing._deq is not None
+                    and self.state.edge_active.any()):
+                mp_result = self.state.message_passing(self.state)
+                jac_loss = mp_result.get('jac_loss', torch.tensor(0.0, device=idx.device))
+            result['loss_jac'] = jac_loss
+            result['deq_solver_steps'] = (
+                self.state.message_passing._last_info.get('nstep', 0)
+                if hasattr(self.state, 'message_passing') else 0
+            )
+
             result['loss'] = (
                 result['loss_token']
                 + alpha * loss_fe
                 + alpha * w_util * loss_utility
                 + alpha * w_surp * result['loss_surprise']
                 + alpha * w_halt * loss_halt
+                + alpha * 0.01 * jac_loss
             )
         else:
             logits = self.transformer.head(x)

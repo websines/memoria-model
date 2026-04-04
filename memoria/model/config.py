@@ -25,11 +25,18 @@ class TransformerConfig:
     n_kv_head: int = 6
     n_embd: int = 768
 
-    # Attention pattern: S = Sliding window, L = Long/global (MLA)
-    # "S" = all layers sliding window (cognitive state handles global context)
+    # Attention pattern: M = Mamba-2, S = Sliding window, L = Long/global (MLA)
+    # "M" = all Mamba (cognitive state handles global context, O(T) linear)
+    # "MMMML" = 4 Mamba + 1 MLA per cycle (hybrid, recommended for scratch training)
+    # "S" = all sliding window (legacy, O(T×W))
     # "SSSL" = 3 sliding + 1 global per cycle (for models without cognitive state)
-    window_pattern: str = "S"
+    window_pattern: str = "MMMML"
     sliding_window_size: int = 4096   # local window for S layers
+
+    # Mamba-2 parameters (for M layers)
+    mamba_d_state: int = 64           # SSM state expansion factor (64 or 128)
+    mamba_d_conv: int = 4             # local convolution width
+    mamba_expand: int = 2             # block expansion factor (inner_dim = expand * d_model)
 
     # RoPE position encoding — native long context, no scaling
     # High base frequency for native 200K support (like Llama 3 at 128K)
@@ -144,6 +151,8 @@ def small_config() -> MemoriaConfig:
     return MemoriaConfig(
         transformer=TransformerConfig(
             n_layer=12, n_head=6, n_kv_head=6, n_embd=768,
+            window_pattern="MMMML",  # 4 Mamba + 1 MLA per 5-layer cycle
+            mla_latent_dim=192,      # enable MLA for L layers (latent = n_embd/4)
             interface_every=4,
         ),
         state=StateConfig(
@@ -168,6 +177,8 @@ def medium_config() -> MemoriaConfig:
     return MemoriaConfig(
         transformer=TransformerConfig(
             n_layer=24, n_head=8, n_kv_head=8, n_embd=1024,
+            window_pattern="MMMML",  # 4 Mamba + 1 MLA per 5-layer cycle
+            mla_latent_dim=256,      # enable MLA for L layers (latent = n_embd/4)
             interface_every=4,
         ),
         state=StateConfig(
@@ -192,6 +203,8 @@ def large_config() -> MemoriaConfig:
     return MemoriaConfig(
         transformer=TransformerConfig(
             n_layer=24, n_head=10, n_kv_head=10, n_embd=1280,
+            window_pattern="MMMML",  # 4 Mamba + 1 MLA per 5-layer cycle
+            mla_latent_dim=320,      # enable MLA for L layers (latent = n_embd/4)
             interface_every=4,
         ),
         state=StateConfig(

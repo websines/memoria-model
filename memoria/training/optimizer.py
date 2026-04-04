@@ -97,7 +97,8 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     """Set up optimizer with per-group learning rates.
 
     Scratch mode (MemoriaModel):
-    - Matrix params in transformer blocks → AdamW (TODO: Muon)
+    - 2D matrix params in transformer blocks (attention, MLP, Mamba) → Muon
+    - 1D params in transformer blocks (biases, norms) → AdamW
     - Embedding / unembedding → AdamW
     - Scalar params (lambdas) → AdamW with higher LR
     - State interface params → AdamW
@@ -286,7 +287,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'weight_decay': 0.0,
         })
 
-    # 15. Message passing (learned damping + iteration count for loopy BP)
+    # 15. Message passing (relation transform + DEQ parameters)
     mp_params = [p for p in model.state.message_passing.parameters() if p.requires_grad]
     if mp_params:
         param_groups.append({
@@ -469,7 +470,7 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
             'weight_decay': 0.0,
         })
 
-    # Message passing (learned damping + iteration count)
+    # Message passing (relation transform + DEQ parameters)
     mp_params = [p for p in model.state.message_passing.parameters() if p.requires_grad]
     if mp_params:
         param_groups.append({

@@ -109,15 +109,15 @@ class CognitiveState(nn.Module):
         # [3] = learning_rate_modulation
         # [4] = reconsolidation_threshold (default 0.3)
         # [5] = match_threshold (default 0.7)
-        # [6] = goal_dedup_threshold (default 0.5, SPSA-tunable)
-        # [7:] = SPSA-tunable parameters
+        # [6] = goal_dedup_threshold (default 0.5)
+        # [7:] = reserved
 
         # Initialize meta defaults
         with torch.no_grad():
             self.meta[0] = 1.0    # β = 1.0 (maximum exploration, no data yet)
             self.meta[4] = 0.3    # reconsolidation threshold
             self.meta[5] = 0.7    # match threshold
-            self.meta[6] = 0.5    # goal dedup threshold (SPSA-tunable)
+            self.meta[6] = 0.5    # goal dedup threshold
 
         # ── Recency Tracking ──
         # Track when beliefs were last accessed (read or written) and how often

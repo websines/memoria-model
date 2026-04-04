@@ -17,8 +17,16 @@ def stream_fineweb_edu(
     tokenizer: PreTrainedTokenizer,
     seq_len: int = 2048,
     split: str = "train",
+    skip_documents: int = 0,
 ) -> Iterator[dict[str, Tensor]]:
     """Stream tokenized sequences from FineWeb-Edu 10BT sample.
+
+    Args:
+        tokenizer: tokenizer for encoding
+        seq_len: sequence length
+        split: dataset split
+        skip_documents: number of raw documents to skip (for fast resume).
+            Uses HF datasets' native skip() which seeks without iterating.
 
     Yields:
         dict with 'input_ids' [seq_len] and 'labels' [seq_len] tensors
@@ -29,6 +37,8 @@ def stream_fineweb_edu(
         split=split,
         streaming=True,
     )
+    if skip_documents > 0:
+        ds = ds.skip(skip_documents)
 
     yield from _tokenize_stream(ds, tokenizer, seq_len, text_key="text")
 

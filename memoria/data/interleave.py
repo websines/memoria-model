@@ -20,6 +20,7 @@ def interleaved_stream(
     weights: tuple[float, float, float] = (0.7, 0.2, 0.1),
     synthetic_data: list[str] | None = None,
     stack_languages: list[str] | None = None,
+    skip_documents: int = 0,
 ) -> Iterator[dict[str, Tensor]]:
     """Interleave multiple data sources by weight.
 
@@ -29,6 +30,8 @@ def interleaved_stream(
         weights: (fineweb_weight, stack_weight, synthetic_weight)
         synthetic_data: pre-generated synthetic sequences (if None, generates on the fly)
         stack_languages: language filter for Stack v2
+        skip_documents: number of raw documents to skip in the primary FineWeb
+            stream for fast resume. Uses HF native skip() — O(1) not O(N).
 
     Yields:
         dict with 'input_ids' [seq_len] and 'labels' [seq_len] and 'source' str
@@ -42,7 +45,7 @@ def interleaved_stream(
     w_synthetic /= total
 
     # Initialize streams
-    fineweb_iter = stream_fineweb_edu(tokenizer, seq_len) if w_fineweb > 0 else iter([])
+    fineweb_iter = stream_fineweb_edu(tokenizer, seq_len, skip_documents=skip_documents) if w_fineweb > 0 else iter([])
 
     # Code dataset: starcoderdata (ungated) → fallback to Stack v2
     code_iter = iter([])

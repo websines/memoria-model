@@ -4,14 +4,17 @@ Instead of hardcoded heuristics deciding when to allocate, merge, prune, or
 connect beliefs, a small learned controller makes these decisions using the
 current cognitive state as input and belief_advantage as reward signal.
 
-Action space (discrete, per-step decisions):
+Action space (continuous, per-step decisions):
 - allocate_rate: what fraction of candidate beliefs to allocate [0, 1]
 - merge_threshold: similarity threshold for consolidation [0.8, 0.99]
 - prune_threshold: minimum precision to keep a belief [0.01, 0.5]
 - connect_rate: what fraction of proposed edges to accept [0, 1]
 - goal_rate: how many goals to generate [0, 3]
 
-The controller outputs continuous action values. Pass2 uses them directly.
+The policy network outputs Beta distribution parameters (α, β) per action.
+Actions are sampled from Beta(α, β) ∈ [0, 1] and scaled to their valid ranges.
+REINFORCE uses the actual log-probability of the sampled action under the Beta
+distribution, which provides an unbiased policy gradient estimator.
 
 Reference: SEAL (MIT, NeurIPS 2025, arXiv:2506.10943)
 Reference: SEC — Self-Evolving Curriculum (arXiv:2505.14970)
@@ -21,6 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.distributions import Beta
 
 
 NUM_ACTIONS = 5
@@ -39,11 +43,16 @@ class CognitiveController(nn.Module):
     """Learned controller over pass2 structural actions.
 
     Input: cognitive state summary vector
-    Output: continuous action values scaled to valid ranges
+    Output: continuous action values sampled from Beta distributions
 
     Trained via REINFORCE with belief_advantage as reward.
     The controller learns WHEN to allocate aggressively, WHEN to prune,
     WHEN to merge, based on what improves downstream performance.
+
+    The policy outputs Beta(α, β) parameters per action. Actions are sampled
+    stochastically during training (exploration) and use the mean during
+    inference (exploitation). Log-probabilities are computed analytically
+    from the Beta PDF for unbiased REINFORCE gradients.
     """
 
     def __init__(
@@ -78,19 +87,23 @@ class CognitiveController(nn.Module):
         # - belief advantage EMA (1)
         self.state_dim = 8
 
-        # Policy network
+        # Policy network: outputs 2 * NUM_ACTIONS values (α_raw, β_raw per action)
+        # softplus(x) + 1.0 gives Beta params ≥ 1.0 (unimodal distributions)
         self.policy = nn.Sequential(
             nn.Linear(self.state_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 2, NUM_ACTIONS),
-            nn.Sigmoid(),  # output in [0, 1], scaled to action ranges
+            nn.Linear(hidden_dim // 2, NUM_ACTIONS * 2),
         )
-        # Init bias so default actions are fully permissive
-        # sigmoid(5) ≈ 0.993 → allocate_rate≈1.0, connect_rate≈1.0
+        # Init bias so default Beta(α,β) is concentrated near 1.0:
+        # softplus(3) + 1 ≈ 4.05 for α, softplus(0) + 1 ≈ 1.69 for β
+        # Beta(4.05, 1.69) has mean ≈ 0.71 and moderate variance
+        # → allocate_rate ≈ 0.71, connect_rate ≈ 0.71 (permissive defaults)
         with torch.no_grad():
-            self.policy[-2].bias.fill_(5.0)
+            bias = self.policy[-1].bias
+            bias[:NUM_ACTIONS] = 3.0   # α params → high (skew toward 1)
+            bias[NUM_ACTIONS:] = 0.0   # β params → moderate
 
         # Value baseline (for variance reduction in REINFORCE)
         self.value_head = nn.Sequential(
@@ -104,10 +117,32 @@ class CognitiveController(nn.Module):
         self.register_buffer('reward_var', torch.tensor(1.0))
         self.register_buffer('belief_advantage_ema', torch.tensor(0.0))
 
-        # Log-probs buffer for REINFORCE
+        # Entropy bonus coefficient: prevents premature collapse by encouraging
+        # exploration. Critical for sparse reward signals (belief_advantage every ~100 steps).
+        # 0.01–0.05 is standard; we use 0.02 as default.
+        self.entropy_coeff = 0.02
+
+        # Trajectory buffers for REINFORCE
         self._saved_log_probs: list[Tensor] = []
+        self._saved_entropies: list[Tensor] = []
         self._saved_values: list[Tensor] = []
         self._saved_rewards: list[float] = []
+
+    def _get_beta_dist(self, features: Tensor) -> tuple[Beta, Tensor, Tensor]:
+        """Compute Beta distribution parameters from state features.
+
+        Returns:
+            dist: Beta distribution for sampling
+            alpha: [NUM_ACTIONS] concentration parameter α
+            beta: [NUM_ACTIONS] concentration parameter β
+        """
+        raw = self.policy(features)  # [NUM_ACTIONS * 2]
+        alpha_raw = raw[:NUM_ACTIONS]
+        beta_raw = raw[NUM_ACTIONS:]
+        # softplus + 1.0 ensures params ≥ 1.0 (unimodal Beta)
+        alpha = F.softplus(alpha_raw) + 1.0
+        beta = F.softplus(beta_raw) + 1.0
+        return Beta(alpha, beta), alpha, beta
 
     def encode_state(self, state) -> Tensor:
         """Encode cognitive state into a fixed-size feature vector.
@@ -138,27 +173,32 @@ class CognitiveController(nn.Module):
         return features
 
     def get_actions(self, state) -> dict[str, float]:
-        """Get action values from the controller.
+        """Sample actions from the Beta policy.
 
         Returns a dict with named action values scaled to valid ranges.
         Also saves log_prob and value for REINFORCE update.
         """
         features = self.encode_state(state)
 
-        # Policy output in [0, 1]
-        raw_actions = self.policy(features)  # [NUM_ACTIONS]
+        # Build Beta distribution from policy network
+        dist, alpha, beta_param = self._get_beta_dist(features)
+
+        # Sample from Beta(α, β) ∈ (0, 1) — stochastic exploration
+        # Clamp to avoid exact 0/1 (log_prob is -inf at boundaries)
+        raw_samples = dist.rsample().clamp(1e-6, 1 - 1e-6)  # [NUM_ACTIONS]
 
         # Scale to action ranges
         actions = {}
         for i, (name, (lo, hi)) in enumerate(zip(ACTION_NAMES, self.action_ranges)):
-            actions[name] = lo + (hi - lo) * raw_actions[i].item()
+            actions[name] = lo + (hi - lo) * raw_samples[i].item()
 
-        # Save for REINFORCE
+        # Save actual log-probability and entropy for REINFORCE + entropy bonus
+        log_prob = dist.log_prob(raw_samples).sum()  # sum over independent actions
+        entropy = dist.entropy().sum()  # Beta entropy (closed-form, cheap)
         value = self.value_head(features)
-        # Log-prob proxy: penalize deviation from midpoint (encourages exploration)
-        # Midpoint of sigmoid output is 0.5 — this is a structural constant (center of [0,1])
-        log_prob = -((raw_actions - 0.5) ** 2).sum()
+
         self._saved_log_probs.append(log_prob)
+        self._saved_entropies.append(entropy)
         self._saved_values.append(value.squeeze())
 
         return actions
@@ -179,6 +219,13 @@ class CognitiveController(nn.Module):
         Call this periodically (e.g., every 100 steps) to update the controller.
         Clears the saved buffers after computing loss.
 
+        Uses proper log π(a|s) from Beta distribution, giving unbiased
+        policy gradient estimates: ∇J = E[∇log π(a|s) · advantage].
+
+        Includes entropy bonus (H_coeff × H[π]) to prevent premature collapse
+        when rewards are sparse. The Beta distribution's entropy has a closed-form
+        expression, so this adds negligible cost.
+
         Returns:
             Scalar policy loss (add to main training loss at small weight)
         """
@@ -197,10 +244,11 @@ class CognitiveController(nn.Module):
         else:
             normalized = rewards
 
-        # REINFORCE with baseline
+        # REINFORCE with baseline + entropy bonus
         n = min(len(self._saved_log_probs), len(normalized))
         policy_loss = torch.tensor(0.0, device=device)
         value_loss = torch.tensor(0.0, device=device)
+        entropy_bonus = torch.tensor(0.0, device=device)
 
         for i in range(n):
             advantage = normalized[i] - self._saved_values[i].detach()
@@ -208,11 +256,16 @@ class CognitiveController(nn.Module):
             value_loss = value_loss + F.mse_loss(
                 self._saved_values[i], normalized[i].detach()
             )
+            if i < len(self._saved_entropies):
+                entropy_bonus = entropy_bonus + self._saved_entropies[i]
 
-        total_loss = (policy_loss + 0.5 * value_loss) / max(n, 1)
+        # L = policy_grad + 0.5 * value_mse - entropy_coeff * H[π]
+        # Negative sign on entropy: maximizing entropy = minimizing -H
+        total_loss = (policy_loss + 0.5 * value_loss - self.entropy_coeff * entropy_bonus) / max(n, 1)
 
         # Clear buffers
         self._saved_log_probs.clear()
+        self._saved_entropies.clear()
         self._saved_values.clear()
         self._saved_rewards.clear()
 

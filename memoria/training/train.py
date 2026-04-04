@@ -39,7 +39,7 @@ from .distributed import (
     broadcast_state, gather_candidates, gather_read_indices, sync_ranks,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
-from ..cognition.meta_learning import SPSAController  # kept for checkpoint backward compat
+from ..cognition.meta_learning import compute_beta  # noqa: F401 — used transitively via pass2
 from .cognitive_seed import save_cognitive_seed
 
 
@@ -192,26 +192,6 @@ def train(
         if world_size > 1:
             print(f"  DDP: {world_size} GPUs via Accelerate, state on rank 0")
 
-    # Data (synthetic only on main process, broadcast if needed)
-    if is_main:
-        print("Generating synthetic data...")
-    synthetic_data = generate_all_synthetic() if is_main else []
-    if is_main:
-        print(f"Generated {len(synthetic_data)} synthetic sequences")
-        print("Starting data stream...")
-    data_stream = interleaved_stream(
-        tokenizer,
-        seq_len=config.transformer.sequence_len,
-        weights=(0.7, 0.2, 0.1),
-        synthetic_data=synthetic_data if synthetic_data else None,
-        stack_languages=["python", "javascript", "rust", "go"],
-    )
-
-    # SPSA controller removed — its 3 tunable params (reconsolidation_threshold,
-    # match_threshold, goal_dedup_threshold) are now nn.Parameters in MetaParams,
-    # trained by backprop through L_fe. No gradient-free optimization needed.
-    spsa_controller = None
-
     # Load cognitive seed from previous run (before resume, which may override)
     if cognitive_seed and is_main:
         from .cognitive_seed import load_cognitive_seed
@@ -242,16 +222,33 @@ def train(
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_step = checkpoint['step']
         samples_consumed = checkpoint.get('samples_consumed', 0)
-        # spsa_state in old checkpoints is ignored — SPSA replaced by learned MetaParams
         if is_main:
             print(f"Resumed from step {start_step}")
 
-    # Fast-forward data stream past already-consumed samples
-    if samples_consumed > 0 and is_main:
-        print(f"Fast-forwarding data stream past {samples_consumed} consumed samples...", flush=True)
-        for _ in range(samples_consumed):
-            next(data_stream)
-        print(f"Data stream resumed at position {samples_consumed}")
+    # Data (synthetic only on main process, broadcast if needed).
+    # Created after resume so we can skip past consumed data using HF native
+    # skip() — O(1) seek instead of O(N) iteration through millions of samples.
+    # The skip count is approximate (samples→documents estimate) because the
+    # interleaved stream uses random routing. This is fine: the stream isn't
+    # reproducible across restarts anyway (unseeded random.random() routing).
+    skip_docs = samples_consumed if samples_consumed > 0 else 0
+    if is_main:
+        print("Generating synthetic data...")
+    synthetic_data = generate_all_synthetic() if is_main else []
+    if is_main:
+        print(f"Generated {len(synthetic_data)} synthetic sequences")
+        if skip_docs > 0:
+            print(f"Resuming data stream (skipping ~{skip_docs} documents via HF skip)...")
+        else:
+            print("Starting data stream...")
+    data_stream = interleaved_stream(
+        tokenizer,
+        seq_len=config.transformer.sequence_len,
+        weights=(0.7, 0.2, 0.1),
+        synthetic_data=synthetic_data if synthetic_data else None,
+        stack_languages=["python", "javascript", "rust", "go"],
+        skip_documents=skip_docs,
+    )
 
     # Checkpoint dir
     ckpt_path = Path(checkpoint_dir)
@@ -339,6 +336,8 @@ def train(
         total_loss = 0.0
         total_loss_token = 0.0
         total_loss_fe = 0.0
+        last_jac_loss = 0.0
+        last_deq_steps = 0
 
         for micro_step in range(grad_accum):
             if step == 0 and is_main:
@@ -358,6 +357,8 @@ def train(
             total_loss += loss.item()
             total_loss_token += result['loss_token'].item() / grad_accum
             total_loss_fe += result['loss_fe'].item() / grad_accum
+            last_jac_loss = result.get('loss_jac', torch.tensor(0.0)).item()
+            last_deq_steps = result.get('deq_solver_steps', 0)
             all_candidates.extend(result['candidates'])
             all_read_indices.extend(result.get('read_indices', []))
 
@@ -445,7 +446,7 @@ def train(
 
         if log_to_wandb:
             import wandb
-            wandb.log({
+            log_dict = {
                 'step': step,
                 'loss': total_loss,
                 'loss_token': total_loss_token,
@@ -461,23 +462,52 @@ def train(
                 'reconsolidations': pass2_stats.get('belief_reconsolidations', 0),
                 'goals_generated': pass2_stats.get('goals_generated', 0),
                 'dt_ms': dt * 1000,
-            })
+                'deq/jac_loss': last_jac_loss,
+                'deq/solver_steps': last_deq_steps,
+            }
+            # Per-operation pass2 diagnostics — essential for isolating which
+            # of the 12 structural operations is misbehaving during training.
+            for key in ['beliefs_cleaned', 'edges_cleaned', 'belief_allocated',
+                        'belief_updated', 'belief_skipped', 'edges_proposed',
+                        'edges_created', 'co_activation_pairs', 'soft_merges',
+                        'hard_cleanup_removed', 'beliefs_promoted',
+                        'beliefs_lr_updated', 'confidence_propagated',
+                        'sleep_strengthened', 'sleep_forgotten', 'sleep_deallocated',
+                        'dream_iterations', 'dream_converged', 'beliefs_shifted']:
+                if key in pass2_stats:
+                    log_dict[f'pass2/{key}'] = pass2_stats[key]
+            # Level distribution
+            if 'level_distribution' in pass2_stats:
+                for level_key, count in pass2_stats['level_distribution'].items():
+                    log_dict[f'levels/{level_key}'] = count
+            # Which operations were skipped this step
+            if 'pass2_skip' in pass2_stats:
+                for op, skipped in pass2_stats['pass2_skip'].items():
+                    log_dict[f'pass2_skip/{op}'] = int(skipped)
+            wandb.log(log_dict)
 
         # Belief advantage evaluation: with-state vs without-state loss delta
-        # Measures whether the cognitive state is actually helping predictions
+        # Measures whether the cognitive state is actually helping predictions.
+        # Averaged over 8 held-out samples to reduce variance — this signal drives
+        # the controller's REINFORCE reward, so noise here propagates everywhere.
         # Runs at eval_interval / 5 (derived from config, not hardcoded)
         belief_eval_interval = max(1, tc.eval_interval // 5)
+        n_belief_eval_samples = 8
         if is_main and step > 0 and step % belief_eval_interval == 0 and alpha > 0:
             base_model.eval()
             with torch.no_grad():
-                # Use held-out data for unbiased measurement (not the training micro-batch)
-                eval_batch = next(eval_data_stream)
-                eval_ids = eval_batch['input_ids'].unsqueeze(0).to(device)
-                eval_labels = eval_batch['labels'].unsqueeze(0).to(device)
-                result_with = base_model(eval_ids, targets=eval_labels, alpha=alpha)
-                loss_with = result_with['loss_token'].item()
-                result_without = base_model(eval_ids, targets=eval_labels, alpha=0.0)
-                loss_without = result_without['loss_token'].item()
+                total_with = 0.0
+                total_without = 0.0
+                for _ in range(n_belief_eval_samples):
+                    eval_batch = next(eval_data_stream)
+                    eval_ids = eval_batch['input_ids'].unsqueeze(0).to(device)
+                    eval_labels = eval_batch['labels'].unsqueeze(0).to(device)
+                    result_with = base_model(eval_ids, targets=eval_labels, alpha=alpha)
+                    total_with += result_with['loss_token'].item()
+                    result_without = base_model(eval_ids, targets=eval_labels, alpha=0.0)
+                    total_without += result_without['loss_token'].item()
+                loss_with = total_with / n_belief_eval_samples
+                loss_without = total_without / n_belief_eval_samples
             base_model.train()
             belief_advantage = loss_without - loss_with  # positive = beliefs help
             ba_decay = 0.95  # EMA decay — matches controller's reward_ema_decay convention
@@ -513,7 +543,7 @@ def train(
         # Checkpoint (main process only)
         if is_main and step > 0 and step % tc.checkpoint_interval == 0:
             save_checkpoint(base_model, optimizer, step, ckpt_path / f"step_{step}.pt",
-                           samples_consumed, spsa_controller)
+                           samples_consumed)
 
         # Push to HuggingFace Hub (async, main process only)
         if push_to_hub and step > 0 and step % hub_push_every == 0:
@@ -536,7 +566,7 @@ def train(
     if is_main:
         print(f"\nTraining complete. {step + 1} steps, {total_training_time:.1f}s training time.")
         save_checkpoint(base_model, optimizer, step, ckpt_path / "final.pt",
-                        samples_consumed, spsa_controller)
+                        samples_consumed)
         # Save cognitive seed for next run
         save_cognitive_seed(base_model.state, ckpt_path / "cognitive_seed.pt")
         if push_to_hub:
@@ -570,7 +600,7 @@ def _run_eval(model, eval_stream, device, n_batches: int = 20) -> float:
 
 
 def save_checkpoint(model, optimizer, step: int, path: Path,
-                    samples_consumed: int = 0, spsa_controller=None):
+                    samples_consumed: int = 0):
     """Save model + cognitive state + optimizer + stream position checkpoint."""
     # In pretrained mode, skip frozen backbone to avoid multi-GB checkpoint bloat
     model_state = model.state_dict()
