@@ -147,6 +147,29 @@ class CognitiveState(nn.Module):
         # Low surprise → higher LR (confident, can update faster).
         self.register_buffer('belief_lr_scale', torch.ones(config.max_beliefs))
 
+        # ── Tentative Belief Mode (A1: Internal Autoresearch Loop) ──
+        # Provisional beliefs participate in forward passes but don't build
+        # reinforcement. After eval_window steps, they're evaluated: promote
+        # if FE decreased AND precision held, evict otherwise.
+        # Reference: BrainCL (arXiv:2504.14727) wake/sleep staging
+        self.register_buffer(
+            'belief_provisional', torch.zeros(config.max_beliefs, dtype=torch.bool)
+        )
+        self.register_buffer('belief_provisional_step', torch.zeros(config.max_beliefs))
+        self.register_buffer('belief_provisional_fe', torch.zeros(config.max_beliefs))
+        self.register_buffer('belief_provisional_radius', torch.zeros(config.max_beliefs))
+
+        # ── MESU Precision Variance (A2: Bayesian Metaplasticity) ──
+        # Per-belief uncertainty about its own precision. High variance → high
+        # plasticity (willing to change), low variance → resists updates.
+        # Windowed posterior: reinforcement_count caps how much variance can shrink.
+        # Reference: MESU (arXiv:2312.10153, Nature Comms 2025)
+        # Reference: Palimpsa (arXiv:2602.09075) — MESU for attention states
+        self.register_buffer('belief_precision_var', torch.ones(config.max_beliefs))
+        self.register_buffer(
+            'belief_reinforcement_count', torch.zeros(config.max_beliefs, dtype=torch.long)
+        )
+
         # ── Causal Learning ──
         # Previous step's per-belief surprise (for temporal precedence detection)
         self.register_buffer(
@@ -236,7 +259,8 @@ class CognitiveState(nn.Module):
         return self.get_active_mask().sum().item()
 
     def allocate_belief(self, belief_vector: Tensor, source_type: int = 0,
-                        source_ids: list[int] | None = None, step: int = 0) -> int:
+                        source_ids: list[int] | None = None, step: int = 0,
+                        provisional: bool = False, current_fe: float = 0.0) -> int:
         """Allocate a new belief in the first empty slot.
 
         Args:
@@ -244,6 +268,8 @@ class CognitiveState(nn.Module):
             source_type: provenance type (0=observation, 1=merge, 2=promotion, 3=ttt_update)
             source_ids: optional list of up to 4 source belief indices
             step: current training/inference step for creation metadata
+            provisional: if True, mark as tentative (evaluated after K steps)
+            current_fe: current global free energy (for provisional evaluation)
 
         Returns:
             slot index, or -1 if full
@@ -263,10 +289,23 @@ class CognitiveState(nn.Module):
             if source_ids:
                 for i, sid in enumerate(source_ids[:4]):
                     self.belief_sources[slot, i] = sid
+            # A1: Tentative belief tracking
+            self.belief_provisional[slot] = provisional
+            if provisional:
+                self.belief_provisional_step[slot] = float(step)
+                self.belief_provisional_fe[slot] = current_fe
+                self.belief_provisional_radius[slot] = belief_vector.norm().item()
+            # A2: MESU — new beliefs start with high variance (uncertain)
+            self.belief_precision_var[slot] = 1.0
+            self.belief_reinforcement_count[slot] = 0
         return slot
 
     def touch_beliefs(self, indices: Tensor, step: int):
         """Update recency tracking for accessed beliefs.
+
+        A1: Provisional beliefs update recency but do NOT increment access_count.
+        This prevents tentative hypotheses from building reinforcement before
+        they've been evaluated. Only committed beliefs accumulate access credit.
 
         Args:
             indices: [N] long tensor of belief indices that were accessed
@@ -276,7 +315,11 @@ class CognitiveState(nn.Module):
             return
         with torch.no_grad():
             self.belief_last_accessed[indices] = float(step)
-            self.belief_access_count[indices] += 1
+            # Only increment access count for non-provisional beliefs
+            committed = ~self.belief_provisional[indices]
+            if committed.any():
+                committed_indices = indices[committed]
+                self.belief_access_count[committed_indices] += 1
 
     def deallocate_belief(self, index: int):
         """Free a belief slot (set to zero)."""
@@ -291,6 +334,14 @@ class CognitiveState(nn.Module):
             self.belief_source_type[index] = 0
             self.belief_created_step[index] = 0.0
             self.belief_lr_scale[index] = 1.0
+            # A1: Clear provisional tracking
+            self.belief_provisional[index] = False
+            self.belief_provisional_step[index] = 0.0
+            self.belief_provisional_fe[index] = 0.0
+            self.belief_provisional_radius[index] = 0.0
+            # A2: Reset MESU variance
+            self.belief_precision_var[index] = 1.0
+            self.belief_reinforcement_count[index] = 0
 
     def promote_belief(self, index: int):
         """Promote a belief to the next abstraction level based on evidence.
@@ -540,6 +591,12 @@ class CognitiveState(nn.Module):
             'belief_source_type': self.belief_source_type.clone(),
             'belief_created_step': self.belief_created_step.clone(),
             'belief_lr_scale': self.belief_lr_scale.clone(),
+            'belief_provisional': self.belief_provisional.clone(),
+            'belief_provisional_step': self.belief_provisional_step.clone(),
+            'belief_provisional_fe': self.belief_provisional_fe.clone(),
+            'belief_provisional_radius': self.belief_provisional_radius.clone(),
+            'belief_precision_var': self.belief_precision_var.clone(),
+            'belief_reinforcement_count': self.belief_reinforcement_count.clone(),
             'goal_status_logits': self.goal_status_logits.clone(),
             'meta_params': self.meta_params.state_dict(),
             'running_stats': {k: v.clone() for k, v in self.running_stats._buffers.items()},
@@ -609,6 +666,14 @@ class CognitiveState(nn.Module):
                 self.belief_created_step.copy_(state['belief_created_step'])
             if 'belief_lr_scale' in state:
                 self.belief_lr_scale.copy_(state['belief_lr_scale'])
+            if 'belief_provisional' in state:
+                self.belief_provisional.copy_(state['belief_provisional'])
+                self.belief_provisional_step.copy_(state['belief_provisional_step'])
+                self.belief_provisional_fe.copy_(state['belief_provisional_fe'])
+                self.belief_provisional_radius.copy_(state['belief_provisional_radius'])
+            if 'belief_precision_var' in state:
+                self.belief_precision_var.copy_(state['belief_precision_var'])
+                self.belief_reinforcement_count.copy_(state['belief_reinforcement_count'])
             if 'goal_status_logits' in state:
                 self.goal_status_logits.copy_(state['goal_status_logits'])
             if 'meta_params' in state:
@@ -637,11 +702,14 @@ class CognitiveState(nn.Module):
         active = self.get_active_mask()
         levels = self.belief_level[active]
         level_counts = [(levels == i).sum().item() for i in range(4)]
+        n_provisional = self.belief_provisional[active].sum().item() if active.any() else 0
+        mean_var = self.belief_precision_var[active].mean().item() if active.any() else 1.0
         return (
             f"CognitiveState: "
             f"{self.num_active_beliefs()}/{self.config.max_beliefs} beliefs "
-            f"(L0:{level_counts[0]} L1:{level_counts[1]} L2:{level_counts[2]} L3:{level_counts[3]}), "
+            f"(L0:{level_counts[0]} L1:{level_counts[1]} L2:{level_counts[2]} L3:{level_counts[3]}, "
+            f"prov:{n_provisional}), "
             f"{self.num_active_edges()}/{self.config.max_edges} edges, "
             f"{self.num_active_goals()}/{self.config.max_goals} goals, "
-            f"β={self.beta:.3f}"
+            f"β={self.beta:.3f}, σ²={mean_var:.3f}"
         )

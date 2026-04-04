@@ -426,6 +426,11 @@ def train(
             gathered_candidates = unpack_candidates(packed, belief_dim)
             read_indices = list(set(all_read_indices))
 
+            # Extract current FE for provisional belief evaluation (A1)
+            _current_fe = result.get('loss_fe_bethe', result.get('loss_fe', 0.0))
+            if isinstance(_current_fe, torch.Tensor):
+                _current_fe = _current_fe.item()
+
             pass2_stats = run_pass2(
                 state=base_model.state,
                 candidates=gathered_candidates,
@@ -434,6 +439,7 @@ def train(
                 is_sequence_boundary=has_boundary,
                 total_steps=max_steps,
                 belief_advantage=belief_advantage_ema,
+                current_fe=_current_fe,
             )
         else:
             pass2_stats = {
@@ -535,6 +541,23 @@ def train(
                     log_dict['cognitive/max_radius'] = _ar.max().item()
                 log_dict['cognitive/active_edges'] = _state.num_active_edges()
                 log_dict['cognitive/active_goals'] = _state.num_active_goals()
+
+                # A1: Provisional belief tracking
+                if hasattr(_state, 'belief_provisional'):
+                    _prov = _state.belief_provisional[_active].sum().item() if _active.any() else 0
+                    log_dict['cognitive/provisional_count'] = _prov
+                    log_dict['provisional/promoted'] = pass2_stats.get('provisional_promoted', 0)
+                    log_dict['provisional/evicted'] = pass2_stats.get('provisional_evicted', 0)
+
+                # A2: MESU precision variance
+                if hasattr(_state, 'belief_precision_var') and _active.any():
+                    _vars = _state.belief_precision_var[_active]
+                    log_dict['mesu/mean_variance'] = _vars.mean().item()
+                    log_dict['mesu/min_variance'] = _vars.min().item()
+                    log_dict['mesu/max_variance'] = _vars.max().item()
+
+                # A3: Cascade revision
+                log_dict['cascade/beliefs_decayed'] = pass2_stats.get('cascade_beliefs_decayed', 0)
 
             if hasattr(base_model, 'log_sigma'):
                 for sname, sparam in base_model.log_sigma.items():

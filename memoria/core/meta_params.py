@@ -115,6 +115,42 @@ class MetaParams(nn.Module):
         # softplus(1.0) ≈ 1.313 → symmetric with epistemic at start
         self._efe_risk_weight = nn.Parameter(torch.tensor(1.0))
 
+        # ── A1: Tentative Belief Mode ──
+        # Evaluation window: how many steps before evaluating provisional beliefs.
+        # softplus(2.0) ≈ 2.127 → we want ~10 steps; softplus(9.99) ≈ 10.0
+        self._provisional_eval_window = nn.Parameter(torch.tensor(9.99))
+        # FE improvement threshold: FE must decrease by this fraction to promote.
+        # sigmoid(0.0) = 0.5 → multiply by 0.2 → 0.1 initial threshold (10% FE decrease)
+        self._provisional_fe_threshold = nn.Parameter(torch.tensor(0.0))
+        # Precision retention: belief must retain this fraction of initial radius.
+        # sigmoid(1.386) ≈ 0.8 → belief must keep 80% of its initial precision
+        self._provisional_precision_retention = nn.Parameter(torch.tensor(1.386294))
+
+        # ── A2: MESU Precision Variance ──
+        # Min variance floor: prevents overconfidence.
+        # softplus(-4.6) ≈ 0.01 → minimum variance of 0.01
+        self._mesu_min_variance = nn.Parameter(torch.tensor(-4.595120))
+        # Variance shrink rate: how fast variance decreases per observation.
+        # sigmoid(-0.847) ≈ 0.3 → variance shrinks by gain^2 * 0.3 per update
+        self._mesu_variance_shrink = nn.Parameter(torch.tensor(-0.847298))
+        # Reinforcement window: max observations before variance floor kicks in.
+        # softplus(3.16) ≈ 32 steps
+        self._mesu_window_size = nn.Parameter(torch.tensor(3.434818))
+        # Variance gain boost: how much high variance amplifies gain.
+        # softplus(0.693) ≈ 1.0 → gain multiplied by (1 + variance * 1.0)
+        self._mesu_gain_boost = nn.Parameter(torch.tensor(0.693147))
+
+        # ── A3: Causal Cascade Revision ──
+        # Base decay factor per hop in the causal graph.
+        # sigmoid(-0.405) ≈ 0.4 → 40% precision decay per hop
+        self._cascade_decay_factor = nn.Parameter(torch.tensor(-0.405465))
+        # Max cascade depth: how many hops to propagate.
+        # softplus(0.693) ≈ 1.0 → multiplied by 3 → 3 hops default
+        self._cascade_max_depth = nn.Parameter(torch.tensor(0.693147))
+        # Variance increase per hop: how much downstream variance grows.
+        # softplus(-0.693) ≈ 0.5 → add 0.5 * decay_per_hop to downstream variance
+        self._cascade_variance_boost = nn.Parameter(torch.tensor(-0.693147))
+
     # ---------------------------------------------------------------------- #
     # Properties — apply activation to yield constrained values               #
     # ---------------------------------------------------------------------- #
@@ -218,3 +254,59 @@ class MetaParams(nn.Module):
     def efe_risk_weight(self) -> torch.Tensor:
         """Weight on the risk term in EFE. Range: (0, inf)."""
         return F.softplus(self._efe_risk_weight)
+
+    # ── A1: Tentative Belief Mode ──
+
+    @property
+    def provisional_eval_window(self) -> torch.Tensor:
+        """Steps before evaluating provisional beliefs. Range: (0, inf)."""
+        return F.softplus(self._provisional_eval_window)
+
+    @property
+    def provisional_fe_threshold(self) -> torch.Tensor:
+        """Required fractional FE decrease for provisional promotion. Range: (0, 0.2)."""
+        return torch.sigmoid(self._provisional_fe_threshold) * 0.2
+
+    @property
+    def provisional_precision_retention(self) -> torch.Tensor:
+        """Min fraction of initial radius to retain for promotion. Range: (0, 1)."""
+        return torch.sigmoid(self._provisional_precision_retention)
+
+    # ── A2: MESU Precision Variance ──
+
+    @property
+    def mesu_min_variance(self) -> torch.Tensor:
+        """Floor for belief precision variance. Range: (0, inf)."""
+        return F.softplus(self._mesu_min_variance)
+
+    @property
+    def mesu_variance_shrink(self) -> torch.Tensor:
+        """Shrink rate for variance per observation. Range: (0, 1)."""
+        return torch.sigmoid(self._mesu_variance_shrink)
+
+    @property
+    def mesu_window_size(self) -> torch.Tensor:
+        """Max reinforcement count before variance floor. Range: (0, inf)."""
+        return F.softplus(self._mesu_window_size) * 10.0
+
+    @property
+    def mesu_gain_boost(self) -> torch.Tensor:
+        """How much high variance amplifies gain. Range: (0, inf)."""
+        return F.softplus(self._mesu_gain_boost)
+
+    # ── A3: Causal Cascade Revision ──
+
+    @property
+    def cascade_decay_factor(self) -> torch.Tensor:
+        """Precision decay fraction per causal hop. Range: (0, 1)."""
+        return torch.sigmoid(self._cascade_decay_factor)
+
+    @property
+    def cascade_max_depth(self) -> torch.Tensor:
+        """Maximum hops for cascade propagation. Range: (0, inf). Use int(3 * x)."""
+        return F.softplus(self._cascade_max_depth)
+
+    @property
+    def cascade_variance_boost(self) -> torch.Tensor:
+        """Variance increase per hop during cascade. Range: (0, inf)."""
+        return F.softplus(self._cascade_variance_boost)

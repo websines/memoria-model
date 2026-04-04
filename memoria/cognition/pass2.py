@@ -33,6 +33,8 @@ from .hebbian import extract_co_activations
 from .consolidation import soft_consolidation, periodic_hard_cleanup
 from .meta_learning import compute_beta
 from .sleep import SleepGate, run_sleep_cycle, run_dream_phase
+from .provisional import evaluate_provisional_beliefs
+from .cascade_revision import cascade_revision
 
 
 class Pass2Probe(nn.Module):
@@ -91,6 +93,7 @@ def run_pass2(
     is_sequence_boundary: bool = True,
     total_steps: int = 1,
     belief_advantage: float = 0.0,
+    current_fe: float = 0.0,
 ) -> dict:
     """Structural cleanup pass after gradient-based updates.
 
@@ -106,7 +109,7 @@ def run_pass2(
         is_sequence_boundary: whether we're at a sequence boundary
         total_steps: total training steps (for temperature annealing)
         belief_advantage: current belief advantage for controller reward
-
+        current_fe: current global free energy (for provisional evaluation)
 
     Returns:
         dict with statistics
@@ -197,16 +200,58 @@ def run_pass2(
     # Collect indices for edge creation + per-belief adaptive LR
     updated_indices = []
     surprise_values = []
+    reconsolidated_indices = []
     for sr in surprise_results:
         if sr.slot >= 0:
             updated_indices.append(sr.slot)
             surprise_values.append(sr.surprise)
+            if sr.should_reconsolidate and not sr.is_new:
+                reconsolidated_indices.append(sr.slot)
 
-    # ── 2b. Per-belief adaptive LR update (RWKV-7) ──
+    # ── 2b-i. A2: MESU — update precision variance for matched beliefs ──
+    # Observations reduce uncertainty about a belief's precision.
+    # High gain → large variance reduction. Windowed posterior prevents
+    # variance from collapsing to zero.
+    if updated_indices:
+        with torch.no_grad():
+            min_var = state.meta_params.mesu_min_variance.item()
+            shrink_rate = state.meta_params.mesu_variance_shrink.item()
+            window_size = int(state.meta_params.mesu_window_size.item())
+            for sr in surprise_results:
+                if sr.slot >= 0 and not sr.is_new:
+                    idx = sr.slot
+                    var = state.belief_precision_var[idx].item()
+                    # Variance shrinks proportional to gain^2
+                    new_var = var * (1.0 - sr.gain ** 2 * shrink_rate)
+                    # Window: if too many reinforcements, floor is raised
+                    count = state.belief_reinforcement_count[idx].item()
+                    effective_floor = min_var * (1.0 + max(0, count - window_size) / window_size)
+                    state.belief_precision_var[idx] = max(new_var, effective_floor)
+                    state.belief_reinforcement_count[idx] += 1
+        stats['mesu_variance_updates'] = sum(
+            1 for sr in surprise_results if sr.slot >= 0 and not sr.is_new
+        )
+
+    # ── 2b-ii. A3: Causal cascade revision ──
+    # When beliefs are reconsolidated (high surprise), propagate precision
+    # decay to downstream beliefs in the causal graph.
+    if reconsolidated_indices:
+        cascade_stats = cascade_revision(state, reconsolidated_indices)
+        stats['cascade_beliefs_decayed'] = cascade_stats['beliefs_decayed']
+        stats['cascade_total_decay'] = cascade_stats['total_decay']
+        stats['cascade_max_depth'] = cascade_stats['max_depth_reached']
+    else:
+        stats['cascade_beliefs_decayed'] = 0
+
+    # ── 2b. Per-belief adaptive LR update (RWKV-7 + MESU variance boost) ──
     if updated_indices:
         idx_t = torch.tensor(updated_indices, device=state.beliefs.device)
         surp_t = torch.tensor(surprise_values, device=state.beliefs.device)
         state.update_belief_lr_scale(idx_t, surp_t)
+        # A2: Boost LR for high-variance beliefs (uncertain → learn faster)
+        with torch.no_grad():
+            var_boost = (1.0 + state.belief_precision_var[idx_t]).sqrt()
+            state.belief_lr_scale[idx_t] *= var_boost
         stats['beliefs_lr_updated'] = len(updated_indices)
 
     # ── 2c. Confidence propagation through source chains (MemOS) ──
@@ -319,6 +364,14 @@ def run_pass2(
     })
 
     state.telos.anneal_temperature(current_step, total_steps)
+
+    # ── 6b. A1: Evaluate provisional beliefs (internal autoresearch loop) ──
+    # Every step, check if any provisional beliefs have passed their evaluation
+    # window. Promote winners, evict losers.
+    prov_stats = evaluate_provisional_beliefs(state, current_step, current_fe)
+    stats['provisional_promoted'] = prov_stats['promoted']
+    stats['provisional_evicted'] = prov_stats['evicted']
+    stats['provisional_pending'] = prov_stats['still_provisional']
 
     # ── 7. Belief promotion (SDFT-inspired abstraction hierarchy) ──
     # Check all updated beliefs for promotion eligibility. Cheap: just compares

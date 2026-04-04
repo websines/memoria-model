@@ -115,6 +115,19 @@ def soft_consolidation(
             state.beliefs.data[idx_i] = new_angle * new_radius
             state.beliefs.data[idx_j].zero_()  # free slot
 
+            # A2: MESU — merge precision variances.
+            # Combined variance = harmonic mean (two independent estimates reduce uncertainty).
+            var_i = state.belief_precision_var[idx_i].item()
+            var_j = state.belief_precision_var[idx_j].item()
+            combined_var = (var_i * var_j) / max(var_i + var_j, 1e-10)
+            min_var = state.meta_params.mesu_min_variance.item()
+            state.belief_precision_var[idx_i] = max(combined_var, min_var)
+            # Combined reinforcement count
+            state.belief_reinforcement_count[idx_i] = max(
+                state.belief_reinforcement_count[idx_i].item(),
+                state.belief_reinforcement_count[idx_j].item(),
+            )
+
             # SDFT-inspired abstraction metadata: merged belief is promoted one level.
             if hasattr(state, 'belief_level'):
                 new_level = min(

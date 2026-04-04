@@ -23,10 +23,11 @@ class SurpriseResult:
     """Result of surprise computation for a single write candidate."""
     slot: int                  # belief slot index (-1 if new)
     surprise: float            # prediction_error × observation_precision
-    gain: float                # Kalman-like gain: how much to shift
+    gain: float                # Kalman-like gain: how much to shift (MESU-modulated)
     should_reconsolidate: bool # gain > threshold → full rewrite
     observation: Tensor        # the observation vector
     is_new: bool               # no matching belief found
+    mesu_gain_raw: float = 0.0 # pre-MESU gain (for diagnostics)
 
 
 def compute_surprise_batch(
@@ -62,6 +63,7 @@ def compute_surprise_batch(
     # Pre-allocate result arrays on CPU
     surprise_out = torch.zeros(N)
     gain_out = torch.full((N,), 1.0)
+    gain_raw_out = torch.full((N,), 1.0)  # A2: pre-MESU gain for diagnostics
     recon_out = torch.ones(N, dtype=torch.bool)  # default True (for new)
     is_new_out = torch.ones(N, dtype=torch.bool)  # default True
     slot_out = slots.cpu().clone()
@@ -100,9 +102,19 @@ def compute_surprise_batch(
             cos_sim = (existing_angles * obs_angles).sum(dim=-1).clamp(-1.0, 1.0)
             pred_error = 1.0 - cos_sim  # [V], range [0, 2]
 
-            # Kalman-like gain
+            # Kalman-like gain (base)
             total_precision = v_existing_radii + v_obs_radii
-            gain = v_obs_radii / total_precision  # [V]
+            gain_raw = v_obs_radii / total_precision  # [V]
+
+            # ── A2: MESU — modulate gain by precision variance ──
+            # High variance → belief is uncertain → amplify gain (more willing to change)
+            # Low variance → belief is confident → dampen gain (resists updates)
+            # Reference: MESU (arXiv:2312.10153), Palimpsa (arXiv:2602.09075)
+            v_matched_slots = matched_slots[v_idx]
+            precision_var = state.belief_precision_var[v_matched_slots]
+            gain_boost = state.meta_params.mesu_gain_boost.item()
+            mesu_factor = (1.0 + precision_var * gain_boost).clamp(max=3.0)
+            gain = (gain_raw * mesu_factor).clamp(max=1.0)
 
             # Surprise
             surprise = pred_error * v_obs_radii  # [V]
@@ -114,6 +126,9 @@ def compute_surprise_batch(
             recon_out[global_idx] = (gain > reconsolidation_threshold).cpu()
             is_new_out[global_idx] = False
 
+            # Store raw gain for diagnostics
+            gain_raw_out[global_idx] = gain_raw.cpu()
+
     # Build result list (cheap — just reads from pre-computed tensors)
     results = []
     for i in range(N):
@@ -124,6 +139,7 @@ def compute_surprise_batch(
             should_reconsolidate=recon_out[i].item(),
             observation=obs_all[i],
             is_new=is_new_out[i].item(),
+            mesu_gain_raw=gain_raw_out[i].item(),
         ))
 
     return results
