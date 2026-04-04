@@ -31,6 +31,7 @@ from ..model.pretrained_model import PretrainedMemoriaModel
 from ..cognition.pass2 import run_pass2
 from ..data.tokenizer import get_tokenizer
 from ..data.interleave import interleaved_stream
+from ..data.curated import curated_stream
 from ..data.streaming import stream_fineweb_edu
 from ..data.synthetic import generate_all_synthetic
 from .optimizer import setup_optimizer
@@ -244,12 +245,17 @@ def train(
             print(f"Resuming data stream (skipping ~{skip_docs} documents via HF skip)...")
         else:
             print("Starting data stream...")
-    data_stream = interleaved_stream(
+
+    # Curated multi-tier mix for all modes: state-essential + reasoning + tool calling.
+    # The cognitive state needs state-demanding data regardless of whether the
+    # backbone is pretrained or trained from scratch.
+    if is_main:
+        print("Using curated dataset mix (state-essential + reasoning + tool calling)")
+    data_stream = curated_stream(
         tokenizer,
         seq_len=config.transformer.sequence_len,
-        weights=(0.7, 0.2, 0.1),
         synthetic_data=synthetic_data if synthetic_data else None,
-        stack_languages=["python", "javascript", "rust", "go"],
+        code_languages=["python", "javascript", "rust", "go"],
         skip_documents=skip_docs,
     )
 

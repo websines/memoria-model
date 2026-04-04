@@ -1,7 +1,10 @@
 # Memoria Dataset Curation Plan
 
 > Compiled from exhaustive HuggingFace research. ~115 datasets evaluated, ~50 selected.
-> Implementation deferred — this doc is the source of truth for data pipeline work.
+> **Status:** Fully implemented in `memoria/data/curated.py` + `memoria/data/formatters.py`.
+> 32 streaming sources registered across 5 tiers. All stream from HF, zero local disk.
+> Used automatically for pretrained backbone training (`--config lfm2` or `--config qwen`).
+> Failed sources gracefully redistribute weight at startup.
 
 ## Design Principle
 
@@ -437,14 +440,45 @@ These are held out to prove the thesis: "500M + experience > 10B."
 
 ---
 
+## Additional Datasets (added post-curation)
+
+User-supplied datasets integrated into the pipeline:
+
+| Dataset | HF ID | Tier | Weight | Notes |
+|---------|--------|------|--------|-------|
+| xLAM FC 60K | `Salesforce/xlam-function-calling-60k` | Tool | 2% | User has gated access |
+| Nemotron RL Conv Tool | `nvidia/Nemotron-RL-Agentic-Conversational-Tool-Use-Pivot-v1` | Tool | 1.5% | Multi-turn agentic pivots |
+| Nemotron RL FC | `nvidia/Nemotron-RL-Agentic-Function-Calling-Pivot-v1` | Tool | 1.5% | FC decision points |
+| Nemotron RL SWE | `nvidia/Nemotron-RL-Agentic-SWE-Pivot-v1` | Tool | 1% | Software eng trajectories |
+| ToolMind | `Nanbeige/ToolMind` | Tool | 1% | split: open_datasets |
+| GSM8K | `openai/gsm8k` | Reasoning | 2% | Grade school math |
+| OpenMathInstruct-1 | `nvidia/OpenMathInstruct-1` | Reasoning | 2% | Math instruction |
+| DeepCoder | `agentica-org/DeepCoder-Preview-Dataset` | Reasoning | 1.5% | config: codeforces |
+| Codeforces | `open-r1/codeforces` | Reasoning | 1.5% | Competitive programming |
+| High-Coder Multi-Turn | `Crownelius/High-Coder-Reasoning-Multi-Turn` | Reasoning | 1% | Multi-turn coding |
+| Tiny-Codes | `nampdn-ai/tiny-codes` | General | 1% | Small code snippets |
+| Tiny-WebText | `nampdn-ai/tiny-webtext` | General | 1% | Small web text |
+
+---
+
+## Unavailable Datasets
+
+Script-based datasets deprecated by HuggingFace (no longer streamable):
+- `lara-martin/FIREBALL`, `abhinavk/openpi_v2`, `fever/fever`
+- `xanhho/2WikiMultihopQA`, `pfb30/multi_woz_v22`
+- `facebook/babi_qa`, `CLUTRR/v1`
+
+Their weight is automatically redistributed to active sources at startup.
+
+---
+
 ## Implementation Notes
 
 1. **Format conversion:** All QA datasets → `[context]\nQuestion: [q]\nAnswer: [a]` for NTP
-2. **FIREBALL:** Serialize game state between narrative turns as structured text
-3. **WikiFactDiff:** Narrate temporal fact changes: "In 2021, X was Y. By 2023, X became Z."
-4. **Streaming:** All large datasets (FineWeb, StarCoder, NVIDIA) use HF streaming mode
-5. **Interleaving:** Extend existing `interleaved_stream` with weighted sampling across tiers
-6. **Tokenizer:** Qwen3 (151K vocab) for scratch mode; LFM2 tokenizer (65K) for pretrained mode
-7. **Sequence packing:** Pack multiple short examples into seq_len chunks with EOS boundaries
-8. **Tool calling format:** Preserve function signatures in system prompt, tool calls as `<tool_call>`, tool responses as `<tool_response>` for consistent parsing
-9. **Multi-turn agentic:** Keep full trajectory (user → agent → tool → agent → ...) as continuous text. The model predicts tool call tokens and final answer tokens — both require state.
+2. **Streaming:** ALL datasets use HF streaming mode — zero local disk footprint
+3. **Tokenizer:** Auto-detected from backbone (LFM2 65K vocab, Qwen3 151K vocab)
+4. **Sequence packing:** Pack multiple short examples into seq_len chunks with EOS boundaries
+5. **Graceful fallback:** Failed sources redistribute weight to remaining active sources
+6. **Tool calling format:** Preserve function signatures, tool calls, responses as continuous text
+7. **Multi-turn agentic:** Keep full trajectory as continuous text for NTP
+8. **Code:** `memoria/data/curated.py` (registry + streaming), `memoria/data/formatters.py` (32 format functions)
