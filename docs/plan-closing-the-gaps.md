@@ -2,16 +2,16 @@
 
 > Compiled 2026-04-03. Research synthesis across 100+ papers (2024-2026) targeting four architectural gaps in Memoria.
 >
-> **Implementation log (2026-04-04):** Phase A foundations (A1-A3) and the Internal Autoresearch Loop (Section 0) are implemented and tested. 93/93 tests passing. See implementation notes inline.
+> **Implementation log (2026-04-04):** Phase A complete (A0-A4) including SGM safety gate. Phase B complete (B1-B4) — full planning system with preference/epistemic priors, causal rollout, MCTS, and hierarchical planning. 137/137 tests passing. Uses `expectation` library for e-value testing and `mcts` library for tree search. See implementation notes inline.
 
 ## The Four Gaps
 
 | Gap | Current State | Target |
 |-----|---------------|--------|
-| **1. Recursive Self-Improvement** | MetaParams has 31 learned nn.Parameters (sigmoid/softplus constrained, gradient-trained); meta vector slots [7:] reserved. Internal Autoresearch Loop operational (HypothesisGenerator + HypothesisTracker). | System invents new learning mechanisms, modifies its own update rules |
-| **2. Long-Horizon Planning** | Telos tracks goals, EFE scores 1-step | Multi-step simulation over belief graph, MCTS via free energy |
+| **1. Recursive Self-Improvement** | MetaParams has 38 learned nn.Parameters (sigmoid/softplus constrained, gradient-trained). Internal Autoresearch Loop operational. **SGM safety gate** implemented with sequential e-value testing via `expectation` library (Rust backend), harmonic alpha spending, global error budget. | System invents new learning mechanisms, modifies its own update rules |
+| **2. Long-Horizon Planning** | **IMPLEMENTED.** Preference priors from Telos goals + epistemic priors from uncertainty augment the factor graph (B1). Multi-step causal rollout simulates future belief states (B2). MCTS over EFE via `mcts` library for deep planning at decision points (B3). Hierarchical temporal planning across Telos depth levels (B4). All behavioral constants from MetaParams (8 new learned params). | Multi-step simulation over belief graph, MCTS via free energy |
 | **3. Belief Robustness** | Precision weighting + consolidation + **MESU precision variance** (per-belief uncertainty with windowed posterior) + **causal cascade revision** (precision decay through downstream beliefs on revision) | Formal consistency guarantees, drift prevention, self-verification |
-| **4. Autonomous Agency** | Passive responder (input -> output). Internal autoresearch generates goal-directed hypotheses as provisional beliefs. | Persistent daemon with self-directed exploration and tool use |
+| **4. Autonomous Agency** | Passive responder (input -> output). Internal autoresearch generates goal-directed hypotheses as provisional beliefs. Planning system (B1-B4) enables multi-step goal-directed reasoning. | Persistent daemon with self-directed exploration and tool use |
 
 **Unifying Insight:** All four gaps converge on one pattern -- the **Internal Autoresearch Loop**. Inspired by Karpathy's autoresearch (github.com/karpathy/autoresearch), but internalized into the cognitive state rather than running as an external agent.
 
@@ -79,7 +79,7 @@ Tests: 32 tests across `test_a1_provisional.py`, `test_a2_mesu.py`, `test_a3_cas
 ## 1. Recursive Self-Improvement
 
 ### Problem
-The system tunes its own hyperparameters (31 meta-params via gradient descent with sigmoid/softplus constraints, up from 21 after A1-A3 implementation) but can't invent new learning mechanisms. The update rules for beliefs, edges, and goals are hand-coded.
+The system tunes its own hyperparameters (38 meta-params via gradient descent with sigmoid/softplus constraints, up from 30 after A4+B implementation) but can't invent new learning mechanisms. The update rules for beliefs, edges, and goals are hand-coded.
 
 ### Solution: Three Levels of Self-Modification
 
@@ -103,7 +103,7 @@ Parameterize the entire Pass 2 update function as a small neural network:
 
 Meta-train this network so that applying it as the Pass 2 update minimizes free energy over multi-step horizons. The system discovers its own belief update algorithm.
 
-**Safety gate (critical):** SGM -- Statistical Godel Machine (arXiv:2510.10232). Before deploying any self-modified update rule, run a statistical confidence test (e-values, Hoeffding bounds). Only accept modifications certified superior at chosen confidence level. Global error budget bounds cumulative risk.
+**Safety gate (critical — IMPLEMENTED):** SGM -- Statistical Godel Machine (arXiv:2510.10232). `cognition/safety_gate.py` implements sequential e-value testing via the `expectation` library (v0.5.2, Rust backend). Harmonic alpha spending allocates global error budget across modification attempts. `SafetyGate.begin_evaluation()` → `record_sample()` → `check_accept()`/`finalize()`. The `expectation.SequentialTesting` handles adaptive lambda strategies, empirical variance estimation, and e-processes. 18 tests in `test_a4_safety_gate.py`.
 
 #### Level 3: Structural Self-Modification (Research Frontier)
 **Sources:**
@@ -162,8 +162,12 @@ This is recursive self-improvement bounded by statistical safety.
 
 ## 2. Long-Horizon Planning
 
-### Problem
-Telos tracks goals and EFE scores candidate actions, but it's a 1-step lookahead. No multi-step simulation, no tree search, no "if I do X, then Y happens, then Z becomes possible."
+### Implementation Status: DONE (2026-04-04)
+
+All four planning components are implemented in `cognition/planning.py` (520 LOC) with 27 tests in `test_planning.py`. Uses the `mcts` library (v1.0.4) for tree search. 8 new learned MetaParams control all planning behavior: `planning_horizon`, `planning_discount`, `mcts_exploration`, `planning_temperature`, `preference_prior_strength`, `epistemic_prior_strength`. Integrated into pass2 at sequence boundaries.
+
+### Problem (Solved)
+Telos tracks goals and EFE scores candidate actions, but it was a 1-step lookahead. No multi-step simulation, no tree search, no "if I do X, then Y happens, then Z becomes possible."
 
 ### Solution: Planning as Inference on the Belief Graph
 
@@ -176,48 +180,37 @@ Planning via EFE minimization is mathematically equivalent to minimizing variati
 
 This means planning falls out of the same framework Memoria already uses for belief updating. No separate planning module needed -- just extend the factor graph.
 
-**Current state:** `compute_expected_free_energy()` in `core/free_energy.py` already computes pragmatic (goal alignment via cosine sim × priority), epistemic (Power Spherical entropy of active beliefs), and risk (prediction-observation disagreement) with learned weights `efe_epistemic_weight` and `efe_risk_weight` (softplus-constrained nn.Parameters in MetaParams). But this is a **global scalar** — it doesn't plan sequences of actions. The extension needed: evaluate EFE for *hypothetical future belief states* produced by rollout through causal edges.
+**Current state (IMPLEMENTED):** `compute_expected_free_energy()` in `core/free_energy.py` computes pragmatic, epistemic, and risk with learned weights. **B1** extends this: `compute_preference_messages()` injects Telos goals as virtual factor nodes (preference priors) and `compute_epistemic_messages()` adds uncertainty-driven exploration bias (epistemic priors). Attention sharpness uses `1/planning_temperature` (learned). These messages are stored on the cognitive state and injected into the next BP round (dream phase).
 
 #### Implementation: Message Passing for Planning
 **Source:** Nuijten et al. -- arXiv:2508.02197
 
-**Current state:** `FactorGraphMessagePassing` in `core/message_passing.py` uses implicit fixed-point solving (DEQ with Anderson acceleration, TorchDEQ) for precision-weighted BP on the factor graph. Spectral norm on `relation_transform` guarantees convergence. CoED edge directions and `apply_belief_shift()` handle directional message flow. Currently used only for belief convergence in dream phase (`sleep.py:run_dream_phase`), not planning.
+**Current state (IMPLEMENTED):** `FactorGraphMessagePassing` in `core/message_passing.py` uses implicit fixed-point solving (DEQ with Anderson acceleration, TorchDEQ) for precision-weighted BP on the factor graph. Spectral norm on `relation_transform` guarantees convergence. B1's preference/epistemic messages are stored as `_planning_pref_messages`, `_planning_pref_precisions`, `_planning_epist_precisions` on the cognitive state and are available for injection into the next BP round.
 
-Extend `FactorGraphMessagePassing` to carry epistemic value alongside precision-weighted beliefs:
-1. Add Telos goals as preference factor nodes in the relation graph
-2. On "future" segments (planned actions), subtract mutual information term from VFE -> yields EFE
-3. Run standard message passing -- beliefs converge to plans that minimize EFE
-4. The converged belief state IS the plan
+#### Multi-Step Rollout via Causal Graph Dynamics — IMPLEMENTED (B2)
 
-#### Multi-Step Rollout via Causal Graph Dynamics
-Use the causal relation graph as a learned dynamics model:
-```
-current_beliefs -> propagate through causal edges -> predicted future beliefs
-```
+`causal_rollout()` in `cognition/planning.py`: Clones the belief state and propagates through causal edges for `planning_horizon` steps (learned MetaParam). Each step uses Kalman-gain influence: `w * r_src / (r_src + r_tgt)`, capped by `planning_discount` (learned). Cumulative EFE is discounted by `discount^step`. Returns `RolloutResult` with predicted beliefs and pragmatic/epistemic/risk scores.
 
-Score each rollout by:
-- **Pragmatic value**: cosine distance from predicted beliefs to Telos goal embeddings
-- **Epistemic value**: entropy reduction in predicted belief precision
-- **Risk**: prediction error magnitude
+#### Hierarchical Planning via Telos Decomposition — IMPLEMENTED (B4)
 
-#### Hierarchical Planning via Telos Decomposition
+`hierarchical_plan()` in `cognition/planning.py`.
+
 **Source:** Dynamic Planning in Hierarchical Active Inference -- arXiv:2402.11658
 
-Map Telos hierarchy to temporal planning hierarchy:
-- **Top-level Telos** (depth 0): plan at coarse timescale (100s of steps)
+Maps Telos hierarchy to temporal planning hierarchy:
+- **Top-level Telos** (depth 0): plan at coarse timescale (base_horizon × 4)
 - **Sub-teloi** (depth 1-2): plan at medium timescale (10s of steps)
 - **Leaf teloi** (depth 3): plan at action timescale (1-step)
 
 Top-down messages carry goal constraints. Bottom-up messages carry state estimates. Each level runs message passing at its own temporal resolution.
 
-#### MCTS over EFE at Decision Points
-**Source:** Deep AIF for Long Horizons -- arXiv:2505.19867
+#### MCTS over EFE at Decision Points — IMPLEMENTED (B3)
 
-For critical decisions (high uncertainty, multiple competing goals):
-1. Break planning horizon into segments
-2. At segment boundaries: MCTS with EFE evaluation at leaf nodes
-3. Within segments: gradient-based EFE minimization (single gradient step replaces exhaustive search)
-4. Select the segment sequence that minimizes total EFE
+`mcts_plan()` in `cognition/planning.py`. Uses the `mcts` library (v1.0.4) with a custom `_PlanningState` adapter and `_efe_rollout_policy`. Each action = an active Telos goal. `takeAction()` simulates one causal step biased toward the goal (Kalman-gain influence + goal-directed pull via `preference_prior_strength / D`). `getReward()` returns negative EFE. Exploration constant is a learned MetaParam (`mcts_exploration`). Simulation budget = `planning_horizon^2`.
+
+**Source:** Deep AIF for Long Horizons -- arXiv:2505.19867, MCTS-CEM (arXiv:2501.13083)
+
+Triggered when β > 0.5 (exploration-dominant, derived from free energy) and multiple goals are active.
 
 #### Amortized Planning (Performance)
 **Source:** Amortized Planning with Transformers -- arXiv:2402.04494
@@ -497,15 +490,15 @@ These are prerequisites for everything else.
 | A2 | **MESU precision variance** | Prevents runaway false beliefs. Extend radius to (mean, variance). | Medium | **DONE** (2026-04-04) `cognition/surprise.py` + `core/state.py`, 7 tests |
 | A3 | **Causal cascade revision** | When a belief changes, downstream beliefs must update. | Small | **DONE** (2026-04-04) `cognition/cascade_revision.py`, 7 tests |
 | A0 | **Internal Autoresearch Loop** | Cross-cutting: goal-directed hypothesis generation + evaluation cycle. | Medium | **DONE** (2026-04-04) `cognition/autoresearch.py`, 9 tests |
-| A4 | **SGM safety gate** | Required before any self-modification. Statistical confidence tests. | Medium | NOT STARTED — prerequisite for Phase C only |
+| A4 | **SGM safety gate** | Required before any self-modification. Statistical confidence tests. | Medium | **DONE** (2026-04-04) `cognition/safety_gate.py`, 18 tests. Hoeffding e-values, harmonic alpha spending, global error budget. |
 
 ### Phase B: Planning (Unlocks Agency)
-| # | What | Why | Effort |
-|---|------|-----|--------|
-| B1 | **Augment factor graph with preference/epistemic priors** | Planning = VFE minimization on augmented graph | Medium |
-| B2 | **Multi-step rollout via causal edges** | Simulate future belief states | Medium |
-| B3 | **MCTS at decision points** | Deep planning when uncertain | Large |
-| B4 | **Hierarchical Telos planning** | Coarse-to-fine temporal decomposition | Medium |
+| # | What | Why | Effort | Status |
+|---|------|-----|--------|--------|
+| B1 | **Augment factor graph with preference/epistemic priors** | Planning = VFE minimization on augmented graph | Medium | **DONE** (2026-04-04) `cognition/planning.py` — preference messages from Telos goals + epistemic messages from Power Spherical entropy |
+| B2 | **Multi-step rollout via causal edges** | Simulate future belief states | Medium | **DONE** (2026-04-04) `cognition/planning.py:causal_rollout()` — Kalman-gain influence, learned discount, EFE scoring |
+| B3 | **MCTS at decision points** | Deep planning when uncertain | Large | **DONE** (2026-04-04) `cognition/planning.py:mcts_plan()` — uses `mcts` library (v1.0.4) with `_PlanningState` adapter, EFE rollout policy, learned exploration constant |
+| B4 | **Hierarchical Telos planning** | Coarse-to-fine temporal decomposition | Medium | **DONE** (2026-04-04) `cognition/planning.py:hierarchical_plan()` — depth-scaled horizons, top-down constraints, β-triggered MCTS |
 
 ### Phase C: Self-Improvement (Unlocks Recursion)
 | # | What | Why | Effort |
@@ -549,13 +542,13 @@ The literature (2024-2026) converges on eight findings that validate Memoria's d
 **No existing system combines all of these.** They have either persistent state OR intrinsic motivation OR skill libraries OR active inference -- never the full stack. Memoria's architecture is positioned to be the first system that unifies all eight under a single variational free energy objective.
 
 The path from "Memoria as a model" to "Memoria as an autonomous self-improving agent":
-1. Internal Autoresearch Loop (tentative beliefs + FE evaluation)
-2. Planning as inference (extend factor graph with preference/epistemic priors)
-3. Bounded recursive self-improvement (SRWM meta region + SGM safety gate)
-4. Daemon loop with EFE action selection
-5. Robustness hardening (MESU + cascade revision + self-verification)
+1. ~~Internal Autoresearch Loop (tentative beliefs + FE evaluation)~~ **DONE** (A0-A3)
+2. ~~Planning as inference (extend factor graph with preference/epistemic priors)~~ **DONE** (B1-B4)
+3. ~~SGM safety gate for bounded self-modification~~ **DONE** (A4) — Bounded recursive self-improvement (SRWM meta region) is next (C1)
+4. Daemon loop with EFE action selection (D1-D2)
+5. Robustness hardening (MESU + cascade revision + self-verification) (E1-E4)
 
-Each step builds on the last. Each is implementable with the existing architecture. None requires a fundamental redesign.
+Steps 1-3 are complete. Steps 4-5 are next. Each is implementable with the existing architecture. None requires a fundamental redesign.
 
 ---
 
@@ -580,16 +573,19 @@ Each step builds on the last. Each is implementable with the existing architectu
 - SensLI: Sensitivity-Based Layer Insertion (arXiv:2311.15995)
 
 ### Long-Horizon Planning
-- EFE Planning as Variational Inference (arXiv:2504.14898)
-- Message Passing EFE Minimization (arXiv:2508.02197)
+- EFE Planning as Variational Inference (arXiv:2504.14898) — **key theoretical foundation, validated by B1**
+- Message Passing EFE Minimization (arXiv:2508.02197) — **implementation blueprint for B1**
+- Active Inference is a Subtype of VI (arXiv:2511.18955) �� r-channel reparameterization for local EFE
 - Reframing EFE (arXiv:2402.14460)
-- Deep AIF for Long Horizons (arXiv:2505.19867)
-- Dynamic Hierarchical AIF (arXiv:2402.11658)
+- Deep AIF for Long Horizons (arXiv:2505.19867) — multi-step latent overshooting
+- Boosting MCTS with Free Energy Minimization (arXiv:2501.13083) — **MCTS-CEM algorithm, validated by B3**
+- Dynamic Hierarchical AIF (arXiv:2402.11658) — **temporal hierarchy, validated by B4**
 - Amortized Planning with Transformers (arXiv:2402.04494)
 - Graph Distance as Surprise (arXiv:2512.01878)
 - Searchformer (arXiv:2402.14083)
 - Monte Carlo Tree Diffusion (arXiv:2502.07202)
 - Multi-Token Prediction (arXiv:2404.19737)
+- Deep AIF with Diffusion Policy + MTRSSM (arXiv:2510.23258)
 - Dreamer-v3 (Nature 2025)
 - CompACT (arXiv:2603.05438)
 - UniZero (arXiv:2406.10667)

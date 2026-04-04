@@ -151,6 +151,34 @@ class MetaParams(nn.Module):
         # softplus(-0.693) ≈ 0.5 → add 0.5 * decay_per_hop to downstream variance
         self._cascade_variance_boost = nn.Parameter(torch.tensor(-0.693147))
 
+        # ── A4: SGM Safety Gate ──
+        # Confidence level for accepting self-modifications.
+        # sigmoid(2.944) ≈ 0.95 → require 95% confidence
+        self._sgm_confidence = nn.Parameter(torch.tensor(2.944439))
+        # Rejection patience: how many samples before giving up on a bad modification.
+        # softplus(2.3) ≈ 10 samples minimum
+        self._sgm_min_samples = nn.Parameter(torch.tensor(2.302585))
+
+        # ── B1-B4: Planning ──
+        # Planning horizon: how many causal steps to simulate ahead.
+        # softplus(1.6) ≈ 5 steps
+        self._planning_horizon = nn.Parameter(torch.tensor(1.609438))
+        # Temporal discount: how much to discount future EFE per step.
+        # sigmoid(1.386) ≈ 0.8 → 20% discount per step
+        self._planning_discount = nn.Parameter(torch.tensor(1.386294))
+        # MCTS exploration constant (UCB-style).
+        # softplus(0.0) ≈ 0.693 → sqrt(2)/2 ≈ standard UCB1
+        self._mcts_exploration = nn.Parameter(torch.tensor(0.0))
+        # Planning temperature for action selection softmax.
+        # softplus(0.0) ≈ 0.693
+        self._planning_temperature = nn.Parameter(torch.tensor(0.0))
+        # Preference prior strength: how strongly goals pull the factor graph.
+        # softplus(0.0) ≈ 0.693
+        self._preference_prior_strength = nn.Parameter(torch.tensor(0.0))
+        # Epistemic prior strength: how strongly uncertainty drives exploration.
+        # softplus(0.0) ≈ 0.693
+        self._epistemic_prior_strength = nn.Parameter(torch.tensor(0.0))
+
     # ---------------------------------------------------------------------- #
     # Properties — apply activation to yield constrained values               #
     # ---------------------------------------------------------------------- #
@@ -310,3 +338,47 @@ class MetaParams(nn.Module):
     def cascade_variance_boost(self) -> torch.Tensor:
         """Variance increase per hop during cascade. Range: (0, inf)."""
         return F.softplus(self._cascade_variance_boost)
+
+    # ── A4: SGM Safety Gate ──
+
+    @property
+    def sgm_confidence(self) -> torch.Tensor:
+        """Confidence level for accepting self-modifications. Range: (0, 1)."""
+        return torch.sigmoid(self._sgm_confidence)
+
+    @property
+    def sgm_min_samples(self) -> torch.Tensor:
+        """Minimum samples before rejecting a modification. Range: (0, inf)."""
+        return F.softplus(self._sgm_min_samples)
+
+    # ── B1-B4: Planning ──
+
+    @property
+    def planning_horizon(self) -> torch.Tensor:
+        """Number of causal steps to simulate ahead. Range: (0, inf)."""
+        return F.softplus(self._planning_horizon)
+
+    @property
+    def planning_discount(self) -> torch.Tensor:
+        """Temporal discount for future EFE per step. Range: (0, 1)."""
+        return torch.sigmoid(self._planning_discount)
+
+    @property
+    def mcts_exploration(self) -> torch.Tensor:
+        """MCTS UCB exploration constant. Range: (0, inf)."""
+        return F.softplus(self._mcts_exploration)
+
+    @property
+    def planning_temperature(self) -> torch.Tensor:
+        """Softmax temperature for planning action selection. Range: (0, inf)."""
+        return F.softplus(self._planning_temperature)
+
+    @property
+    def preference_prior_strength(self) -> torch.Tensor:
+        """How strongly Telos goals pull the factor graph. Range: (0, inf)."""
+        return F.softplus(self._preference_prior_strength)
+
+    @property
+    def epistemic_prior_strength(self) -> torch.Tensor:
+        """How strongly uncertainty drives exploration planning. Range: (0, inf)."""
+        return F.softplus(self._epistemic_prior_strength)

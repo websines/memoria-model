@@ -233,6 +233,18 @@ class CognitiveState(nn.Module):
         self.hypothesis_gen = HypothesisGenerator(belief_dim=config.belief_dim)
         self.hypothesis_tracker = HypothesisTracker(max_goals=config.max_goals)
 
+        # ── A4: SGM Safety Gate ──
+        from ..cognition.safety_gate import SafetyGate
+        self.safety_gate = SafetyGate(global_alpha=0.05, max_modifications=100)
+
+        # ── B1-B4: Planning priors (populated by planning step) ──
+        self.register_buffer('_planning_pref_messages',
+                             torch.zeros(config.max_beliefs, config.belief_dim))
+        self.register_buffer('_planning_pref_precisions',
+                             torch.zeros(config.max_beliefs))
+        self.register_buffer('_planning_epist_precisions',
+                             torch.zeros(config.max_beliefs))
+
     # ── Belief Region Accessors ──
 
     def get_belief_radii(self) -> Tensor:
@@ -618,6 +630,15 @@ class CognitiveState(nn.Module):
                 'hypothesis_evicted': self.hypothesis_tracker.hypothesis_evicted.clone(),
                 'goal_success_ema': self.hypothesis_tracker.goal_success_ema.clone(),
             },
+            'safety_gate': {
+                'alpha_spent_total': self.safety_gate.alpha_spent_total.clone(),
+                'n_modifications': self.safety_gate.n_modifications.clone(),
+                'n_accepted': self.safety_gate.n_accepted.clone(),
+                'n_rejected': self.safety_gate.n_rejected.clone(),
+            },
+            '_planning_pref_messages': self._planning_pref_messages.clone(),
+            '_planning_pref_precisions': self._planning_pref_precisions.clone(),
+            '_planning_epist_precisions': self._planning_epist_precisions.clone(),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -714,6 +735,16 @@ class CognitiveState(nn.Module):
                 self.hypothesis_tracker.hypothesis_promoted.copy_(ht['hypothesis_promoted'])
                 self.hypothesis_tracker.hypothesis_evicted.copy_(ht['hypothesis_evicted'])
                 self.hypothesis_tracker.goal_success_ema.copy_(ht['goal_success_ema'])
+            if 'safety_gate' in state:
+                sg = state['safety_gate']
+                self.safety_gate.alpha_spent_total.copy_(sg['alpha_spent_total'])
+                self.safety_gate.n_modifications.copy_(sg['n_modifications'])
+                self.safety_gate.n_accepted.copy_(sg['n_accepted'])
+                self.safety_gate.n_rejected.copy_(sg['n_rejected'])
+            if '_planning_pref_messages' in state:
+                self._planning_pref_messages.copy_(state['_planning_pref_messages'])
+                self._planning_pref_precisions.copy_(state['_planning_pref_precisions'])
+                self._planning_epist_precisions.copy_(state['_planning_epist_precisions'])
 
     # ── Summary ──
 

@@ -36,6 +36,7 @@ from .sleep import SleepGate, run_sleep_cycle, run_dream_phase
 from .provisional import evaluate_provisional_beliefs
 from .cascade_revision import cascade_revision
 from .autoresearch import run_autoresearch_step
+from .planning import run_planning_step
 
 
 class Pass2Probe(nn.Module):
@@ -451,6 +452,15 @@ def run_pass2(
             mp_result = state.message_passing(state)
             shifted = apply_belief_shift(state, mp_result['messages'], mp_result['precisions'])
             stats['beliefs_shifted'] = len(shifted)
+
+    # ── 10. Planning step (B1-B4) ──
+    # Run at sequence boundaries when there are active goals and beliefs.
+    # Planning computes preference/epistemic priors, causal rollouts,
+    # and optionally MCTS for multi-goal decisions.
+    if (is_sequence_boundary and state.num_active_goals() > 0
+            and state.num_active_beliefs() > 0):
+        planning_stats = run_planning_step(state, current_step)
+        stats['planning'] = planning_stats
 
     stats['active_beliefs'] = state.num_active_beliefs()
     stats['active_edges'] = state.num_active_edges()
