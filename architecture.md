@@ -1,5 +1,18 @@
 # Memoria Training Architecture
 
+## Thesis
+
+Every AI system today has amnesia. Every conversation resets to zero. Every "memory" system is the same trick: stuff retrieved text into the prompt. The model itself never changes, never learns, never adapts.
+
+Memoria's thesis: a model with the right *architecture* — persistent memory, causal graphs, active inference, self-improvement — can punch above its weight class against models 10-100× larger. The scaling law has a massive architectural constant that nobody is optimizing.
+
+```
+Industry bet:    capability ∝ N^0.076    (more params = more capability)
+Memoria's bet:   capability ∝ N^0.076 × f(architecture, state, experience)
+```
+
+Where `f()` might be worth 1000× of raw parameters.
+
 ## Overview
 
 Memoria is a hybrid transformer-cognitive architecture that combines a language model backbone with a persistent, evolving cognitive state (beliefs, edges, goals). The system implements active inference: the model minimizes free energy by maintaining an internal world model that tracks entities, causal relations, and goals across arbitrarily long contexts.
@@ -84,6 +97,187 @@ Input tokens [B, T]
        ▼
    Loss computation (inside forward)
 ```
+
+## Backbone Components
+
+### Layer Types ("MMMML" Pattern)
+
+The `window_pattern` string defines per-layer architecture. Default "MMMML" = 4 Mamba-2 + 1 MLA per 5-layer cycle.
+
+| Type | Class | Scaling | When to use |
+|------|-------|---------|-------------|
+| **M** (Mamba-2) | `MambaBlock` | O(T) linear | Default — handles recurrent long-range memory |
+| **S** (Sliding Window) | `SlidingWindowAttention` | O(T×W) | Legacy — local attention with RotorQuant KV compression |
+| **L** (MLA Global) | `MLACausalSelfAttention` | O(T²) or O(T×W) | Periodic dense attention with latent KV compression |
+
+### Mamba-2 (M layers)
+
+Wraps `mamba_ssm.Mamba2` — selective state space model with input-dependent gating:
+
+```
+h_t = (1 - Δ·σ(B_t)) × h_{t-1} + Δ·σ(B_t) × (A × x_t)
+```
+
+- `d_state=64`: SSM latent dimension (selective scan state)
+- `d_conv=4`: local convolution width (captures immediate context)
+- `expand=2`: inner dimension = 2 × d_model
+- **No KV cache**: recurrent state is fixed size (~400 KB total across all M layers)
+- **No RoPE needed**: sequence ordering implicit in recurrence
+- Drop-in replacement for attention: `[B, T, D] → [B, T, D]`
+
+### MLA (L layers) — Multi-Head Latent Attention
+
+DeepSeek V3-style compressed attention with decoupled RoPE:
+
+```
+x → c_kv_compress → latent [B, T, d_latent]     (position-invariant, cacheable)
+latent → k_up → K_nope [B, T, n_kv, head_dim - d_rope]   (content keys)
+x → c_k_rope → K_rope [B, T, n_kv, d_rope]               (positional keys, small)
+K = cat(K_rope_with_RoPE, K_nope)                          (full key)
+latent → v_up → V [B, T, n_kv, head_dim]                  (values)
+```
+
+- `mla_latent_dim=192`: KV compression bottleneck (vs full 768-dim)
+- `mla_rope_dim=64`: only 64 dims carry positional encoding
+- `mla_window_size=0`: full causal O(T²); set >0 for windowed O(T×W) at long context
+- Windowed MLA uses RotorQuant KV compression + blockwise attention
+
+### Engram Cache (O(1) Static Knowledge)
+
+Hash-based N-gram lookup inspired by DeepSeek Engram (arXiv:2601.07372):
+
+1. **Tokenizer compression**: NFKC + lowercase + accent strip ("Apple"/"apple"/"APPLE" → same ID, ~23% vocab reduction)
+2. **N-gram hashing**: multiplicative-XOR hash for 2-grams and 3-grams across `n_heads` hash tables
+3. **Retrieval**: `hash % table_size` → embedding lookup (O(1) per token)
+4. **Context-aware gating**: `gate = sigmoid(sqrt_sign(hidden · retrieved / √d))` — suppresses hash collisions
+
+Injected once at layer 0, before any transformer block. Handles static patterns (function signatures, import idioms, common phrases) so beliefs can focus on dynamic/experiential memory.
+
+### Working Memory Suffix
+
+`M` learnable tokens (default 8) appended to the hidden stream:
+
+- Real tokens cannot attend to WM (causally after them)
+- WM can attend to all real tokens
+- During refinement loops: real tokens anchored by lifeline, WM evolves freely
+- Acts as a vector scratchpad — richer than text-based chain-of-thought
+- Initialized `randn(...) × 0.02`, trained by gradient descent
+
+### RoPE Configuration
+
+- `rope_base=500000`: High base frequency for native long context (Llama 3 style)
+- `max_position=204800`: RoPE extrapolation ceiling (~200K)
+- `rope_scaling="none"`: Native (scratch) or `"yarn"` (pretrained extension)
+- Applied partially in MLA: only first `d_rope` dims of Q get rotated; K_nope is position-invariant
+
+## Cognitive State Structure
+
+The cognitive state is a persistent, slot-based world model with four regions:
+
+### Beliefs (World Model)
+
+- `beliefs`: `[max_beliefs, D]` — nn.Parameter, trained by optimizer
+- **Polar representation**: radius = precision (confidence), angle = content direction
+- Empty slots: radius ≈ 0 (available for allocation)
+- Dot products between beliefs are naturally precision-weighted (large radius dominates)
+- Typical: 16K-65K slots, 256-dim
+
+### Edges (Causal/Associative Relations)
+
+- `edge_src/tgt`: `[max_edges]` — source/target belief indices
+- `edge_relations`: `[max_edges, K]` — learned relation semantics (K=64)
+- `edge_weights`: `[max_edges]` — edge strength
+- `edge_causal_obs`: `[max_edges]` — causal observation count (0 = Hebbian/associative)
+- `edge_direction`: `[max_edges]` — CoED learned causal direction angle
+- Typical: 65K-262K edges
+
+### Goals (Telos — Emergent Objectives)
+
+- `goal_embeddings`: `[max_goals, D]` — goal direction vectors
+- `goal_metadata`: `[max_goals, 8]` — priority, urgency, progress, status, depth, surprise, created, deadline
+- `goal_status_logits`: `[max_goals, 6]` — Gumbel-Softmax over {empty, proposed, active, stalled, completed, failed}
+- Typical: 64-512 goals
+
+### Meta Region
+
+- `meta`: `[32]` — learned meta-parameters (β, accumulated_surprise, thresholds, etc.)
+- `meta_params`: `MetaParams` — 40 learned constants replacing hardcoded hyperparameters throughout the system (sigmoid/softplus constrained, initialized to original values)
+
+### Belief Metadata Buffers
+
+Per-belief tracking (all `[max_beliefs]`):
+
+| Buffer | Type | Purpose |
+|--------|------|---------|
+| `belief_level` | int | Abstraction level L0-L3 (SDFT hierarchy) |
+| `belief_last_accessed` | int | Step of last retrieval |
+| `belief_access_count` | int | Total retrieval count |
+| `belief_prev_surprise` | float | Last surprise score |
+| `belief_lr_scale` | float | Per-belief adaptive LR (RWKV-7 inspired) |
+| `belief_provisional` | bool | Provisional (hypothesis, not yet confirmed) |
+| `belief_provisional_step` | int | Step when provisionally allocated |
+| `belief_provisional_fe` | float | Free energy at allocation time |
+| `belief_provisional_radius` | float | Radius at allocation time |
+| `belief_precision_var` | float | MESU precision variance |
+| `belief_reinforcement_count` | int | Times reinforced by observations |
+| `belief_confirmed_count` | int | Confirmations |
+| `belief_contradicted_count` | int | Contradictions |
+| `belief_sources` | int | Source belief index (provenance chain) |
+| `belief_source_type` | int | How it was created (observation, consolidation, hypothesis) |
+| `belief_created_step` | int | Training step when allocated |
+| `immutable_beliefs` | bool | Protected from merge/prune (core knowledge) |
+
+### Belief Hierarchy (SDFT-Inspired Abstraction)
+
+Beliefs progress through four levels based on evidence and access:
+
+| Level | Name | How achieved | Properties |
+|-------|------|-------------|------------|
+| **L0** | Observation | Direct allocation from write path | Ephemeral, specific, can be pruned |
+| **L1** | Consolidated | Merged from multiple similar L0 beliefs | Combined radius = √(r_A² + r_B²) |
+| **L2** | Abstract | Survived many sleep cycles, high access count | Stable patterns |
+| **L3** | Core | Promotion threshold met, marked immutable | Protected from merge/prune/split |
+
+**Scarcity drives generalization**: limited slots force consolidation, consolidation forces abstraction, abstraction IS generalization. Remove the slot limit and the hierarchy collapses.
+
+## State Interface (Read + Write Paths)
+
+### Read Path (Beliefs → Hidden Stream)
+
+Hopfield-style content-addressable retrieval with goal modulation:
+
+1. **Query projection**: `hidden [B, T, H] → query [B, T, num_heads, D]`
+2. **Goal modulation**: active Telos goals bias attention toward goal-relevant beliefs
+3. **Depth-conditioned temperature**: early interfaces retrieve broadly, late interfaces focus
+4. **Top-k sparse attention**: only k beliefs per position (32-64), avoids O(N_active) cost
+5. **Post-retrieval convolution**: depthwise 1D conv adds coherence between positions (Engram ShortConv)
+6. **Read gate**: per-position sigmoid — "does this position even need beliefs?"
+7. **Utility head**: auxiliary logits from beliefs alone (trains "are beliefs useful for prediction?")
+8. **Belief QAT**: STE quantize→dequantize during training for compression robustness
+
+### Write Path (Hidden Stream → Candidates)
+
+Precision-gated observation buffering:
+
+1. **Observation projection**: `hidden [B, T, H] → obs [B, T, D]`
+2. **Write gate**: learned sigmoid, biased closed (-2.0 init → ~12% open) — prevents state flooding
+3. **Precision head**: softplus — learned observation confidence
+4. **Batch matching**: one matmul `[N_obs, N_active]` cosine similarity against all active beliefs
+5. **WriteCandidate**: `{belief_vector, matched_slot, similarity, source_position, source_layer}`
+6. **No commitment during forward**: candidates buffered for Pass 2 (slot allocation is non-differentiable)
+
+### Surprise Computation (Pass 2)
+
+For each write candidate, compute prediction error:
+
+```
+surprise = angular_distance(observation, existing_belief) × observation_precision
+gain = obs_radius / (obs_radius + belief_radius)              # Kalman-like
+gain *= (1 + precision_var × boost).clamp(max=3.0)            # MESU modulation
+should_reconsolidate = (gain > reconsolidation_threshold)     # full rewrite?
+```
+
+High-variance beliefs (uncertain) amplify gain → more willing to change. Low-variance beliefs (confident) dampen gain → resist updates. Matches Titans surprise-driven memorization.
 
 ## Loss Functions
 
@@ -251,6 +445,158 @@ Pass 2 runs once per step after `optimizer.step()` and `detach_state()`. All mod
 | 10 | **Planning** | At sequence boundaries | Preference/epistemic priors, causal rollouts, optional MCTS. |
 | 11 | **SRWM update** | If SRWM exists | Self-referential fast-weight matrix for meta-parameter modulation. |
 | 12 | **Structural plasticity** | At sequence boundaries | Split polysemantic beliefs, prune dead ones. |
+
+### Cognitive Subsystems (Pass 2 Detail)
+
+#### Telos — Intrinsic Motivation
+
+Goal system driven by RND (Random Network Distillation) surprise:
+
+1. **Surprise detection**: Frozen random projection (target) vs trained predictor. High prediction error = novel belief. The predictor improves on seen beliefs, so novel beliefs stay surprising.
+2. **Goal generation**: Most surprising beliefs become seeds → `goal_generator` network transforms them into goal direction vectors. Goals point toward regions of belief space the model doesn't understand yet.
+3. **Goal modulation**: Active goals bias read path attention via `goal_gate` — retrieval becomes goal-directed, not just query-driven.
+4. **Progress tracking**: `estimate_progress` measures how close beliefs are to the goal region. Progress 0→1 as understanding builds.
+5. **Status transitions**: Gumbel-Softmax over {proposed→active→completed/stalled/failed} via learned `transition_net`.
+6. **Telos energy**: Unfinished important goals increase free energy → gradient pressure to make progress.
+
+#### Autoresearch — Hypothesis Generation
+
+Internalized Karpathy autoresearch loop:
+
+1. **HypothesisGenerator**: active goals → candidate beliefs (hypotheses) in goal direction
+2. **Generate gate**: learned, biased closed (-1.0) — prevents flooding state with bad hypotheses
+3. **Provisional allocation**: hypotheses enter as L0 beliefs with `provisional=True`
+4. **Evaluation**: after learned window (MetaParam), check: did free energy improve? Did precision hold?
+5. **HypothesisTracker**: per-goal success EMA — skip goals that never produce useful hypotheses
+
+#### Cognitive Controller (SEAL-Style)
+
+Learned RL policy for structural decisions:
+
+- **State**: 8 features (mean/std radii, fill ratio, edge density, β, surprise, goal density, belief_advantage_ema)
+- **Actions**: 5 continuous via Beta distribution — allocate_rate, merge_threshold, prune_threshold, connect_rate, goal_rate
+- **Training**: PPO clipped surrogate + adaptive entropy (SAC-style) + value baseline
+- **Reward**: `belief_advantage` (does cognitive state improve token prediction?) + dense state-delta signals
+
+#### Sleep / Dream Cycle
+
+**SleepGate** (learned scoring):
+- Input: belief vector + 6 metadata features (radius, access_count, level, age, n_edges, mean_edge_weight)
+- Output: softmax over {strengthen, maintain, forget}
+- Strengthen: radius × (1 + factor), Forget: radius × (1 - factor)
+- Factors adaptive: strengthen more when room to grow, forget more when full
+
+**NeuroDream** (offline message passing):
+- Runs message passing WITHOUT token input — pure internal reflection
+- Beliefs shift toward incoming messages weighted by relative precision
+- Only directions update (radii preserved) — dreaming reorganizes, doesn't create confidence
+- Convergence checked via shift magnitude; iterations adaptive based on edge density
+
+**Full sleep pipeline**: SleepGate → NeuroDream → belief shift → two-factor sleep (homeostatic normalization) → self-verification (causal consistency) → precision recalibration → interleaved replay (cross-temporal contradiction detection)
+
+#### Message Passing (Factor Graph)
+
+Loopy belief propagation on the edge graph with DEQ (Deep Equilibrium) solver:
+
+```
+For each edge (src → tgt):
+  bias = relation_transform(edge_relation)        # learned relation semantics
+  target' = normalize(target_angle + bias)         # transformed target
+  msg_precision = weight × radius × cos(direction) # CoED directional encoding
+  message = msg_precision × target'                # precision-weighted message
+
+Aggregate per belief: weighted mean of incoming messages
+```
+
+**DEQ solver** (Anderson acceleration): finds fixed point in ~10 iterations with constant memory. Spectral norm on relation_transform guarantees contractivity → unique fixed point exists.
+
+**Belief shift**: `shift_rate = β/D × msg_precision / (msg_precision + belief_radius)` — bounded, precision-relative.
+
+#### Planning (B1-B4)
+
+Four tiers of active inference planning:
+
+- **B1**: Inject preference (goal) and epistemic (uncertainty) priors into message passing
+- **B2**: Causal rollout — simulate K steps forward through edges, compute Expected Free Energy
+- **B3**: MCTS when β > 0.5 and multiple goals — UCB exploration with EFE rollout policy
+- **B4**: Hierarchical planning — group goals by depth, plan at different horizons
+
+All parameters learned MetaParams. Planning is internal (no action execution) — it biases next-step structural decisions.
+
+#### Cascade Revision
+
+When a belief is revised (high surprise → reconsolidation), BFS-propagate precision decay through causal edges:
+
+```
+For each downstream belief at depth d:
+  radius *= (1 - decay_factor^d)             # exponential decay
+  precision_var += variance_boost × decay_factor^d  # rightfully uncertain
+```
+
+Prevents orphaned high-precision children of corrected parents. Only causal edges participate (not associative). Immutable beliefs skip cascade.
+
+#### Structural Plasticity
+
+- **Split**: polysemantic beliefs (high activation entropy) → two children at angle ± perturbation, each with radius/√2 (energy conservation)
+- **Prune**: low frequency + low radius + learned prune_net decision → deallocate
+- **Growth pressure**: fill_ratio × (1 + surprise) — tracks capacity need
+
+#### Edge Proposal
+
+Learned `EdgeProposer` evaluates candidate pairs from co-activation (Hebbian) + causal observation counts. Creates edges with learned weights and CoED direction angles. Runs when edge_fill < 90%.
+
+## Refinement Loops (Latent Chain-of-Thought)
+
+Unlike text-based CoT, refinement loops reason in latent space:
+
+```
+For loop_i in range(max_loops):
+  1. Loop-index encoding (additive signal, fraction of max loops)
+  2. Re-run upper transformer blocks on current hidden states
+  3. Lifeline anchor: real tokens += gate × original_hidden (prevent drift)
+     Working memory suffix: evolves freely (true scratchpad)
+  4. Re-query beliefs via last interface (retrieve-reason-retrieve cycle)
+  5. TTT gradient step on upper MLP deltas (self-improvement within reasoning)
+  6. HaltingHead probe: P(halt) — stop early if confident enough
+```
+
+- **Training**: teacher forcing with random oracle loop count; halt probe learns from random targets
+- **Inference**: halt when P(halt) > threshold or max loops reached
+- **Cost**: ~3-4× per token (amortized by DFlash speculative decoding)
+- **Advantage over text CoT**: no output tokens wasted, vector representations richer than language, TTT adapts weights during reasoning, different beliefs retrieved each loop as understanding shifts
+
+## Four Memory Systems
+
+Memoria maintains coherence at any context length through four complementary memory systems:
+
+| System | Range | Scaling | Timescale | What it stores |
+|--------|-------|---------|-----------|---------------|
+| **MLA attention** | W tokens (window) | O(W) constant | Immediate | Dense local context, every detail |
+| **Mamba-2 state** | Unlimited | O(1) fixed | Continuous | Compressed recurrent memory, sequential patterns |
+| **Cognitive state** | Unlimited | O(1) fixed slots | Persistent | Facts, relations, goals — survives across sessions |
+| **Engram** | Unlimited | O(1) hash | Static | Common N-gram patterns, signatures, idioms |
+
+Memory at 1M tokens (small config, 2 MLA layers, W=128K, RotorQuant 3-bit): **~65 MB total**.
+
+No single system covers everything. MLA provides dense recent context. Mamba carries compressed signal forward. Cognitive state stores discrete facts retrievable by content. Engram handles static patterns with zero distance penalty.
+
+## Model Configurations
+
+### Presets
+
+| Config | Params | Layers | Pattern | Beliefs | Target Hardware |
+|--------|--------|--------|---------|---------|----------------|
+| `small_config()` | ~245M (+117M embed) | 12 | MMMML | 16K | Single 3090 |
+| `medium_config()` | ~456M | 24 | MMMML | 32K | 2× 3090 |
+| `large_config()` | ~694M | 24 | MMMML | 65K | B200 / multi-GPU |
+| `lfm2_config()` | 350M frozen + 15M adapters | 16 | LFM2 hybrid | 16K | Single 3090 |
+| `qwen_config()` | 2B frozen + 25M adapters | 24 | Qwen3.5 hybrid | 32K | Single 24GB GPU |
+
+### Pretrained Backbone Mode
+
+Freeze HF backbone, train only state interface layers (~15-25M params):
+- LFM2.5-350M: 28T tokens of data exposure for free, hybrid conv+attention
+- Qwen3.5-2B: 36T tokens, strongest language at this scale
 
 ## Data Pipeline
 
@@ -481,6 +827,44 @@ At 1M tokens with W=128K, D=128: ~38 MB MLA KV vs ~3 GB uncompressed.
 - Loss spike > 3× smoothed average
 - NaN/Inf in any loss component
 
+## Inference
+
+### Generation
+
+Standard autoregressive generation with cognitive state active:
+
+1. **Prefill**: Process full prompt through model. Beliefs form, Engram activates, Mamba state builds.
+2. **Decode**: Generate tokens one-by-one. Each token triggers read path (retrieve beliefs), write path (buffer observations), TTT (adapt weights).
+3. **Between chunks**: Pass 2 runs — allocate beliefs, create edges, update goals. Dream phase if at sequence boundary.
+4. **Cognitive state persists**: After generation ends, beliefs/edges/goals remain for next conversation.
+
+### Speculative Decoding (DFlash)
+
+DFlash draft head amortizes refinement loop cost:
+
+```
+while tokens_generated < max_new_tokens:
+  1. Run full model on current sequence (with refinement loops)
+  2. Draft head generates block_size tokens in parallel (cheap: 15.9M params)
+  3. Verify: run full model on [sequence + drafted block]
+  4. Accept tokens until first mismatch
+  5. Append accepted, continue
+```
+
+~3-4× speedup at 50% acceptance rate, roughly canceling refinement loop overhead.
+
+### Session Persistence
+
+```python
+# End of session: save cognitive state
+state_dict = model.state.state_dict_cognitive(compress=True)  # RotorQuant compressed
+torch.save(state_dict, "user_state.pt")
+
+# Start of next session: restore
+model.state.load_state_cognitive(torch.load("user_state.pt"))
+# Model remembers everything from previous sessions
+```
+
 ## File Map
 
 ```
@@ -512,19 +896,24 @@ memoria/interface/
   read_path.py       — BeliefCache, ReadPath (Hopfield attention over beliefs)
   write_path.py      — WritePath, WriteCandidate, pack/unpack for distributed
 
+memoria/core/
+  meta_params.py     — 40 learned MetaParams replacing hardcoded constants (sigmoid/softplus constrained)
+
 memoria/cognition/
   pass2.py           — Pass 2 orchestrator (12 structural operations)
-  surprise.py        — Prediction error computation
+  surprise.py        — Prediction error × precision, MESU-modulated Kalman gain
   belief_update.py   — Slot allocation, eviction
-  consolidation.py   — Soft merge, hard cleanup
+  consolidation.py   — Soft merge (cosine > threshold), hard cleanup, L0→L1 promotion
   hebbian.py         — Co-activation extraction for edge candidates
   meta_learning.py   — Beta computation, running statistics
-  telos_module.py    — TelosModule: goal generation, progress, transitions
-  sleep.py           — SleepGate + NeuroDream phase
-  planning.py        — Active inference planning (preference/epistemic priors)
-  autoresearch.py    — Hypothesis generation from goals
-  provisional.py     — Provisional belief evaluation (promote/evict)
-  cascade_revision.py — Causal cascade precision decay
+  telos_module.py    — TelosModule: RND surprise, goal generation, status transitions
+  sleep.py           — SleepGate (learned strengthen/maintain/forget) + NeuroDream (offline BP)
+  planning.py        — B1-B4: preference/epistemic priors, causal rollout, MCTS, hierarchical
+  autoresearch.py    — HypothesisGenerator + HypothesisTracker (goal→hypothesis→evaluate)
+  provisional.py     — Provisional belief evaluation (learned window, FE + precision criteria)
+  cascade_revision.py — BFS precision decay through causal edges after reconsolidation
+  cognitive_controller.py — SEAL-style RL policy (PPO + SAC entropy), 5 continuous actions
+  structural_plasticity.py — Polysemantic splitting (activation entropy), dead belief pruning
 
 memoria/data/
   curated.py         — Multi-tier dataset mix (45% state-essential)
