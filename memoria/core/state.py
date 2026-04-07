@@ -610,10 +610,12 @@ class CognitiveState(nn.Module):
             from .quantize import QuantizedBeliefStore, PolarQuantizer
 
             # Compress beliefs: polar decomposition (angle quantized, radius full precision)
-            bs = QuantizedBeliefStore(self.config.belief_dim, bits=3)
+            # Uses RotorQuant (PlanarQuant) when available for better MSE than uniform
+            device = str(self.beliefs.device)
+            bs = QuantizedBeliefStore(self.config.belief_dim, bits=3, device=device)
             belief_compressed = bs.compress_beliefs(self.beliefs.data)
 
-            # Compress edge relations (same approach, different dim)
+            # Compress edge relations
             rel_q = PolarQuantizer(self.config.relation_dim, bits=3, rotate=False)
             rel_codes, rel_scale = rel_q.quantize(self.edge_relations.data)
 
@@ -724,14 +726,15 @@ class CognitiveState(nn.Module):
     def load_state_cognitive(self, state: dict):
         """Restore cognitive state from checkpoint.
 
-        Handles both compressed (PolarQuant) and uncompressed belief/relation formats.
+        Handles compressed (RotorQuant/PolarQuant) and uncompressed belief/relation formats.
         """
         with torch.no_grad():
             # Beliefs: compressed or raw
             beliefs_data = state['beliefs']
             if isinstance(beliefs_data, dict) and beliefs_data.get('compressed'):
                 from .quantize import QuantizedBeliefStore
-                bs = QuantizedBeliefStore(self.config.belief_dim, bits=3)
+                device = str(self.beliefs.device)
+                bs = QuantizedBeliefStore(self.config.belief_dim, bits=3, device=device)
                 self.beliefs.data.copy_(bs.decompress_beliefs(beliefs_data))
             elif isinstance(beliefs_data, dict):
                 self.beliefs.data.copy_(beliefs_data['data'])

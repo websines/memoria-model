@@ -78,11 +78,15 @@ except ImportError:
 class SlidingWindowAttention(nn.Module):
     """Local attention within a fixed window. O(T × W) cost.
 
-    KV is quantized to 3-bit via PolarQuant (random rotation + uniform scalar
-    quantization). This reduces KV memory by ~10x and improves speed on
-    memory-bandwidth-bound attention.
+    KV compression via RotorQuant (PlanarQuant 2D Givens rotation + Lloyd-Max
+    centroids). Falls back to PolarQuant (uniform scalar) if unavailable.
+    10x KV memory reduction at 3-bit.
 
-    Uses FlashAttention-2's native window_size parameter if available.
+    Training: STE quantization-aware training (QAT) injects quantization noise
+    into K,V so the model learns representations robust to compression.
+    Inference: actual quantized blockwise attention for long sequences.
+
+    Uses FlashAttention-2's native window_size parameter when available.
     Falls back to blockwise processing that never materializes a T×T mask.
     """
 
@@ -100,15 +104,12 @@ class SlidingWindowAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-        # KV compression: TurboQuant (7.7x savings) with our PolarQuant fallback
-        self._use_turboquant = False
-        try:
-            from turboquant import TurboQuantKVCache
-            self.kv_cache = TurboQuantKVCache(head_dim=self.head_dim, bit_width=3)
-            self._use_turboquant = True
-        except ImportError:
-            from ..core.quantize import QuantizedKVCache
-            self.kv_cache = QuantizedKVCache(self.head_dim, bits=3)
+        # KV compression: RotorQuant (PlanarQuant/IsoQuant) with PolarQuant fallback
+        from ..core.quantize import QuantizedKVCache, _make_quantizer, ste_quantize
+        self.kv_cache = QuantizedKVCache(self.head_dim, bits=3)
+        # STE quantizer for training-time QAT (separate instance, same config)
+        self._kv_ste_quantizer = _make_quantizer(self.head_dim, bits=3)
+        self._ste_quantize = ste_quantize
 
         # YaRN attention temperature scaling
         self._yarn_scale = 1.0
@@ -121,6 +122,13 @@ class SlidingWindowAttention(nn.Module):
 
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
+
+        # QAT: during training, inject quantization noise via STE so the model
+        # learns K,V representations that are robust to 3-bit compression.
+        # Gradient flows through as identity (straight-through estimator).
+        if self.training:
+            k = self._ste_quantize(k, self._kv_ste_quantizer)
+            v = self._ste_quantize(v, self._kv_ste_quantizer)
 
         # GQA: expand kv heads if needed
         if self.n_kv_head < self.n_head:
@@ -138,8 +146,8 @@ class SlidingWindowAttention(nn.Module):
             )
         else:
             # Quantized blockwise sliding window:
-            # 1. Quantize K,V to 3-bit (10x smaller) — peak KV memory drops from O(T×D) to O(T×1byte)
-            # 2. Process in chunks of window_size, dequantizing only the window needed per chunk
+            # 1. Quantize K,V to 3-bit (10x smaller)
+            # 2. Process in chunks, dequantizing only the window per chunk
             # 3. Never materializes a T×T mask. Memory is O(W²) per chunk.
             q = q.transpose(1, 2)  # [B, H, T, D]
             k = k.transpose(1, 2)
@@ -157,13 +165,10 @@ class SlidingWindowAttention(nn.Module):
         For short sequences (T <= W): standard causal attention, no quantization.
         For long sequences (T > W):
           1. Quantize K,V to 3-bit immediately, free full-precision copies
-          2. For each chunk, dequantize ONLY the W-sized window (element-wise, no matmul)
+          2. For each chunk, dequantize ONLY the window slice (no full materialization)
           3. Compute attention on the small dequantized window
 
-        No rotation matrix: keys are QK-normed so dimensions already have equal
-        variance — rotation is redundant. Dequant is pure element-wise ops.
-
-        Peak KV memory: O(T × 1 byte) quantized + O(W × D × 4 bytes) per chunk window.
+        Peak KV memory: O(T × 1 byte) quantized + O(W × D × 4 bytes) per chunk.
         At 200K with W=4K, D=128: ~25MB quantized + ~4MB window = ~29MB vs ~300MB unquantized.
         """
         W = self.window_size
@@ -175,48 +180,25 @@ class SlidingWindowAttention(nn.Module):
         B, H, _, D = q.shape
         out = torch.zeros_like(q)
 
-        # Step 1: Compress K,V — TurboQuant (7.7x) or PolarQuant (3.9x) fallback
-        if self._use_turboquant:
-            compressed = self.kv_cache.compress(k, v)
-        else:
-            compressed = self.kv_cache.compress(k, v)
-        # Free full-precision K,V
+        # Step 1: Compress K,V via RotorQuant/PolarQuant
+        compressed = self.kv_cache.compress(k, v)
         del k, v
 
         # Step 2: Process in chunks, dequantizing only the window per chunk
         for start in range(0, T, W):
             end = min(start + W, T)
-            q_chunk = q[:, :, start:end]  # [B, H, chunk_len, D]
+            q_chunk = q[:, :, start:end]
 
-            # KV window boundaries
             kv_start = max(0, start - W + 1)
 
-            # Dequantize ONLY the window slice
-            if self._use_turboquant:
-                # TurboQuant: decompress full then slice (API doesn't support slicing compressed)
-                # TODO: upstream slice support to turboquant-torch
-                k_full = self.kv_cache.decompress_keys(compressed)
-                v_full = self.kv_cache.decompress_values(compressed)
-                k_window = k_full[:, :, kv_start:end]
-                v_window = v_full[:, :, kv_start:end]
-                del k_full, v_full
-            else:
-                k_window = self.kv_cache.quantizer.dequantize(
-                    compressed['k_codes'][:, :, kv_start:end],
-                    compressed['k_scale'][:, :, kv_start:end],
-                )
-                v_window = self.kv_cache.quantizer.dequantize(
-                    compressed['v_codes'][:, :, kv_start:end],
-                    compressed['v_scale'][:, :, kv_start:end],
-                )
+            # Dequantize only the needed slice — no full-tensor materialization
+            k_window, v_window = self.kv_cache.decompress_slice(compressed, kv_start, end)
 
             if kv_start == 0 and end <= W:
-                # First chunk: standard causal
                 attn_out = F.scaled_dot_product_attention(
                     q_chunk, k_window, v_window, is_causal=True, scale=scale,
                 )
             else:
-                # Small causal+window mask for this chunk: [chunk_len, window_len]
                 q_pos = torch.arange(start, end, device=q.device).unsqueeze(1)
                 k_pos = torch.arange(kv_start, end, device=q.device).unsqueeze(0)
                 dist = q_pos - k_pos

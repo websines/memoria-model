@@ -29,6 +29,7 @@ mamba = ["mamba-ssm>=2.0", "causal-conv1d>=1.4"]
 deq = ["torchdeq>=0.4"]
 full = ["mamba-ssm>=2.0", "causal-conv1d>=1.4", "torchdeq>=0.4"]
 scale = ["faiss-cpu>=1.9"]
+rotorquant = ["rotorquant @ git+https://github.com/scrya-com/rotorquant.git"]
 
 [build-system]
 requires = ["setuptools>=68.0"]

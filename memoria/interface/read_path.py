@@ -22,6 +22,7 @@ from torch import Tensor
 
 from ..core.state import CognitiveState
 from ..core.polar import belief_is_active, angular_similarity, EPSILON
+from ..core.quantize import _make_quantizer, ste_quantize
 
 try:
     from entmax import entmax15
@@ -158,6 +159,10 @@ class ReadPath(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.utility_head.weight)
 
+        # Belief QAT: quantize→dequantize beliefs via STE during training so the
+        # model learns belief representations that compress well for checkpointing
+        self._belief_ste_quantizer = _make_quantizer(belief_dim, bits=3)
+
     @torch.no_grad()
     def _faiss_prefilter(self, query: Tensor, keys: Tensor, k: int) -> Tensor:
         """FAISS IndexFlatIP for fast top-k when N_active is large.
@@ -247,6 +252,12 @@ class ReadPath(nn.Module):
 
         keys = active_angles       # [N_active, D] — unit vectors (content)
         values = active_beliefs    # [N_active, D] — full vectors (precision-weighted)
+
+        # Belief QAT: during training, pass values through STE quantize→dequantize.
+        # This teaches the model to produce belief vectors that are robust to
+        # 3-bit compression, making checkpoint quantization nearly lossless.
+        if self.training:
+            values = ste_quantize(values, self._belief_ste_quantizer)
 
         # ── Read Gate (compute FIRST, skip attention for closed positions) ──
         # At inference: positions with gate < threshold skip the expensive

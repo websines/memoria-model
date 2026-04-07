@@ -4,8 +4,8 @@ Beliefs are stored in polar form where:
 - Radius = precision (confidence). Large radius = high confidence, dominates message passing.
 - Angle = content (what the belief is about). Unit vector in representation space.
 
-This comes from TurboQuant's insight: PolarQuant decomposes vectors into radius + angle,
-where angle patterns are concentrated and compress well. In our case, precision weighting
+This comes from RotorQuant's insight: block-diagonal rotations decorrelate angle
+coordinates for efficient low-bit quantization. In our case, precision weighting
 is free from the geometry — dot products between beliefs are naturally precision-weighted
 because large-radius vectors dominate.
 """

@@ -146,10 +146,13 @@ def small_config() -> MemoriaConfig:
     """~125M params (+ ~117M embedding). Single 3090. Rapid iteration.
     Total ~245M params. Fits in <10GB VRAM.
 
-    All sliding window attention (4K) with PolarQuant KV compression.
+    All sliding window attention (4K) with RotorQuant KV compression.
     Cognitive state handles global context. Native 200K via high-base RoPE.
 
-    State scaled 4x from original (TurboQuant compression keeps memory flat):
+    KV QAT (quantization-aware training via STE) during training teaches
+    the model to produce representations robust to 3-bit compression.
+
+    State scaled 4x (RotorQuant checkpoint compression keeps disk flat):
     - 16K beliefs (was 4K) — 1 belief per 12.5 tokens at 200K
     - 65K edges (was 16K) — richer causal graph
     - 256 goals (was 64) — more concurrent objectives
@@ -175,7 +178,7 @@ def medium_config() -> MemoriaConfig:
     """~300M params (+ ~156M embedding). 2x 3090. Serious training.
     Total ~456M params.
 
-    State scaled 4x (TurboQuant compressed):
+    State scaled 4x (RotorQuant compressed):
     - 32K beliefs — 1 belief per 6.25 tokens at 200K
     - 131K edges — dense causal graph
     - 256 goals
@@ -201,7 +204,7 @@ def large_config() -> MemoriaConfig:
     """~500M params (+ ~194M embedding). B200 or multi-GPU. Crossover experiment.
     Total ~694M params.
 
-    State scaled 4x (TurboQuant compressed):
+    State scaled 4x (RotorQuant compressed):
     - 65K beliefs — 1 belief per 3 tokens at 200K (very dense coverage)
     - 262K edges — massive causal graph
     - 512 goals
@@ -310,7 +313,7 @@ def qwen_config() -> MemoriaConfig:
         ),
         state=StateConfig(
             belief_dim=512,  # larger to match richer representations from 2B model
-            max_beliefs=32768,   # 4x from 8K — TurboQuant compressed
+            max_beliefs=32768,   # 4x from 8K — RotorQuant compressed
             max_edges=262144,    # 8× beliefs — 2B model creates edges fast
             max_goals=256,
             relation_dim=64,
