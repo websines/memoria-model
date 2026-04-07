@@ -34,7 +34,7 @@ from ..data.curated import curated_stream
 from ..data.streaming import stream_fineweb_edu
 from ..data.synthetic import generate_all_synthetic
 from .optimizer import setup_optimizer
-from .schedule import get_lr_multiplier, get_alpha
+from .schedule import get_lr_multiplier, get_alpha, get_context_length
 from .distributed import (
     broadcast_state, gather_candidates, gather_read_indices, sync_ranks,
 )
@@ -338,6 +338,9 @@ def train(
         for group in optimizer.param_groups:
             group['lr'] = group['initial_lr'] * lr_mult
 
+        # SkyLadder: progressive context length (short→long ramp)
+        ctx_len = get_context_length(step, max_steps, tc, config.transformer.sequence_len)
+
         # Accumulate gradients
         all_candidates = []
         all_read_indices = []
@@ -352,6 +355,11 @@ def train(
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
             input_ids, labels = prefetcher.next_batch()
+
+            # SkyLadder: truncate to current context length
+            if ctx_len < input_ids.shape[1]:
+                input_ids = input_ids[:, :ctx_len]
+                labels = labels[:, :ctx_len]
 
             # DDP no_sync for all but last micro-step
             is_last_micro = (micro_step == grad_accum - 1)

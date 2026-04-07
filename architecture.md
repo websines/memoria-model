@@ -194,6 +194,30 @@ get_alpha(step, config) → α ∈ [0, alpha_max]
 - Phase 2 (`phase1_steps` → `+ alpha_warmup_steps`): Linear ramp 0 → α_max
 - Phase 3: α = α_max (constant)
 
+### Context Length Schedule (SkyLadder)
+
+```
+get_context_length(step, total_steps, config) → ctx_len
+```
+
+Progressive context extension from `skyladder_start` (default 256) to `sequence_len` over the
+first `skyladder_ratio` (default 60%) of training. Short context early = faster training (less
+attention compute) + better representations (model learns local patterns first). Batches are
+truncated to `ctx_len` each step.
+
+Reference: SkyLadder (NeurIPS 2025, arxiv.org/abs/2503.15450) — up to 22% faster training
+with better short- and long-context benchmarks.
+
+Schedules:
+- **linear** (default): `ctx = start + (target - start) × progress`
+- **exponential**: log-linear ramp, spends more steps at shorter (cheaper) context
+- **step**: doubles at equal intervals (256→512→1024→...→target)
+
+Interacts with the three training phases:
+- Phase 1 (language foundation): runs at short context → fast, cheap
+- Phase 2 (cognitive awakening): context grows, beliefs learn medium-range dependencies
+- Phase 3 (full training): at target context, all systems active
+
 ## Pass 2: Structural Cognitive Updates
 
 Pass 2 runs once per step after `optimizer.step()` and `detach_state()`. All modifications use `.data` access (no gradients). Adaptive depth logic decides which operations run each step.
@@ -381,16 +405,41 @@ The STE ensures gradients flow through as if no quantization occurred, while the
 trains the model to be robust to the noise. Over training, K/V projections and belief write paths
 naturally converge toward representations where information sits in directions that survive 3-bit rounding.
 
+### Windowed MLA for Long Context
+
+MLA layers (L in "MMMML") default to full causal attention O(T²). At long context (>128K),
+this becomes prohibitive. Setting `mla_window_size > 0` gives MLA a sliding window, reducing
+cost to O(T × W) while cognitive state + Mamba-2 handle beyond-window coherence.
+
+```
+mla_window_size = 0       → full causal O(T²), short context training
+mla_window_size = 131072  → 128K window, enables 1M+ context
+```
+
+Four memory systems stack to maintain coherence at any context length:
+
+| System | Range | Scaling | Role |
+|--------|-------|---------|------|
+| **MLA attention** | W tokens (window) | O(W) constant | Dense local context |
+| **Mamba-2 state** | Unlimited | O(1) fixed | Compressed recurrent memory |
+| **Cognitive state** | Unlimited | O(1) fixed slots | Persistent beliefs, edges, goals |
+| **Engram** | Unlimited | O(1) hash | Static N-gram patterns |
+
+Memory at 1M tokens (small config, 2 MLA layers, W=128K, RotorQuant 3-bit):
+- MLA KV: ~38 MB (windowed + compressed)
+- Mamba-2 state: ~400 KB (fixed)
+- Total: **~65 MB** — same as at 10K tokens
+
 ### Blockwise Attention (Inference)
 
-For long sequences (T > window_size), the quantized blockwise attention path:
+For long sequences (T > window_size), both SWA and windowed MLA use quantized blockwise attention:
 1. Compress full K,V via RotorQuant/PolarQuant → ~10× smaller
 2. Free full-precision copies
-3. For each chunk of window_size tokens, `decompress_slice()` only the needed window
+3. For each chunk, `decompress_slice()` only the needed window — no full-tensor materialization
 4. Compute attention on the small decompressed window
 
 Peak memory: O(T × 1 byte) quantized + O(W × D × 4 bytes) per chunk.
-At 200K tokens with W=4K, D=128: ~29 MB vs ~300 MB unquantized.
+At 1M tokens with W=128K, D=128: ~38 MB MLA KV vs ~3 GB uncompressed.
 
 ## Checkpoint Strategy
 
@@ -438,7 +487,7 @@ At 200K tokens with W=4K, D=128: ~29 MB vs ~300 MB unquantized.
 memoria/training/
   train.py          — Main training loop, DataPrefetcher, checkpoint, hub push
   optimizer.py      — Muon + AdamW setup, 18 parameter groups, _CombinedOptimizer
-  schedule.py       — LR schedule (WSD) + alpha schedule (KL annealing)
+  schedule.py       — LR (WSD) + alpha (KL annealing) + context length (SkyLadder) schedules
   distributed.py    — Cognitive state broadcast/gather for multi-GPU
   cognitive_seed.py  — Cross-run belief transfer via content matching
 

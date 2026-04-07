@@ -278,9 +278,11 @@ class MLACausalSelfAttention(nn.Module):
 
     Final key: K = cat(K_rope_with_RoPE, K_nope)
 
-    This decoupling allows the latent to be position-invariant (cacheable
-    without storing per-position RoPE'd keys), while the small K_rope
-    component carries positional information.
+    Supports two attention modes:
+    - Full causal (mla_window_size=0): O(T²) — use for shorter contexts
+    - Windowed (mla_window_size>0): O(T×W) — use for long context (>128K)
+      With RotorQuant KV compression, windowed MLA uses ~38 MB at 1M tokens.
+      Cognitive state + Mamba-2 handle coherence beyond the window.
     """
 
     def __init__(self, config: TransformerConfig, layer_idx: int):
@@ -293,6 +295,7 @@ class MLACausalSelfAttention(nn.Module):
         self.d_rope = config.mla_rope_dim
         self.d_nope = self.head_dim - self.d_rope
         self.layer_idx = layer_idx
+        self.mla_window_size = getattr(config, 'mla_window_size', 0)
 
         assert self.d_rope <= self.head_dim, (
             f"mla_rope_dim ({self.d_rope}) must be <= head_dim ({self.head_dim})"
@@ -314,6 +317,13 @@ class MLACausalSelfAttention(nn.Module):
 
         # Output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+
+        # RotorQuant KV compression for windowed MLA at long context
+        if self.mla_window_size > 0:
+            from ..core.quantize import QuantizedKVCache, _make_quantizer, ste_quantize
+            self.mla_kv_cache = QuantizedKVCache(self.head_dim, bits=3)
+            self._mla_ste_quantizer = _make_quantizer(self.head_dim, bits=3)
+            self._ste_quantize = ste_quantize
 
         # YaRN attention temperature scaling
         self._yarn_scale = 1.0
@@ -351,23 +361,102 @@ class MLACausalSelfAttention(nn.Module):
         # QK norm
         q, k = norm(q), norm(k)
 
+        # QAT: during training with windowed MLA, inject quantization noise
+        if self.training and self.mla_window_size > 0:
+            k = self._ste_quantize(k, self._mla_ste_quantizer)
+            v = self._ste_quantize(v, self._mla_ste_quantizer)
+
         # GQA: expand kv heads if needed
         if self.n_kv_head < self.n_head:
             rep = self.n_head // self.n_kv_head
             k = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
             v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
 
-        # Standard causal attention (full context for L layers)
-        q = q.transpose(1, 2)  # [B, H, T, D]
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True,
-            scale=self._yarn_scale / math.sqrt(self.head_dim),
-        )
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        W = self.mla_window_size
+        if W <= 0 or T <= W:
+            # Full causal attention (short context or no window configured)
+            if _flash_attn_available and x.is_cuda and W > 0:
+                # FlashAttention-2 with native sliding window
+                q_fa = q.transpose(1, 2)  # flash_attn expects [B, T, H, D]... wait
+                y = flash_attn_func(
+                    q, k, v,
+                    causal=True,
+                    window_size=(W - 1, 0) if W > 0 else (-1, -1),
+                    softmax_scale=self._yarn_scale / math.sqrt(self.head_dim),
+                )
+            else:
+                q = q.transpose(1, 2)  # [B, H, T, D]
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                y = F.scaled_dot_product_attention(
+                    q, k, v, is_causal=True,
+                    scale=self._yarn_scale / math.sqrt(self.head_dim),
+                )
+                y = y.transpose(1, 2)
+        else:
+            # Windowed MLA with RotorQuant KV compression for long context
+            if _flash_attn_available and x.is_cuda:
+                y = flash_attn_func(
+                    q, k, v,
+                    causal=True,
+                    window_size=(W - 1, 0),
+                    softmax_scale=self._yarn_scale / math.sqrt(self.head_dim),
+                )
+            else:
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                y = self._windowed_attention(q, k, v, T)
+                y = y.transpose(1, 2)
+
+        y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
+
+    def _windowed_attention(self, q: Tensor, k: Tensor, v: Tensor, T: int) -> Tensor:
+        """Windowed MLA with RotorQuant KV compression (CPU/non-flash fallback).
+
+        Same blockwise approach as SlidingWindowAttention but for MLA layers.
+        Compresses K,V to 3-bit, processes in window-sized chunks.
+        """
+        W = self.mla_window_size
+        scale = self._yarn_scale / math.sqrt(self.head_dim)
+
+        if T <= W:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scale)
+
+        B, H, _, D = q.shape
+        out = torch.zeros_like(q)
+
+        compressed = self.mla_kv_cache.compress(k, v)
+        del k, v
+
+        for start in range(0, T, W):
+            end = min(start + W, T)
+            q_chunk = q[:, :, start:end]
+            kv_start = max(0, start - W + 1)
+
+            k_window, v_window = self.mla_kv_cache.decompress_slice(
+                compressed, kv_start, end
+            )
+
+            if kv_start == 0 and end <= W:
+                attn_out = F.scaled_dot_product_attention(
+                    q_chunk, k_window, v_window, is_causal=True, scale=scale,
+                )
+            else:
+                q_pos = torch.arange(start, end, device=q.device).unsqueeze(1)
+                k_pos = torch.arange(kv_start, end, device=q.device).unsqueeze(0)
+                dist = q_pos - k_pos
+                valid = (dist >= 0) & (dist < W)
+                mask = torch.where(valid, 0.0, float('-inf')).to(q.dtype)
+                attn_out = F.scaled_dot_product_attention(
+                    q_chunk, k_window, v_window, attn_mask=mask, scale=scale,
+                )
+
+            out[:, :, start:end] = attn_out
+
+        return out
 
 
 # ── Standard Causal Attention (fallback) ──

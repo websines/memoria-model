@@ -50,6 +50,9 @@ class TransformerConfig:
     # Set mla_latent_dim=0 to disable (L layers use standard full attention).
     mla_latent_dim: int = 0           # KV compression dimension (0 = disabled)
     mla_rope_dim: int = 64            # RoPE dimensions kept uncompressed in MLA
+    mla_window_size: int = 0          # sliding window for MLA layers (0 = full attention)
+                                      # At long context (>128K), use 65536-131072 to avoid O(T²)
+                                      # Cognitive state + Mamba-2 handle beyond-window coherence
 
     # State interface placement
     interface_every: int = 4          # insert state interface every N layers
@@ -121,6 +124,15 @@ class TrainingConfig:
     phase1_steps: int = 2000          # L_token only (language foundation)
     phase2_steps: int = 3000          # α ramps up (cognitive awakening)
     # phase 3: full training continues indefinitely
+
+    # SkyLadder progressive context extension
+    # Ramps sequence_len from skyladder_start to sequence_len over skyladder_ratio
+    # of total training. Short context is cheaper (less attention compute) and
+    # empirically produces better representations (SkyLadder, NeurIPS 2025).
+    # Set skyladder_ratio=0 to disable (fixed sequence_len throughout).
+    skyladder_ratio: float = 0.6      # fraction of training spent ramping (0 = disabled)
+    skyladder_start: int = 256        # initial context length (small = fast early training)
+    skyladder_schedule: str = "linear"  # "linear", "exponential", or "step"
 
     # Logging
     log_interval: int = 10
