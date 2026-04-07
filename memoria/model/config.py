@@ -75,6 +75,12 @@ class TransformerConfig:
     # Working memory init scale (small normal around zero)
     working_memory_init_scale: float = 0.02
 
+    # DFlash block diffusion draft head (speculative decoding)
+    dflash_enabled: bool = False       # enable DFlash draft head
+    dflash_n_layers: int = 3           # draft head layers (small — this is the "fast" path)
+    dflash_block_size: int = 8         # tokens to draft per speculation step
+    dflash_loss_weight: float = 0.1    # weight for draft training loss
+
 
 @dataclass
 class TrainingConfig:

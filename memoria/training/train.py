@@ -498,6 +498,7 @@ def train(
                 'dt_ms': dt * 1000,
                 'deq/jac_loss': last_jac_loss,
                 'deq/solver_steps': last_deq_steps,
+                'dflash/loss_draft': result.get('loss_draft', torch.tensor(0.0)).item(),
             }
             # Per-operation pass2 diagnostics — essential for isolating which
             # of the 12 structural operations is misbehaving during training.

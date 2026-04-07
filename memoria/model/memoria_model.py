@@ -29,6 +29,7 @@ from ..core.ttt import InPlaceTTT, TTTContext
 from ..interface.layer import StateInterfaceLayer
 from ..interface.read_path import BeliefCache
 from ..interface.write_path import WriteCandidate
+from .dflash_head import DFlashDraftHead
 
 
 class EngramCache(nn.Module):
@@ -346,6 +347,22 @@ class MemoriaModel(nn.Module):
             'aux': nn.Parameter(torch.tensor(0.0)),
         })
 
+        # ── DFlash Block Diffusion Draft Head (arXiv:2602.06036) ──
+        # Small draft module for speculative decoding at inference time.
+        # Cross-attends to target hidden states at selected layers + active
+        # belief embeddings → predicts block_size tokens in parallel.
+        # Trained jointly via auxiliary loss; shared LM head avoids 117M duplication.
+        self.dflash_enabled = getattr(config.transformer, 'dflash_enabled', False)
+        if self.dflash_enabled:
+            tc = config.transformer
+            self.dflash_head = DFlashDraftHead(
+                hidden_dim=tc.n_embd,
+                n_heads=tc.n_head,
+                n_layers=tc.dflash_n_layers,
+                block_size=tc.dflash_block_size,
+                n_target_layers=tc.n_layer,
+            )
+
     @torch.no_grad()
     def init_weights(self):
         """Initialize all weights."""
@@ -435,6 +452,10 @@ class MemoriaModel(nn.Module):
         interface_idx = 0
         ttt_ctx = TTTContext()
 
+        # DFlash: track which layers to tap for draft head conditioning
+        dflash_tap_set = set(self.dflash_head.tap_indices) if self.dflash_enabled else set()
+        dflash_tapped: dict[int, Tensor] = {}
+
         for i, block in enumerate(self.transformer.blocks):
             if self.training and T_total > self.config.transformer.sliding_window_size:
                 x = torch.utils.checkpoint.checkpoint(
@@ -449,6 +470,10 @@ class MemoriaModel(nn.Module):
                     self.transformer.resid_lambdas[i],
                     self.transformer.x0_lambdas[i],
                 )
+
+            # DFlash: save hidden states at tapped layers (detached — no extra grad cost)
+            if i in dflash_tap_set:
+                dflash_tapped[i] = x[:, :T, :].detach() if M > 0 else x.detach()
 
             # Insert state interface after designated blocks
             # Interface layers process ONLY real token positions (not working memory suffix)
@@ -781,6 +806,42 @@ class MemoriaModel(nn.Module):
                 if hasattr(self.state, 'message_passing') else 0
             )
 
+            # ── DFlash draft loss (arXiv:2602.06036) ──
+            # Train the draft head to predict next-block tokens conditioned on
+            # tapped hidden states + beliefs. Only runs when draft head is enabled
+            # and we have collected tap features. NOT alpha-gated — the draft head
+            # should learn during phase 1 alongside the main model.
+            loss_draft = torch.tensor(0.0, device=idx.device)
+            if self.dflash_enabled and dflash_tapped and self.training:
+                block_size = self.config.transformer.dflash_block_size
+                # Pick a random starting position that has block_size tokens ahead
+                if T > block_size + 1:
+                    import random
+                    t_start = random.randint(0, T - block_size - 1)
+                    # Target: the next block_size tokens after t_start
+                    draft_targets = targets[:, t_start + 1: t_start + 1 + block_size]
+                    if draft_targets.shape[1] == block_size:
+                        # Extract features: tapped hidden states at position t_start
+                        # Use a window of context (last 64 positions up to t_start)
+                        ctx_start = max(0, t_start - 63)
+                        ctx_hiddens = {
+                            k: v[:, ctx_start:t_start + 1, :]
+                            for k, v in dflash_tapped.items()
+                        }
+                        # Get active beliefs for extra context
+                        active_beliefs = None
+                        if belief_cache.n_active > 0:
+                            active_beliefs = belief_cache.active_beliefs
+
+                        draft_context = self.dflash_head.extract_features(
+                            ctx_hiddens, active_beliefs,
+                        )
+                        loss_draft = self.dflash_head.compute_draft_loss(
+                            draft_context, draft_targets,
+                            lm_head_fn=self.transformer.head,
+                        )
+            result['loss_draft'] = loss_draft
+
             # Kendall/Gal uncertainty weighting (CVPR 2018)
             def _uw(loss_term: Tensor, log_s: Tensor) -> Tensor:
                 """Uncertainty-weighted loss: L/(2*exp(2s)) + s"""
@@ -790,16 +851,21 @@ class MemoriaModel(nn.Module):
 
             L_fe_w = _uw(loss_fe, self.log_sigma['fe'])
 
+            w_draft = self.config.transformer.dflash_loss_weight if self.dflash_enabled else 0.0
             L_aux = (
                 w_util * loss_utility
                 + w_surp * result['loss_surprise']
                 + w_halt * loss_halt
                 + 0.01 * jac_loss
+                + w_draft * loss_draft
             )
             L_aux_w = _uw(L_aux, self.log_sigma['aux'])
 
             # Alpha gating preserved: phase 1 = token only, phase 2-3 = all terms
-            result['loss'] = L_token_w + alpha * L_fe_w + alpha * L_aux_w
+            # Draft loss is added to aux but is NOT alpha-gated itself (it's inside
+            # L_aux_w which IS alpha-gated). To let it train during phase 1, we add
+            # it directly to the total loss as well.
+            result['loss'] = L_token_w + alpha * L_fe_w + alpha * L_aux_w + w_draft * loss_draft
 
             result['log_sigma_token'] = self.log_sigma['token'].item()
             result['log_sigma_fe'] = self.log_sigma['fe'].item()
@@ -822,6 +888,186 @@ class MemoriaModel(nn.Module):
         Convenience wrapper around forward() for non-DDP usage and tests.
         """
         return self.forward(idx, targets, alpha=alpha)
+
+    @torch.no_grad()
+    def spec_generate(
+        self,
+        input_ids: Tensor,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        stop_token_ids: list[int] | None = None,
+    ) -> Tensor:
+        """Generate tokens using DFlash speculative decoding.
+
+        Draft-verify loop:
+        1. Run full model on current sequence → collect tapped hidden states
+        2. Draft head generates block_size candidate tokens in parallel
+        3. Full model verifies candidates in one pass (with refinement loops)
+        4. Accept tokens until first mismatch with verifier
+        5. Repeat until max_new_tokens or stop token
+
+        Falls back to standard autoregressive if DFlash is not enabled.
+
+        Args:
+            input_ids: [1, T] prompt token ids
+            max_new_tokens: maximum tokens to generate
+            temperature: sampling temperature (0 = greedy)
+            stop_token_ids: stop generation when any of these are produced
+
+        Returns:
+            [1, T + N] generated sequence
+        """
+        assert input_ids.shape[0] == 1, "spec_generate only supports batch_size=1"
+        self.eval()
+        device = input_ids.device
+        generated = input_ids.clone()
+        stop_set = set(stop_token_ids) if stop_token_ids else set()
+
+        if not self.dflash_enabled:
+            # Fallback: standard autoregressive generation
+            return self._generate_autoregressive(
+                generated, max_new_tokens, temperature, stop_set,
+            )
+
+        block_size = self.dflash_head.block_size
+        tokens_generated = 0
+
+        while tokens_generated < max_new_tokens:
+            # ── Step 1: Prefill — run full model on current sequence ──
+            result = self.forward(generated)
+            logits = result['logits']  # [1, T_current, vocab]
+
+            # Greedy/sample next token from the verifier (the "guaranteed" token)
+            next_token = self._sample_token(logits[:, -1, :], temperature)
+
+            # Check stop
+            if next_token.item() in stop_set:
+                generated = torch.cat([generated, next_token.unsqueeze(0)], dim=1)
+                break
+
+            # ── Step 2: Extract features for draft head ──
+            # Re-run to collect tapped hidden states (forward already computed them
+            # but we need to access dflash_tapped which is local to forward).
+            # More efficient: run forward_blocks and tap directly.
+            tap_hiddens = self._collect_tap_hiddens(generated)
+
+            # Context: last 64 positions of tapped features
+            ctx_start = max(0, generated.shape[1] - 64)
+            ctx_hiddens = {k: v[:, ctx_start:, :] for k, v in tap_hiddens.items()}
+
+            # Active beliefs
+            active_mask = self.state.get_active_mask()
+            active_beliefs = self.state.beliefs.data[active_mask] if active_mask.any() else None
+
+            draft_context = self.dflash_head.extract_features(ctx_hiddens, active_beliefs)
+
+            # ── Step 3: Draft block_size tokens in parallel ──
+            draft_logits = self.dflash_head(draft_context, lm_head_fn=self.transformer.head)
+            draft_tokens = self._sample_token(draft_logits.squeeze(0), temperature)  # [block_size]
+
+            # Build candidate sequence: guaranteed token + drafted tokens
+            candidate_tokens = torch.cat([next_token, draft_tokens], dim=0)  # [1 + block_size]
+            candidate_seq = torch.cat([
+                generated,
+                candidate_tokens.unsqueeze(0),
+            ], dim=1)
+
+            # ── Step 4: Verify with full model (includes refinement loops) ──
+            verify_result = self.forward(candidate_seq)
+            verify_logits = verify_result['logits']  # [1, T + 1 + block_size, vocab]
+
+            # Compare verifier's predictions with draft tokens.
+            # verify_logits[:, T-1, :] should predict next_token (already guaranteed).
+            # verify_logits[:, T, :] should predict draft_tokens[0], etc.
+            T_orig = generated.shape[1]
+            n_accepted = 1  # the guaranteed next_token is always accepted
+
+            for j in range(block_size):
+                verify_token = self._sample_token(
+                    verify_logits[:, T_orig + j, :], temperature,
+                )
+                if verify_token.item() == candidate_tokens[1 + j].item():
+                    n_accepted += 1
+                else:
+                    # Mismatch: accept verifier's token instead and stop
+                    candidate_tokens[1 + j] = verify_token.squeeze()
+                    n_accepted += 1
+                    break
+
+            # Accept the verified prefix
+            accepted = candidate_tokens[:n_accepted]
+            generated = torch.cat([generated, accepted.unsqueeze(0)], dim=1)
+            tokens_generated += n_accepted
+
+            # Check for stop tokens in accepted
+            if stop_set and any(t.item() in stop_set for t in accepted):
+                break
+
+        self.train()
+        return generated
+
+    def _collect_tap_hiddens(self, input_ids: Tensor) -> dict[int, Tensor]:
+        """Run transformer blocks and collect hidden states at DFlash tap layers."""
+        B, T = input_ids.size()
+        M = self.working_memory_size if self.working_memory_size > 0 else 0
+        T_total = T + M
+
+        self.transformer._ensure_rope(T_total)
+        cos = self.transformer.cos[:, :T_total]
+        sin = self.transformer.sin[:, :T_total]
+
+        x = self.transformer.wte(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+
+        if M > 0:
+            wm = self.working_memory.expand(B, -1, -1)
+            x = torch.cat([x, wm], dim=1)
+
+        x0 = x
+
+        engram_out = self.engram_cache(x[:, :T, :], input_ids)
+        x = torch.cat([x[:, :T, :] + engram_out, x[:, T:, :]], dim=1) if M > 0 else x + engram_out
+
+        tap_set = set(self.dflash_head.tap_indices)
+        tapped: dict[int, Tensor] = {}
+
+        for i, block in enumerate(self.transformer.blocks):
+            x = block(
+                x, x0, cos, sin,
+                self.transformer.resid_lambdas[i],
+                self.transformer.x0_lambdas[i],
+            )
+            if i in tap_set:
+                tapped[i] = x[:, :T, :] if M > 0 else x
+
+        return tapped
+
+    @staticmethod
+    def _sample_token(logits: Tensor, temperature: float) -> Tensor:
+        """Sample from logits (greedy if temperature < 1e-5)."""
+        if temperature < 1e-5:
+            return logits.argmax(dim=-1)
+        probs = F.softmax(logits / temperature, dim=-1)
+        if probs.dim() == 1:
+            return torch.multinomial(probs.unsqueeze(0), 1).squeeze()
+        return torch.multinomial(probs, 1).squeeze(-1)
+
+    def _generate_autoregressive(
+        self,
+        tokens: Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        stop_set: set[int],
+    ) -> Tensor:
+        """Standard autoregressive generation (fallback when DFlash disabled)."""
+        for _ in range(max_new_tokens):
+            result = self.forward(tokens)
+            logits = result['logits']
+            next_token = self._sample_token(logits[:, -1, :], temperature)
+            tokens = torch.cat([tokens, next_token.unsqueeze(0).unsqueeze(0)], dim=1)
+            if next_token.item() in stop_set:
+                break
+        return tokens
 
     def detach_state(self):
         """Detach state tensors from computation graph before structural pass2 modifications."""

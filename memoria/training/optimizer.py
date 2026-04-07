@@ -322,6 +322,18 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
+    # 18. DFlash draft head (block diffusion speculative decoding)
+    if hasattr(model, 'dflash_enabled') and model.dflash_enabled:
+        dflash_params = [p for p in model.dflash_head.parameters() if p.requires_grad]
+        if dflash_params:
+            param_groups.append({
+                'params': dflash_params,
+                'lr': tc.interface_lr,  # same LR as interface layers
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 
