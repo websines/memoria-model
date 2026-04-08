@@ -274,11 +274,16 @@ class LogLinearDeltaProductBlock(nn.Module):
             k = _conv_bf16(self.k_conv, k)
             v = _conv_bf16(self.v_conv, v)
 
-        # Activations (FLA convention)
+        # Activations and reshape (FLA interleaving convention)
+        # q: [B, T, H, K] — normal
         q = q.view(B, T, H, K)
-        k = nn.functional.silu(k).view(B, T, H, K * n_h)
-        v = nn.functional.silu(v).view(B, T, H, V * n_h)
-        beta = beta.view(B, T, H * n_h).sigmoid()
+        # k: interleave n_h into time dim → [B, T*n_h, H, K]
+        k = nn.functional.silu(k).view(B, T, H, K, n_h).permute(0, 1, 4, 2, 3).reshape(B, T * n_h, H, K)
+        # v: interleave n_h into time dim → [B, T*n_h, H, V]
+        v = nn.functional.silu(v).view(B, T, H, V, n_h).permute(0, 1, 4, 2, 3).reshape(B, T * n_h, H, V)
+        # beta: interleave n_h into time dim → [B, T*n_h, H]
+        beta = beta.view(B, T, H, n_h).permute(0, 1, 3, 2).reshape(B, T * n_h, H).sigmoid()
+        # g: one per token (NOT expanded) → [B, T, H]
         g_gate = nn.functional.logsigmoid(g_gate).view(B, T, H)
         o_gate = o_gate.view(B, T, H * V)
 
@@ -290,9 +295,9 @@ class LogLinearDeltaProductBlock(nn.Module):
         pad_len = (C - T % C) % C
         if pad_len > 0:
             q = nn.functional.pad(q, (0, 0, 0, 0, 0, pad_len))
-            k = nn.functional.pad(k, (0, 0, 0, 0, 0, pad_len))
-            v = nn.functional.pad(v, (0, 0, 0, 0, 0, pad_len))
-            beta = nn.functional.pad(beta, (0, 0, 0, pad_len))
+            k = nn.functional.pad(k, (0, 0, 0, 0, 0, pad_len * n_h))
+            v = nn.functional.pad(v, (0, 0, 0, 0, 0, pad_len * n_h))
+            beta = nn.functional.pad(beta, (0, 0, 0, pad_len * n_h))
             g_gate = nn.functional.pad(g_gate, (0, 0, 0, pad_len))
             level_weights = nn.functional.pad(level_weights, (0, 0, 0, 0, 0, pad_len))
 
@@ -305,15 +310,16 @@ class LogLinearDeltaProductBlock(nn.Module):
         # ── Process chunks sequentially with Fenwick state management ──
         outputs = []
         for ci in range(num_chunks):
-            s, e = ci * C, (ci + 1) * C
+            sq, eq = ci * C, (ci + 1) * C
+            sk, ek = ci * C * n_h, (ci + 1) * C * n_h
 
-            q_c = q[:, s:e]
-            k_c = k[:, s:e]
-            v_c = v[:, s:e]
-            beta_c = beta[:, s:e]
-            g_c = g_gate[:, s:e]
+            q_c = q[:, sq:eq]          # [B, C, H, K]
+            k_c = k[:, sk:ek]          # [B, C*n_h, H, K]
+            v_c = v[:, sk:ek]          # [B, C*n_h, H, V]
+            beta_c = beta[:, sk:ek]    # [B, C*n_h, H]
+            g_c = g_gate[:, sq:eq]     # [B, C, H]
 
-            lw_c = level_weights[:, s:e].mean(dim=1)  # [B, H, L]
+            lw_c = level_weights[:, sq:eq].mean(dim=1)  # [B, H, L]
             init_state = fenwick.query(lw_c)  # [B, H, K, V]
 
             # Run DeltaProduct chunk kernel (all tensors already bf16)
