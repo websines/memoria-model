@@ -109,7 +109,7 @@ class FenwickStateTree:
         # states: [L, B, H, K, V] — detached from graph (values only,
         # gradients flow through weights/level_scales, not stored states)
         mask = self.active.view(self.num_levels, 1, 1, 1, 1).float()
-        weighted = self.states.detach() * weights * mask
+        weighted = self.states.detach().clone() * weights * mask
         init_state = weighted.sum(dim=0)  # [B, H, K, V]
         return init_state
 
