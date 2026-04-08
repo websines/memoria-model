@@ -43,13 +43,13 @@ Previous architectures have gaps: Mamba-2 compresses passively between TTT steps
 
 | System | Mechanism | Range | Scaling | Timescale |
 |--------|-----------|-------|---------|-----------|
-| **MLA** | Exact softmax attention | W tokens | O(W) | Immediate |
+| **MLA + DSA** | Belief-conditioned sparse attention | Full context (sparse) | O(T×K) | Immediate |
 | **DeltaProduct state** | Error-correcting KV matrix | Unlimited | O(1) per level | Continuous |
 | **Fenwick hierarchy** | Log-growing temporal levels | Unlimited | O(log T) | Multi-scale |
 | **Cognitive state** | Explicit beliefs + edges + goals | Unlimited | O(1) fixed slots | Persistent (cross-session) |
 | **Engram** | Hash-based N-gram lookup | Unlimited | O(1) | Static |
 
-Each system handles something the others cannot. MLA gives exact local recall. DeltaProduct error-corrects within-sequence state. The Fenwick hierarchy provides multi-scale temporal context. Cognitive state stores discrete facts that survive across sessions. Engram handles static patterns at zero cost. No single system is redundant.
+Each system handles something the others cannot. MLA+DSA gives exact sparse recall across the full context, guided by cognitive state beliefs. DeltaProduct error-corrects within-sequence state. The Fenwick hierarchy provides multi-scale temporal context. Cognitive state stores discrete facts that survive across sessions and directs MLA's sparse attention. Engram handles static patterns at zero cost. No single system is redundant.
 
 ## Overview
 
@@ -247,6 +247,63 @@ latent → v_up → V [B, T, n_kv, head_dim]                  (values)
 - `mla_rope_dim=64`: only 64 dims carry positional encoding
 - `mla_window_size=0`: full causal O(T²); set >0 for windowed O(T×W) at long context
 - Windowed MLA uses RotorQuant KV compression + blockwise attention
+
+#### DSA: Belief-Conditioned Sparse Attention (Lightning Indexer)
+
+When `dsa_enabled=True`, MLA layers use a learned **Lightning Indexer** for sparse global attention instead of windowed or full causal. Based on DeepSeek-V3.2 DSA (arXiv:2512.02556), extended with belief conditioning — a novel contribution.
+
+```
+                    ┌─ Lightning Indexer ─────────────────────────┐
+hidden [B,T,D] ──→ │ q_I = q_proj(hidden)  [B, T, H_I, d_I]    │
+                    │ k_I = k_proj(hidden)  [B, T, H_I, d_I]    │
+                    │ k_I = RotorQuant_STE(k_I)  ← 3-bit QAT    │
+                    │                                              │
+                    │ score(t,s) = Σ_j w(t,j)·ReLU(q_I·k_I)     │
+                    │            + λ · max_b sim(k_I, belief_b)   │
+                    │                  ↑ belief conditioning       │
+                    │                                              │
+                    │ indices = top_k(scores)  [B, T, K]          │
+                    └──────────────────────────────────────────────┘
+                                  │
+                                  ▼
+                    ┌─ Sparse MLA Attention ──────────────────────┐
+                    │ k_sparse, v_sparse = gather(K, V, indices)  │
+                    │ output = softmax(Q · k_sparse / √d) · v     │
+                    └──────────────────────────────────────────────┘
+```
+
+**Score function** (per indexer head j):
+```
+I(t, s) = Σ_j w(t,j) · ReLU( q_I(t,j) · k_I(s,j) )
+         + λ_belief · max_b cosine_sim(k_I(s), belief_proj(b))
+```
+
+- `dsa_index_dim=32`: indexer projection dimension (tiny — cheap scoring)
+- `dsa_index_heads=4`: parallel scoring channels (each head can specialize)
+- `dsa_top_k=2048`: tokens selected per query at inference (out of 1M)
+- `dsa_top_k_ratio=0.25`: fraction selected during training (indexer always has to choose)
+- `dsa_index_bits=3`: RotorQuant bits for indexer key compression (STE QAT)
+- `dsa_belief_lambda=0.1`: belief conditioning strength
+
+**Belief conditioning** (novel): Active beliefs from the cognitive state are projected into indexer space. Their max-similarity to each token's indexer key adds an additive bias. This means MLA preferentially attends to tokens relevant to current beliefs — attention becomes goal-directed via active inference. No existing architecture does this because no other architecture has a cognitive state to condition on.
+
+**Three attention modes** (selected per-layer based on config):
+
+| Mode | When | Complexity | Coverage |
+|------|------|-----------|----------|
+| Full causal | `dsa_enabled=False, mla_window_size=0` | O(T²) | Full, dense |
+| Windowed | `dsa_enabled=False, mla_window_size>0` | O(T×W) | Dense within window |
+| **DSA sparse** | `dsa_enabled=True` | O(T²×d_I/d) + O(T×K) | **Sparse global** |
+
+**KL alignment loss**: During phase 1 (short context, dense attention is cheap), the indexer is trained via KL divergence against the dense MLA attention distribution. This teaches it "which tokens would full attention focus on?" After phase 1, KL weight reduces to maintenance level (0.1) while sparse selection activates.
+
+**RotorQuant on indexer keys**: Same STE QAT pipeline as KV cache, weights, and beliefs. At d_I=32, RotorQuant's Givens rotations (3-bit: 16 pairs) or quaternion rotations (4-bit: 8 groups) fit perfectly. The model learns indexer representations that survive 3-bit compression.
+
+Memory overhead at 1M tokens:
+- Indexer keys (3-bit RotorQuant): 1M × 32 × 0.375 bytes = **12 MB**
+- vs current windowed KV: ~38 MB (saved, since DSA replaces windowed path)
+
+Reference: DeepSeek-V3.2 DSA (arXiv:2512.02556), NSA (arXiv:2502.11089, ACL 2025)
 
 ### Engram Cache (O(1) Static Knowledge)
 
@@ -677,20 +734,20 @@ Memoria maintains coherence at any context length through five complementary mem
 
 | System | Range | Scaling | Timescale | What it stores |
 |--------|-------|---------|-----------|---------------|
-| **MLA attention** | W tokens (window) | O(W) constant | Immediate | Dense local context, every detail |
+| **MLA + DSA** | Full context (sparse K tokens) | O(T×K) | Immediate | Exact sparse recall, belief-guided token selection |
 | **DeltaProduct state** | Unlimited | O(1) fixed | Continuous | Error-corrected recurrent memory, entity tracking |
 | **Log-Linear GDN state** | Unlimited | O(log T) growing | Multi-scale | Hierarchical temporal context, recent=high-res, distant=compressed |
-| **Cognitive state** | Unlimited | O(1) fixed slots | Persistent | Facts, relations, goals — survives across sessions |
+| **Cognitive state** | Unlimited | O(1) fixed slots | Persistent | Facts, relations, goals — survives across sessions + guides DSA |
 | **Engram** | Unlimited | O(1) hash | Static | Common N-gram patterns, signatures, idioms |
 
-Memory at 1M tokens (small config, 2 MLA layers, W=128K, RotorQuant 3-bit):
-- MLA KV: ~38 MB (windowed + compressed)
+Memory at 1M tokens (small config, 2 MLA layers, DSA with RotorQuant 3-bit):
+- DSA indexer keys: ~12 MB (1M × 32 × 3-bit RotorQuant)
 - DeltaProduct state: ~2 MB per layer (fixed d_k × d_v matrix)
 - Log-Linear GDN state: ~0.6 MB per layer × log₂(1M) ≈ 20 levels
 - Cognitive state: ~26 MB (65K beliefs × 256 dims)
-- **Total: ~80 MB** — grows logarithmically, not linearly
+- **Total: ~54 MB** — lighter than windowed MLA (~80 MB) with global reach
 
-No single system covers everything. MLA provides exact local context. DeltaProduct error-corrects within-sequence state. Log-Linear GDN maintains multi-scale temporal hierarchy. Cognitive state stores discrete facts retrievable by content. Engram handles static patterns with zero distance penalty.
+No single system covers everything. MLA+DSA provides exact sparse recall across the entire context, directed by beliefs. DeltaProduct error-corrects within-sequence state. Log-Linear GDN maintains multi-scale temporal hierarchy. Cognitive state stores discrete facts retrievable by content AND guides DSA's sparse attention toward relevant tokens. Engram handles static patterns with zero distance penalty.
 
 ## Model Configurations
 
@@ -851,6 +908,7 @@ decode speed (28% faster), and prefill (5.3× faster) at same 10.3× compression
 | **KV QAT** | Training (every forward) | 3 | `ste_quantize(k, quantizer)` in attention layers | K,V projections survive 3-bit compression |
 | **Belief QAT** | Training (every read) | 3 | `ste_quantize(values, quantizer)` in `ReadPath` | Belief representations compress losslessly |
 | **Weight QAT** | Training (every forward) | 4/3 | `WeightQuantLinear` wraps all backbone `nn.Linear` | Weight matrices deployable at 4-bit |
+| **DSA Indexer QAT** | Training (every MLA forward) | 3 | `ste_quantize(k_I, quantizer)` in `LightningIndexer` | Indexer keys survive 3-bit for global token scoring |
 | **CAGE correction** | Training (after optimizer.step) | — | `cage_step()` nudges weights toward grid | Weights converge to quantization-friendly distributions |
 | **KV cache compression** | Inference (T > window) | 3 | `QuantizedKVCache.compress()` → `decompress_slice()` | 10× KV memory reduction |
 | **Checkpoint compression** | Save/load | 3 | `QuantizedBeliefStore` in `state_dict_cognitive()` | ~10× belief tensor compression |
@@ -900,32 +958,33 @@ trains the model to be robust to the noise. Over training, weight matrices, K/V 
 and belief write paths naturally converge toward representations where information sits in
 directions that survive low-bit rounding.
 
-### Windowed MLA for Long Context
+### DSA Sparse MLA for Long Context
 
-MLA layers (L in "MMMML") default to full causal attention O(T²). At long context (>128K),
-this becomes prohibitive. Setting `mla_window_size > 0` gives MLA a sliding window, reducing
-cost to O(T × W) while cognitive state + DeltaProduct + Log-Linear GDN handle beyond-window coherence.
+MLA layers default to full causal attention O(T²). At long context (>128K), three modes are available:
 
 ```
-mla_window_size = 0       → full causal O(T²), short context training
-mla_window_size = 131072  → 128K window, enables 1M+ context
+dsa_enabled = True          → sparse global O(T×K), belief-conditioned (RECOMMENDED)
+mla_window_size = 131072    → 128K window O(T×W) (legacy fallback, no DSA)
+mla_window_size = 0         → full causal O(T²), short context only
 ```
 
-Four memory systems stack to maintain coherence at any context length:
+With DSA enabled, MLA layers use the Lightning Indexer to select the top-K most relevant tokens from the ENTIRE context, then run full attention only on those tokens. The indexer is belief-conditioned: active beliefs bias token selection toward evidence relevant to current cognitive state. This creates an active inference loop where beliefs direct attention, attention surfaces evidence, and evidence revises beliefs.
+
+Five memory systems stack to maintain coherence at any context length:
 
 | System | Range | Scaling | Role |
 |--------|-------|---------|------|
-| **MLA attention** | W tokens (window) | O(W) constant | Dense local context |
+| **MLA + DSA** | Full context (sparse) | O(T×K) | Exact sparse recall, belief-guided |
 | **DeltaProduct state** | Unlimited | O(1) fixed | Error-corrected recurrent memory |
 | **Log-Linear GDN state** | Unlimited | O(log T) growing | Hierarchical multi-scale context |
-| **Cognitive state** | Unlimited | O(1) fixed slots | Persistent beliefs, edges, goals |
+| **Cognitive state** | Unlimited | O(1) fixed slots | Persistent beliefs + DSA guidance |
 | **Engram** | Unlimited | O(1) hash | Static N-gram patterns |
 
-Memory at 1M tokens (small config, 2 MLA layers, W=128K, RotorQuant 3-bit):
-- MLA KV: ~38 MB (windowed + compressed)
+Memory at 1M tokens (small config, 2 MLA layers, DSA, RotorQuant 3-bit):
+- DSA indexer keys: ~12 MB (3-bit RotorQuant, full context)
 - DeltaProduct state: ~2 MB per layer (fixed)
 - Log-Linear GDN state: ~12 MB (log₂(1M) ≈ 20 levels)
-- Total: **~80 MB** — grows logarithmically, not linearly
+- Total: **~54 MB** — lighter than windowed MLA with global coverage
 
 ### Blockwise Attention (Inference)
 
@@ -1039,7 +1098,7 @@ memoria/core/
   state.py           — CognitiveState: beliefs, edges, goals, meta-parameters
   free_energy.py     — Bethe FE, EFE, Power Spherical entropy
   losses.py          — chunked_cross_entropy, differentiable FE proxy
-  quantize.py        — RotorQuant/PolarQuant quantization, STE, KV cache, belief store
+  quantize.py        — RotorQuant/PolarQuant quantization, STE, KV cache, belief store, DSA Lightning Indexer
   polar.py           — Polar coordinate utilities for belief representation
   ttt.py             — In-Place TTT with Titans/LaCT/DeltaProduct enhancements
   message_passing.py — Factor graph message passing with DEQ solver

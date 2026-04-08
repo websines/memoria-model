@@ -91,6 +91,20 @@ class TransformerConfig:
     # Working memory init scale (small normal around zero)
     working_memory_init_scale: float = 0.02
 
+    # DSA (DeepSeek Sparse Attention) — belief-conditioned Lightning Indexer
+    # Replaces windowed MLA with sparse global attention: a lightweight indexer
+    # scores all tokens, selects top-k, then full MLA runs on the sparse subset.
+    # Indexer keys compressed via RotorQuant STE QAT (same pipeline as KV/weights).
+    # Belief conditioning: active beliefs bias indexer scores toward relevant tokens.
+    # Set dsa_enabled=False to disable (MLA uses windowed or full causal attention).
+    dsa_enabled: bool = False          # enable belief-conditioned sparse attention
+    dsa_index_dim: int = 32            # indexer projection dimension (small = cheap scoring)
+    dsa_index_heads: int = 4           # indexer heads (parallel scoring channels)
+    dsa_top_k: int = 2048              # tokens selected per query position at inference
+    dsa_top_k_ratio: float = 0.25      # fraction selected during training (when T < dsa_top_k)
+    dsa_index_bits: int = 3            # RotorQuant bits for indexer key compression
+    dsa_belief_lambda: float = 0.1     # belief conditioning strength (0 = no belief bias)
+
     # Weight QAT (Quantization-Aware Training) via RotorQuant + CAGE
     # Applies STE quantization noise to weight matrices during forward pass,
     # training the model to produce weight distributions robust to low-bit compression.
@@ -161,6 +175,13 @@ class TrainingConfig:
     # Reference: CAGE (arXiv 2510.18784, IST-DASLab 2025)
     cage_lambda_base: float = 10.0     # CAGE correction strength at full ramp
     cage_silence_ratio: float = 0.0    # fraction of training with CAGE silent (0 = use phase-aligned schedule)
+
+    # DSA indexer KL alignment loss
+    # Trains the Lightning Indexer to predict which tokens full attention would focus on.
+    # Active during phase 1 (dense attention is cheap at short context, provides KL target).
+    # Continues at reduced weight during phase 2+3 for alignment maintenance.
+    dsa_kl_weight: float = 1.0         # KL alignment loss weight during phase 1
+    dsa_kl_weight_after: float = 0.1   # KL weight after phase 1 (maintenance)
 
     # Logging
     log_interval: int = 10

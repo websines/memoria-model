@@ -369,6 +369,21 @@ class MemoriaModel(nn.Module):
         self.transformer.init_weights()
         # Interface layers use default PyTorch init (output projections already zero-init)
 
+        # DSA: set up belief projections on Lightning Indexers now that belief_dim is known
+        if self.config.transformer.dsa_enabled:
+            belief_dim = self.config.state.belief_dim
+            from .transformer import MLACausalSelfAttention
+            for block in self.transformer.blocks:
+                if isinstance(block.attn, MLACausalSelfAttention) and block.attn.dsa_enabled:
+                    indexer = block.attn.indexer
+                    if belief_dim > 0 and not indexer.has_beliefs:
+                        indexer.belief_proj = nn.Linear(
+                            belief_dim, indexer.index_dim, bias=False,
+                        ).to(indexer.q_proj.weight.device)
+                        indexer.has_beliefs = True
+                        # Small init — belief conditioning starts subtle
+                        nn.init.normal_(indexer.belief_proj.weight, mean=0.0, std=0.01)
+
     def forward(
         self,
         idx: Tensor,
@@ -456,6 +471,9 @@ class MemoriaModel(nn.Module):
         dflash_tap_set = set(self.dflash_head.tap_indices) if self.dflash_enabled else set()
         dflash_tapped: dict[int, Tensor] = {}
 
+        # DSA: extract active belief vectors for belief-conditioned attention
+        dsa_beliefs = belief_cache.beliefs if self.config.transformer.dsa_enabled else None
+
         for i, block in enumerate(self.transformer.blocks):
             if self.training and T_total > self.config.transformer.sliding_window_size:
                 x = torch.utils.checkpoint.checkpoint(
@@ -469,6 +487,7 @@ class MemoriaModel(nn.Module):
                     x, x0, cos, sin,
                     self.transformer.resid_lambdas[i],
                     self.transformer.x0_lambdas[i],
+                    beliefs=dsa_beliefs,
                 )
 
             # DFlash: save hidden states at tapped layers (detached — no extra grad cost)
@@ -569,6 +588,7 @@ class MemoriaModel(nn.Module):
                         x, x0, cos, sin,
                         self.transformer.resid_lambdas[layer_global],
                         self.transformer.x0_lambdas[layer_global],
+                        beliefs=dsa_beliefs,
                     )
 
                 # Step 3: Lifeline — anchor tokens, leave WM alone
@@ -842,6 +862,22 @@ class MemoriaModel(nn.Module):
                         )
             result['loss_draft'] = loss_draft
 
+            # DSA KL alignment loss: collect from all MLA layers with indexers
+            loss_dsa_kl = torch.tensor(0.0, device=idx.device)
+            if self.config.transformer.dsa_enabled:
+                from .transformer import MLACausalSelfAttention
+                n_dsa = 0
+                for block in self.transformer.blocks:
+                    if isinstance(block.attn, MLACausalSelfAttention) and block.attn.dsa_enabled:
+                        kl = block.attn._last_dsa_kl_loss
+                        if kl is not None:
+                            loss_dsa_kl = loss_dsa_kl + kl
+                            n_dsa += 1
+                            block.attn._last_dsa_kl_loss = None  # consumed
+                if n_dsa > 0:
+                    loss_dsa_kl = loss_dsa_kl / n_dsa
+            result['loss_dsa_kl'] = loss_dsa_kl
+
             # Kendall/Gal uncertainty weighting (CVPR 2018)
             def _uw(loss_term: Tensor, log_s: Tensor) -> Tensor:
                 """Uncertainty-weighted loss: L/(2*exp(2s)) + s"""
@@ -861,11 +897,20 @@ class MemoriaModel(nn.Module):
             )
             L_aux_w = _uw(L_aux, self.log_sigma['aux'])
 
+            # DSA KL weight: full weight during phase 1 (indexer alignment while
+            # dense attention is cheap), reduced weight after (maintenance).
+            dsa_kl_w = 0.0
+            if self.config.transformer.dsa_enabled and loss_dsa_kl.item() > 0:
+                tc = self.config.training
+                dsa_kl_w = tc.dsa_kl_weight if alpha == 0.0 else tc.dsa_kl_weight_after
+
             # Alpha gating preserved: phase 1 = token only, phase 2-3 = all terms
             # Draft loss is added to aux but is NOT alpha-gated itself (it's inside
             # L_aux_w which IS alpha-gated). To let it train during phase 1, we add
             # it directly to the total loss as well.
-            result['loss'] = L_token_w + alpha * L_fe_w + alpha * L_aux_w + w_draft * loss_draft
+            # DSA KL loss is NOT alpha-gated — trains from step 0 (like draft loss).
+            result['loss'] = (L_token_w + alpha * L_fe_w + alpha * L_aux_w
+                              + w_draft * loss_draft + dsa_kl_w * loss_dsa_kl)
 
             result['log_sigma_token'] = self.log_sigma['token'].item()
             result['log_sigma_fe'] = self.log_sigma['fe'].item()

@@ -291,11 +291,12 @@ class MLACausalSelfAttention(nn.Module):
 
     Final key: K = cat(K_rope_with_RoPE, K_nope)
 
-    Supports two attention modes:
-    - Full causal (mla_window_size=0): O(T²) — use for shorter contexts
-    - Windowed (mla_window_size>0): O(T×W) — use for long context (>128K)
-      With RotorQuant KV compression, windowed MLA uses ~38 MB at 1M tokens.
-      Cognitive state + DeltaProduct handle coherence beyond the window.
+    Supports three attention modes:
+    - Full causal (mla_window_size=0, dsa_enabled=False): O(T²) — short contexts
+    - Windowed (mla_window_size>0, dsa_enabled=False): O(T×W) — long context fallback
+    - DSA sparse (dsa_enabled=True): O(T×K) — belief-conditioned sparse global attention
+      Lightning Indexer scores all tokens, selects top-k, MLA runs on sparse subset.
+      Indexer keys RotorQuant-compressed via STE QAT. Beliefs bias token selection.
     """
 
     def __init__(self, config: TransformerConfig, layer_idx: int):
@@ -331,8 +332,26 @@ class MLACausalSelfAttention(nn.Module):
         # Output projection
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-        # RotorQuant KV compression for windowed MLA at long context
-        if self.mla_window_size > 0:
+        # DSA: Belief-Conditioned Lightning Indexer
+        self.dsa_enabled = getattr(config, 'dsa_enabled', False)
+        if self.dsa_enabled:
+            from ..core.quantize import LightningIndexer
+            # belief_dim=0 at init; set later by MemoriaModel once state is available
+            self.indexer = LightningIndexer(
+                hidden_dim=self.n_embd,
+                index_dim=config.dsa_index_dim,
+                n_heads=config.dsa_index_heads,
+                bits=config.dsa_index_bits,
+                belief_dim=0,
+                belief_lambda=config.dsa_belief_lambda,
+            )
+            self.dsa_top_k = config.dsa_top_k
+            self.dsa_top_k_ratio = config.dsa_top_k_ratio
+            # Store last KL loss for training loop to pick up
+            self._last_dsa_kl_loss = None
+
+        # RotorQuant KV compression for windowed MLA at long context (non-DSA fallback)
+        if self.mla_window_size > 0 and not self.dsa_enabled:
             from ..core.quantize import QuantizedKVCache, _make_quantizer, ste_quantize
             self.mla_kv_cache = QuantizedKVCache(self.head_dim, bits=3)
             self._mla_ste_quantizer = _make_quantizer(self.head_dim, bits=3)
@@ -341,7 +360,8 @@ class MLACausalSelfAttention(nn.Module):
         # YaRN attention temperature scaling
         self._yarn_scale = 1.0
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
+                beliefs: Tensor | None = None) -> Tensor:
         B, T, C = x.size()
 
         # Query: standard projection + full RoPE
@@ -374,56 +394,163 @@ class MLACausalSelfAttention(nn.Module):
         # QK norm
         q, k = norm(q), norm(k)
 
-        # QAT: during training with windowed MLA, inject quantization noise
-        if self.training and self.mla_window_size > 0:
-            k = self._ste_quantize(k, self._mla_ste_quantizer)
-            v = self._ste_quantize(v, self._mla_ste_quantizer)
+        # DSA: belief-conditioned sparse attention
+        if self.dsa_enabled:
+            y = self._dsa_attention(x, q, k, v, beliefs)
+        else:
+            # Non-DSA path: windowed or full causal
+            # QAT: during training with windowed MLA, inject quantization noise
+            if self.training and self.mla_window_size > 0:
+                k = self._ste_quantize(k, self._mla_ste_quantizer)
+                v = self._ste_quantize(v, self._mla_ste_quantizer)
 
-        # GQA: expand kv heads if needed
+            # GQA: expand kv heads if needed
+            if self.n_kv_head < self.n_head:
+                rep = self.n_head // self.n_kv_head
+                k = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
+                v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
+
+            W = self.mla_window_size
+            if W <= 0 or T <= W:
+                # Full causal attention
+                if _flash_attn_available and x.is_cuda and W > 0:
+                    y = flash_attn_func(
+                        q, k, v,
+                        causal=True,
+                        window_size=(W - 1, 0) if W > 0 else (-1, -1),
+                        softmax_scale=self._yarn_scale / math.sqrt(self.head_dim),
+                    )
+                else:
+                    q = q.transpose(1, 2)  # [B, H, T, D]
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
+                    y = F.scaled_dot_product_attention(
+                        q, k, v, is_causal=True,
+                        scale=self._yarn_scale / math.sqrt(self.head_dim),
+                    )
+                    y = y.transpose(1, 2)
+            else:
+                # Windowed MLA with RotorQuant KV compression for long context
+                if _flash_attn_available and x.is_cuda:
+                    y = flash_attn_func(
+                        q, k, v,
+                        causal=True,
+                        window_size=(W - 1, 0),
+                        softmax_scale=self._yarn_scale / math.sqrt(self.head_dim),
+                    )
+                else:
+                    q = q.transpose(1, 2)
+                    k = k.transpose(1, 2)
+                    v = v.transpose(1, 2)
+                    y = self._windowed_attention(q, k, v, T)
+                    y = y.transpose(1, 2)
+
+        y = y.contiguous().view(B, T, -1)
+        y = self.c_proj(y)
+        return y
+
+    def _dsa_attention(
+        self,
+        x: Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        beliefs: Tensor | None,
+    ) -> Tensor:
+        """Belief-conditioned sparse attention via Lightning Indexer.
+
+        1. Indexer scores all tokens (cheap, d_I=32, RotorQuant compressed)
+        2. Select top-k tokens per query position
+        3. Gather sparse KV at selected indices
+        4. Run full MLA attention on sparse subset
+        5. Compute KL alignment loss (training only)
+
+        During training at short context (T <= top_k), runs full attention
+        and computes KL loss for indexer alignment.
+        """
+        from ..core.quantize import gather_sparse_kv
+
+        B, T, _, _ = q.shape
+        scale = self._yarn_scale / math.sqrt(self.head_dim)
+
+        # Compute indexer scores
+        indexer_scores = self.indexer.compute_scores(x, beliefs)  # [B, T, T]
+
+        # Determine top-k for current context
+        # During training: use ratio (so indexer always has to choose)
+        # During inference: use absolute top_k
+        if self.training:
+            effective_k = max(1, int(T * self.dsa_top_k_ratio))
+        else:
+            effective_k = min(self.dsa_top_k, T)
+
+        # GQA: expand kv heads if needed (before sparse gather)
         if self.n_kv_head < self.n_head:
             rep = self.n_head // self.n_kv_head
             k = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
             v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
 
-        W = self.mla_window_size
-        if W <= 0 or T <= W:
-            # Full causal attention (short context or no window configured)
-            if _flash_attn_available and x.is_cuda and W > 0:
-                # FlashAttention-2 with native sliding window
-                q_fa = q.transpose(1, 2)  # flash_attn expects [B, T, H, D]... wait
-                y = flash_attn_func(
-                    q, k, v,
-                    causal=True,
-                    window_size=(W - 1, 0) if W > 0 else (-1, -1),
-                    softmax_scale=self._yarn_scale / math.sqrt(self.head_dim),
-                )
-            else:
-                q = q.transpose(1, 2)  # [B, H, T, D]
-                k = k.transpose(1, 2)
-                v = v.transpose(1, 2)
-                y = F.scaled_dot_product_attention(
-                    q, k, v, is_causal=True,
-                    scale=self._yarn_scale / math.sqrt(self.head_dim),
-                )
-                y = y.transpose(1, 2)
-        else:
-            # Windowed MLA with RotorQuant KV compression for long context
-            if _flash_attn_available and x.is_cuda:
-                y = flash_attn_func(
-                    q, k, v,
-                    causal=True,
-                    window_size=(W - 1, 0),
-                    softmax_scale=self._yarn_scale / math.sqrt(self.head_dim),
-                )
-            else:
-                q = q.transpose(1, 2)
-                k = k.transpose(1, 2)
-                v = v.transpose(1, 2)
-                y = self._windowed_attention(q, k, v, T)
-                y = y.transpose(1, 2)
+        if effective_k >= T:
+            # Full attention (context smaller than top-k) — also get KL target
+            q_t = q.transpose(1, 2)  # [B, H, T, D]
+            k_t = k.transpose(1, 2)
+            v_t = v.transpose(1, 2)
+            y = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=True, scale=scale,
+            )
+            y = y.transpose(1, 2)
 
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+            # KL alignment loss: compare indexer to dense attention
+            if self.training:
+                with torch.no_grad():
+                    attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale
+                    causal = torch.triu(
+                        torch.full((T, T), float('-inf'), device=q.device, dtype=q.dtype),
+                        diagonal=1,
+                    )
+                    attn_weights = torch.softmax(attn_weights + causal, dim=-1)
+                self._last_dsa_kl_loss = self.indexer.compute_kl_loss(
+                    indexer_scores, attn_weights
+                )
+        else:
+            # Sparse attention: select top-k, gather, attend
+            indices = self.indexer.select_topk(indexer_scores, effective_k)  # [B, T, k]
+
+            # Gather sparse KV: [B, T, k, H, D]
+            k_sparse, v_sparse = gather_sparse_kv(k, v, indices)
+
+            # Attention: each query attends to its own top-k keys
+            # q: [B, T, H, D] → [B, T, 1, H, D] for bmm with [B, T, k, H, D]
+            # Reshape for per-query attention: merge B,T into batch dim
+            BT = B * T
+            q_r = q.reshape(BT, 1, self.n_head, self.head_dim).transpose(1, 2)  # [BT, H, 1, D]
+            k_r = k_sparse.reshape(BT, effective_k, self.n_head, self.head_dim).transpose(1, 2)  # [BT, H, k, D]
+            v_r = v_sparse.reshape(BT, effective_k, self.n_head, self.head_dim).transpose(1, 2)  # [BT, H, k, D]
+
+            y = F.scaled_dot_product_attention(q_r, k_r, v_r, scale=scale)  # [BT, H, 1, D]
+            y = y.transpose(1, 2).reshape(B, T, self.n_head, self.head_dim)
+
+            # KL loss: during training, periodically compute dense attention for alignment
+            if self.training:
+                # Compute KL on indexer scores vs sparse attention weights
+                # Use the selected indices to build a sparse target
+                with torch.no_grad():
+                    sparse_scores = torch.matmul(q_r, k_r.transpose(-2, -1)) * scale  # [BT, H, 1, k]
+                    sparse_weights = torch.softmax(sparse_scores, dim=-1)  # [BT, H, 1, k]
+                    # Build full-context target from sparse weights
+                    sparse_weights = sparse_weights.squeeze(2).mean(dim=1)  # [BT, k]
+                    full_target = torch.zeros(BT, T, device=q.device, dtype=q.dtype)
+                    idx_flat = indices.reshape(BT, effective_k)
+                    full_target.scatter_(1, idx_flat, sparse_weights)
+                    full_target = full_target.view(B, T, T)
+                    # Normalize
+                    full_target = full_target / (full_target.sum(dim=-1, keepdim=True) + 1e-8)
+                    # Wrap as [B, 1, T, T] for KL computation
+                    attn_weights = full_target.unsqueeze(1)
+                self._last_dsa_kl_loss = self.indexer.compute_kl_loss(
+                    indexer_scores, attn_weights
+                )
+
         return y
 
     def _windowed_attention(self, q: Tensor, k: Tensor, v: Tensor, T: int) -> Tensor:
@@ -570,10 +697,15 @@ class Block(nn.Module):
         self._attn_type = attn_type
 
     def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor,
-                resid_lambda: Tensor, x0_lambda: Tensor) -> Tensor:
+                resid_lambda: Tensor, x0_lambda: Tensor,
+                beliefs: Tensor | None = None) -> Tensor:
         # Per-layer residual scaling (from autoresearch)
         x = resid_lambda * x + x0_lambda * x0
-        x = x + self.attn(norm(x), cos, sin)
+        # Pass beliefs to MLA layers for DSA belief-conditioned attention
+        if isinstance(self.attn, MLACausalSelfAttention) and self.attn.dsa_enabled:
+            x = x + self.attn(norm(x), cos, sin, beliefs=beliefs)
+        else:
+            x = x + self.attn(norm(x), cos, sin)
         x = x + self.mlp(norm(x))
         return x
 
@@ -719,6 +851,11 @@ class Transformer(nn.Module):
                 nn.init.normal_(attn.k_up.weight, mean=0.0, std=0.01)
                 nn.init.normal_(attn.v_up.weight, mean=0.0, std=0.01)
                 nn.init.zeros_(attn.c_proj.weight)
+                # DSA: init Lightning Indexer projections
+                if attn.dsa_enabled:
+                    nn.init.uniform_(attn.indexer.q_proj.weight, -s, s)
+                    nn.init.uniform_(attn.indexer.k_proj.weight, -s, s)
+                    nn.init.normal_(attn.indexer.head_gate.weight, mean=0.0, std=0.01)
             else:
                 nn.init.uniform_(attn.c_q.weight, -s, s)
                 nn.init.uniform_(attn.c_k.weight, -s, s)

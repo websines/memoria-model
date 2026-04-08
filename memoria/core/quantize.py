@@ -1,4 +1,4 @@
-"""Quantization via RotorQuant block-diagonal rotations + CAGE weight QAT.
+"""Quantization via RotorQuant block-diagonal rotations + CAGE weight QAT + DSA.
 
 Primary backend: RotorQuant (PlanarQuant for 3-bit, IsoQuant for 4-bit)
   - Block-diagonal 2D/4D rotations: O(d) FMAs, fully parallelizable
@@ -21,9 +21,18 @@ Weight QAT via CAGE (Curvature-Aware Gradient Estimation):
     weight -= lr * lambda * (weight - Q(weight))
   - Phase-aligned schedule: silent phase 1, ramp phase 2, full phase 3
 
+DSA (Belief-Conditioned Sparse Attention) via Lightning Indexer:
+  - Lightweight learned indexer scores all tokens, selects top-k for full MLA
+  - Indexer keys compressed via RotorQuant STE QAT (same pipeline as KV/weights)
+  - Belief conditioning: active beliefs bias scores toward relevant tokens
+  - KL alignment loss trains indexer against dense attention distribution
+  - Replaces windowed MLA with sparse global MLA at long context
+
 Reference: RotorQuant — scrya.com/rotorquant.pdf (March 2026)
 Reference: TurboQuant — arxiv.org/abs/2504.19874 (ICLR 2026)
 Reference: CAGE — arxiv.org/abs/2510.18784 (IST-DASLab 2025)
+Reference: DeepSeek-V3.2 DSA — arxiv.org/abs/2512.02556 (DeepSeek 2025)
+Reference: NSA — arxiv.org/abs/2502.11089 (ACL 2025)
 """
 
 import math
@@ -511,3 +520,239 @@ def get_cage_lambda(step: int, config) -> float:
         return lambda_base * progress
     else:
         return lambda_base
+
+
+# ── DSA: Belief-Conditioned Lightning Indexer ──
+
+class LightningIndexer(nn.Module):
+    """Learned sparse token selector for MLA with belief conditioning.
+
+    Scores all tokens via small projections, selects top-k for full attention.
+    Indexer keys are RotorQuant-compressed via STE QAT — same pipeline as
+    KV cache and weight quantization.
+
+    Belief conditioning: active belief vectors are projected into indexer space.
+    Their similarity to each token's indexer key adds an additive bias to the
+    score, so MLA preferentially attends to tokens relevant to cognitive state.
+
+    Score computation (per indexer head j):
+        I(t, s) = Σ_j w(t,j) · ReLU( q_I(t,j) · k_I(s,j) )
+                  + λ · max_b sim(k_I(s), belief_proj(b))
+
+    Reference: DeepSeek-V3.2 (arxiv.org/abs/2512.02556)
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        index_dim: int = 32,
+        n_heads: int = 4,
+        bits: int = 3,
+        belief_dim: int = 0,
+        belief_lambda: float = 0.1,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.index_dim = index_dim
+        self.n_heads = n_heads
+        self.bits = bits
+        self.belief_lambda = belief_lambda
+
+        # Query and key projections into small indexer space
+        self.q_proj = nn.Linear(hidden_dim, n_heads * index_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_dim, n_heads * index_dim, bias=False)
+
+        # Per-head learned weights: w(t, j) — data-dependent head gating
+        self.head_gate = nn.Linear(hidden_dim, n_heads, bias=False)
+
+        # RotorQuant for indexer keys (STE QAT during training)
+        self.quantizer = _make_quantizer(index_dim, bits)
+
+        # Belief conditioning projections (if beliefs exist)
+        self.has_beliefs = belief_dim > 0
+        if self.has_beliefs:
+            self.belief_proj = nn.Linear(belief_dim, index_dim, bias=False)
+
+    def compute_scores(
+        self,
+        hidden: Tensor,
+        beliefs: Tensor | None = None,
+    ) -> Tensor:
+        """Compute indexer scores for all token pairs.
+
+        Args:
+            hidden: [B, T, D] — hidden states from transformer
+            beliefs: [N_active, D_belief] — active belief vectors (optional)
+
+        Returns:
+            scores: [B, T, T] — indexer scores (query t, key s)
+        """
+        B, T, _ = hidden.shape
+
+        # Project to indexer space
+        q = self.q_proj(hidden).view(B, T, self.n_heads, self.index_dim)
+        k = self.k_proj(hidden).view(B, T, self.n_heads, self.index_dim)
+
+        # STE quantize indexer keys (RotorQuant noise during training)
+        k_flat = k.reshape(-1, self.index_dim)
+        k_flat = ste_quantize(k_flat, self.quantizer)
+        k = k_flat.view(B, T, self.n_heads, self.index_dim)
+
+        # Per-head gating: w(t, j) via softmax
+        w = torch.softmax(self.head_gate(hidden), dim=-1)  # [B, T, n_heads]
+
+        # Dot-product scores per head: [B, T_q, n_heads, T_k]
+        # q: [B, T, H, d_I], k: [B, T, H, d_I]
+        # score_per_head[b, t, j, s] = q[b,t,j] · k[b,s,j]
+        scores_per_head = torch.einsum('bthd,bshd->bths', q, k)
+
+        # ReLU gate — only positively correlated tokens contribute
+        scores_per_head = torch.relu(scores_per_head)
+
+        # Weighted sum across heads: I(t, s) = Σ_j w(t,j) · ReLU(q·k)
+        # w: [B, T, H] → [B, T, H, 1], scores: [B, T, H, T]
+        scores = (w.unsqueeze(-1) * scores_per_head).sum(dim=2)  # [B, T, T]
+
+        # Belief conditioning: additive bias from belief relevance
+        if self.has_beliefs and beliefs is not None and beliefs.shape[0] > 0:
+            scores = self._add_belief_bias(scores, k, beliefs)
+
+        # Causal mask — can only attend to past tokens
+        causal_mask = torch.triu(
+            torch.full((T, T), float('-inf'), device=scores.device, dtype=scores.dtype),
+            diagonal=1,
+        )
+        scores = scores + causal_mask
+
+        return scores
+
+    def _add_belief_bias(
+        self,
+        scores: Tensor,
+        k: Tensor,
+        beliefs: Tensor,
+    ) -> Tensor:
+        """Add belief-conditioned bias to indexer scores.
+
+        For each key token s, compute max similarity to any active belief.
+        This biases attention toward tokens relevant to current cognitive state.
+
+        Args:
+            scores: [B, T, T] — current indexer scores
+            k: [B, T, n_heads, d_I] — indexer keys
+            beliefs: [N_active, D_belief] — active belief vectors
+
+        Returns:
+            scores with belief bias added: [B, T, T]
+        """
+        # Project beliefs to indexer space
+        b_proj = self.belief_proj(beliefs)  # [N_active, d_I]
+
+        # Average across indexer heads for belief matching
+        k_avg = k.mean(dim=2)  # [B, T, d_I]
+
+        # Similarity: [B, T, N_active]
+        sim = torch.einsum('btd,nd->btn', k_avg, b_proj)
+
+        # Max belief relevance per token: [B, T]
+        belief_score = sim.max(dim=-1).values
+
+        # Add as column bias (same bias for all query positions)
+        scores = scores + self.belief_lambda * belief_score.unsqueeze(1)
+
+        return scores
+
+    def select_topk(
+        self,
+        scores: Tensor,
+        k: int,
+    ) -> Tensor:
+        """Select top-k token indices per query position.
+
+        Args:
+            scores: [B, T, T] — indexer scores
+            k: number of tokens to select per query
+
+        Returns:
+            indices: [B, T, k] — selected token indices
+        """
+        # Clamp k to available tokens
+        T = scores.shape[-1]
+        k = min(k, T)
+
+        # Top-k selection per query position
+        _, indices = scores.topk(k, dim=-1)  # [B, T, k]
+        return indices
+
+    def compute_kl_loss(
+        self,
+        indexer_scores: Tensor,
+        attn_weights: Tensor,
+    ) -> Tensor:
+        """KL alignment loss: train indexer to match dense attention distribution.
+
+        Args:
+            indexer_scores: [B, T, T] — raw indexer scores (logits)
+            attn_weights: [B, H, T, T] — dense attention weights from full MLA
+
+        Returns:
+            KL divergence loss (scalar)
+        """
+        # Aggregate dense attention across heads (L1-normalized as in DSA paper)
+        # attn_weights: [B, H, T, T] → [B, T, T]
+        target = attn_weights.sum(dim=1)  # sum across heads
+        target = target / (target.sum(dim=-1, keepdim=True) + 1e-8)  # L1 normalize
+
+        # Replace -inf in scores with large negative finite value for log_softmax
+        scores_safe = indexer_scores.clone()
+        scores_safe[scores_safe == float('-inf')] = -1e9
+
+        # KL(target || pred) — target is the "true" distribution
+        # Only compute where target > 0 to avoid 0 * log(0) = NaN
+        log_pred = torch.log_softmax(scores_safe, dim=-1)
+        # Mask out zero-target entries
+        nonzero = target > 1e-10
+        kl_elem = torch.zeros_like(target)
+        kl_elem[nonzero] = target[nonzero] * (
+            target[nonzero].log() - log_pred[nonzero]
+        )
+        kl = kl_elem.sum(dim=-1)
+
+        return kl.mean()
+
+
+def gather_sparse_kv(
+    k: Tensor,
+    v: Tensor,
+    indices: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Gather K,V at selected token indices for sparse attention.
+
+    Args:
+        k: [B, T, H, D] — full key tensor
+        v: [B, T, H, D] — full value tensor
+        indices: [B, T_q, top_k] — selected indices per query
+
+    Returns:
+        k_sparse: [B, T_q, top_k, H, D]
+        v_sparse: [B, T_q, top_k, H, D]
+    """
+    B, T, H, D = k.shape
+    T_q = indices.shape[1]
+    top_k = indices.shape[2]
+
+    # Flatten indices for gather: [B, T_q * top_k]
+    flat_idx = indices.reshape(B, -1)  # [B, T_q * top_k]
+
+    # Expand for multi-head gather: [B, T_q*top_k, H, D]
+    flat_idx_exp = flat_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, H, D)
+
+    # Gather from full tensors
+    k_gathered = k.gather(1, flat_idx_exp)  # [B, T_q*top_k, H, D]
+    v_gathered = v.gather(1, flat_idx_exp)
+
+    # Reshape to per-query groups
+    k_sparse = k_gathered.view(B, T_q, top_k, H, D)
+    v_sparse = v_gathered.view(B, T_q, top_k, H, D)
+
+    return k_sparse, v_sparse
