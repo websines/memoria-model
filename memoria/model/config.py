@@ -91,6 +91,14 @@ class TransformerConfig:
     # Working memory init scale (small normal around zero)
     working_memory_init_scale: float = 0.02
 
+    # Weight QAT (Quantization-Aware Training) via RotorQuant + CAGE
+    # Applies STE quantization noise to weight matrices during forward pass,
+    # training the model to produce weight distributions robust to low-bit compression.
+    # CAGE post-step correction nudges weights toward the quantization grid.
+    # Set weight_qat_bits=0 to disable.
+    weight_qat_bits: int = 4           # default bit-width for weight QAT (0 = disabled)
+    weight_qat_mlp_bits: int = 3       # MLP weights get more aggressive quantization (0 = use weight_qat_bits)
+
     # DFlash block diffusion draft head (speculative decoding)
     dflash_enabled: bool = False       # enable DFlash draft head
     dflash_n_layers: int = 3           # draft head layers (small — this is the "fast" path)
@@ -146,6 +154,13 @@ class TrainingConfig:
     skyladder_ratio: float = 0.6      # fraction of training spent ramping (0 = disabled)
     skyladder_start: int = 256        # initial context length (small = fast early training)
     skyladder_schedule: str = "linear"  # "linear", "exponential", or "step"
+
+    # CAGE (Curvature-Aware Gradient Estimation) for weight QAT
+    # Post-optimizer correction that pushes weights toward quantization grid.
+    # Silent during phase 1, ramps during phase 2, full strength in phase 3.
+    # Reference: CAGE (arXiv 2510.18784, IST-DASLab 2025)
+    cage_lambda_base: float = 10.0     # CAGE correction strength at full ramp
+    cage_silence_ratio: float = 0.0    # fraction of training with CAGE silent (0 = use phase-aligned schedule)
 
     # Logging
     log_interval: int = 10

@@ -249,8 +249,16 @@ class LogLinearDeltaProductBlock(nn.Module):
         V = self.head_v_dim
         n_h = self.num_householder
 
-        # ── Projections (explicit bf16 weight cast, preserves autograd) ──
+        # ── Projections ──
+        # Handles both plain nn.Linear and WeightQuantLinear wrappers.
+        # WeightQuantLinear.forward() applies STE quantization noise + dtype cast.
+        # Plain nn.Linear needs explicit weight casting for bf16 input.
+        from ..core.quantize import WeightQuantLinear
         def _lin(proj, inp):
+            if isinstance(proj, WeightQuantLinear):
+                # WeightQuantLinear.forward handles STE + dtype casting
+                return proj(inp)
+            # Plain nn.Linear: manual bf16 weight cast (original behavior)
             w = proj.weight.to(_bf)
             b = proj.bias.to(_bf) if proj.bias is not None else None
             return nn.functional.linear(inp, w, b)

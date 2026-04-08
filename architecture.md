@@ -823,19 +823,20 @@ TTT is the self-improvement mechanism. During BOTH training and inference:
 
 **Loaded via content matching**: Belief slots are mutable storage locations, not stable semantic coordinates. EWC on raw slots is invalid. Instead, each seed belief is matched to the closest existing belief by cosine similarity. Only transferred if the seed has higher confidence than the match.
 
-## Quantization-Aware Training (RotorQuant)
+## Quantization-Aware Training (RotorQuant + CAGE)
 
-KV cache and belief storage use RotorQuant block-diagonal rotations for compression.
-During training, STE (Straight-Through Estimator) injects quantization noise so the model
-learns representations robust to 3-bit compression. This makes inference-time KV compression
-and checkpoint belief quantization nearly lossless.
+Three quantization paths, all using RotorQuant block-diagonal rotations:
+
+1. **Activation QAT** (KV cache, beliefs): 3-bit STE noise during training → lossless runtime compression
+2. **Weight QAT** (all transformer backbone nn.Linear): 4-bit (attention/DeltaProduct) or 3-bit (MLP) STE noise → deployable at low-bit with near-zero quality loss
+3. **CAGE correction**: Post-optimizer step nudges weights toward quantization grid points
 
 ### Backend Selection
 
 | Backend | Rotation | FMAs (d=128) | Centroids | When Used |
 |---------|----------|-------------|-----------|-----------|
-| **PlanarQuantMSE** | 2D Givens | 256 | Lloyd-Max (MSE-optimal) | 3-bit, `rotorquant` installed |
-| **IsoQuantMSE** | 4D quaternion | 512 | Lloyd-Max | 4-bit, `rotorquant` installed |
+| **PlanarQuantMSE** | 2D Givens | 256 | Lloyd-Max (MSE-optimal) | 3-bit (KV, beliefs, MLP weights), `rotorquant` installed |
+| **IsoQuantMSE** | 4D quaternion | 512 | Lloyd-Max | 4-bit (attention/DeltaProduct weights), `rotorquant` installed |
 | **PolarQuantizer** | Full d×d QR | d² | Uniform scalar | Fallback (no external deps) |
 
 Install RotorQuant: `pip install -e ".[rotorquant]"` (optional, PolarQuantizer fallback works without it).
@@ -845,12 +846,47 @@ decode speed (28% faster), and prefill (5.3× faster) at same 10.3× compression
 
 ### Where Quantization Acts
 
-| Path | When | Mechanism | Effect |
-|------|------|-----------|--------|
-| **KV QAT** | Training (every forward) | `ste_quantize(k, quantizer)` in `SlidingWindowAttention.forward()` | Model learns K,V projections that survive 3-bit quantization |
-| **Belief QAT** | Training (every read) | `ste_quantize(values, quantizer)` in `ReadPath.forward()` | Belief representations become quantization-robust |
-| **KV cache compression** | Inference (T > window) | `QuantizedKVCache.compress()` → blockwise `decompress_slice()` | 10× KV memory reduction for long sequences |
-| **Checkpoint compression** | Save/load | `QuantizedBeliefStore` in `state_dict_cognitive()` | ~10× belief tensor compression in checkpoints |
+| Path | When | Bits | Mechanism | Effect |
+|------|------|------|-----------|--------|
+| **KV QAT** | Training (every forward) | 3 | `ste_quantize(k, quantizer)` in attention layers | K,V projections survive 3-bit compression |
+| **Belief QAT** | Training (every read) | 3 | `ste_quantize(values, quantizer)` in `ReadPath` | Belief representations compress losslessly |
+| **Weight QAT** | Training (every forward) | 4/3 | `WeightQuantLinear` wraps all backbone `nn.Linear` | Weight matrices deployable at 4-bit |
+| **CAGE correction** | Training (after optimizer.step) | — | `cage_step()` nudges weights toward grid | Weights converge to quantization-friendly distributions |
+| **KV cache compression** | Inference (T > window) | 3 | `QuantizedKVCache.compress()` → `decompress_slice()` | 10× KV memory reduction |
+| **Checkpoint compression** | Save/load | 3 | `QuantizedBeliefStore` in `state_dict_cognitive()` | ~10× belief tensor compression |
+
+### Weight QAT: Which Layers
+
+Quantized (via `WeightQuantLinear` wrapper):
+- H-block projections: q/k/v/b/a/g/o/l_proj (4-bit, `IsoQuantMSE`)
+- MLA projections: c_q, c_kv_compress, k_up, v_up, c_k_rope, c_proj (4-bit)
+- MLP: c_fc, c_proj (3-bit, `PlanarQuantMSE` — MLPs tolerate aggressive quantization)
+
+NOT quantized (kept bf16/fp32):
+- Token embeddings, LM head (lookup tables, need precision for rare tokens)
+- State interface layers (bridge cognitive state and hidden stream)
+- Cognitive state (beliefs, edges, goals — knowledge store)
+- DFlash draft head, Telos, SleepGate, EdgeProposer, Controller (small, sensitive)
+- Short convolutions in DeltaProduct (tiny, affect recurrent state quality)
+
+### CAGE Schedule (Phase-Aligned)
+
+CAGE is silent during phase 1 (model learns language freely), ramps during phase 2
+(cognitive awakening), and runs at full strength in phase 3:
+
+```
+Phase 1 (0 → phase1_steps):      λ = 0              (silent)
+Phase 2 (phase1_steps → +phase2): λ ramps 0 → λ_base (nudging begins)
+Phase 3 (remainder):              λ = λ_base          (full correction)
+```
+
+The CAGE correction is optimizer-agnostic (works with both Muon and AdamW):
+```
+e = weight - Q(weight)           # quantization error
+weight -= lr × λ × e             # push toward nearest grid point
+```
+
+Reference: CAGE (arXiv 2510.18784, IST-DASLab 2025) — halves quantization error vs STE alone.
 
 ### STE Gradient Flow
 
@@ -860,8 +896,9 @@ Backward: grad_output → identity → grad_input   (straight-through)
 ```
 
 The STE ensures gradients flow through as if no quantization occurred, while the forward pass
-trains the model to be robust to the noise. Over training, K/V projections and belief write paths
-naturally converge toward representations where information sits in directions that survive 3-bit rounding.
+trains the model to be robust to the noise. Over training, weight matrices, K/V projections,
+and belief write paths naturally converge toward representations where information sits in
+directions that survive low-bit rounding.
 
 ### Windowed MLA for Long Context
 

@@ -180,6 +180,19 @@ def train(
         model = MemoriaModel(config)
     model.init_weights()
 
+    # Weight QAT: wrap eligible nn.Linear with STE quantization
+    if config.transformer.weight_qat_bits > 0:
+        from ..core.quantize import apply_weight_qat
+        patched = apply_weight_qat(
+            model,
+            bits=config.transformer.weight_qat_bits,
+            mlp_bits=config.transformer.weight_qat_mlp_bits,
+        )
+        if is_main:
+            print(f"  Weight QAT: patched {len(patched)} layers "
+                  f"({config.transformer.weight_qat_bits}-bit default, "
+                  f"{config.transformer.weight_qat_mlp_bits or config.transformer.weight_qat_bits}-bit MLP)")
+
     # Optimizer
     optimizer = setup_optimizer(model, config)
 
@@ -389,6 +402,17 @@ def train(
             if clip_params:
                 torch.nn.utils.clip_grad_norm_(clip_params, tc.grad_clip_norm)
         optimizer.step()
+
+        # CAGE post-step correction: nudge weights toward quantization grid
+        cage_lam = 0.0
+        if config.transformer.weight_qat_bits > 0:
+            from ..core.quantize import cage_step, get_cage_lambda
+            cage_lam = get_cage_lambda(step, config)
+            if cage_lam > 0:
+                # Use matrix_lr as the reference LR (most quantized params are Muon)
+                current_lr = tc.matrix_lr * lr_mult
+                cage_step(base_model, lr=current_lr, cage_lambda=cage_lam)
+
         optimizer.zero_grad(set_to_none=True)
 
         # Per-component NaN/Inf detection (zeroes out bad components to prevent cascade)
@@ -507,6 +531,7 @@ def train(
                 'deq/jac_loss': last_jac_loss,
                 'deq/solver_steps': last_deq_steps,
                 'dflash/loss_draft': result.get('loss_draft', torch.tensor(0.0)).item(),
+                'cage_lambda': cage_lam if config.transformer.weight_qat_bits > 0 else 0.0,
             }
             # Per-operation pass2 diagnostics — essential for isolating which
             # of the 12 structural operations is misbehaving during training.
