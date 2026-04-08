@@ -51,6 +51,65 @@ Previous architectures have gaps: Mamba-2 compresses passively between TTT steps
 
 Each system handles something the others cannot. MLA+DSA gives exact sparse recall across the full context, guided by cognitive state beliefs. DeltaProduct error-corrects within-sequence state. The Fenwick hierarchy provides multi-scale temporal context. Cognitive state stores discrete facts that survive across sessions and directs MLA's sparse attention. Engram handles static patterns at zero cost. No single system is redundant.
 
+### Self-Modifying Architecture
+
+Memoria is a self-modifying architecture: the system changes its own compute graph — the number of nodes, the topology of edges, the optimization objective, and the parameters governing those modifications — at runtime. This is not parameter tuning within a fixed graph. The graph itself grows, splits, prunes, and rewires based on what the system learns.
+
+**10 self-modification mechanisms, organized in a recursive hierarchy:**
+
+| Layer | Mechanism | What changes at runtime | Module |
+|-------|-----------|------------------------|--------|
+| 0 | Belief allocation/eviction | Number of active nodes in factor graph | `belief_update.py`, `state.py` |
+| 1 | Edge proposal/pruning | Causal graph topology (which beliefs connect) | `edge_proposal.py`, `state.py` |
+| 2 | Structural plasticity | Belief splitting (polysemantic → children) and pruning | `structural_plasticity.py` |
+| 3 | Provisional beliefs + autoresearch | Hypothesis beliefs generated, tested, promoted or killed | `autoresearch.py`, `provisional.py` |
+| 4 | SRWM | Meta-parameters become state-dependent via fast-weight matrix | `srwm.py` |
+| 5 | Cognitive controller | Learned policy over rates of layers 0-4 (how aggressively to self-modify) | `cognitive_controller.py` |
+| 6 | SGM safety gate | Statistical validation of modifications (e-value testing) | `safety_gate.py` |
+| 7 | Telos goal generation | Creates new goals from surprise → changes what the system optimizes for | `telos_module.py` |
+| 8 | Adaptive depth | Variable computation depth per belief (ACT halting) | `adaptive_depth.py` |
+| 9 | Message passing + dream | Belief positions shift via loopy BP on the causal graph | `message_passing.py` |
+
+**The recursive autoresearch loop.** These mechanisms don't operate independently — they form a closed loop of self-directed architectural modification:
+
+```
+Telos generates goals from surprising beliefs
+  → Autoresearch generates hypothesis beliefs in goal directions
+    → Hypotheses participate in the forward pass as provisional beliefs
+      → Free energy measures their impact on prediction quality
+        → Promote if FE improved + precision held; evict otherwise
+          → Promoted beliefs change the cognitive state
+            → Changed state triggers new edge proposals (graph rewires)
+              → Changed state modulates SRWM fast-weight matrix
+                → SRWM modulates the parameters governing hypothesis generation
+                  → Back to step 1 with different operating point
+```
+
+This is genuine recursive self-modification: the system modifies how it modifies itself. The SRWM changes the thresholds used by structural plasticity, the cognitive controller changes the rates at which plasticity operates, the SGM safety gate validates everything with sequential hypothesis testing, and Telos creates the goals that drive the entire loop. Each pass through the loop operates at a different point in parameter space because the previous pass changed the SRWM state.
+
+**Relationship to Godel machines.** The SGM safety gate implements the key requirement from Schmidhuber's Godel machine: modifications are only deployed when there is statistical evidence (e-values, Vovk & Wang) that they improve the system. The difference: Godel machines are theoretical (require proof search over all possible self-modifications). Memoria's loop is gradient-driven and empirically validated — the autoresearch loop is a learned, differentiable approximation of proof search over the belief space.
+
+### Huber-Robust Belief Matching (MIRAS/YAAD)
+
+All belief matching losses use Huber loss instead of raw cosine disagreement. The Huber transition point (`huber_delta`) is a learned MetaParam (softplus, init 0.5).
+
+- **Below delta**: quadratic penalty — precise gradients for small belief-observation disagreements
+- **Above delta**: linear penalty — caps gradient contribution from outlier matches
+
+**Why this matters for self-modification.** The write gate fires on ~12% of tokens. Over 500B training tokens, that's ~60B match operations. If 1% are spurious matches (cosine outlier sensitivity), that's 600M bad belief updates poisoning the persistent cognitive state. Beliefs are persistent — a bad update at token 50M is still there at token 500B unless consolidation catches it. Huber matching is cheap insurance (one MetaParam, zero architectural changes) that keeps the cognitive state clean over long training runs. The cleaner the state, the better the recursive self-modification loop works — every mechanism in the hierarchy depends on belief quality.
+
+Applied in `compute_differentiable_free_energy` (L_fe_proxy energy term) and `compute_expected_free_energy` (EFE risk term). Reference: MIRAS/YAAD (arXiv:2504.13173); Huber (1964).
+
+### Belief-Conditioned Sparse Attention (DSA)
+
+MLA layers use a learned Lightning Indexer for sparse global attention, extended with belief conditioning — a novel contribution. The cognitive state directly influences which tokens the transformer attends to, making attention goal-directed via active inference. Documented in detail in the MLA section below.
+
+Key optimizations:
+- **Chunk-based scoring**: O(T×C×H) memory instead of O(T²×H). Never materializes the full score matrix.
+- **Triton fused kernel**: `_fused_chunk_score_kernel` fuses dot product + ReLU + weighted sum + belief bias + causal mask into one `@triton.jit` kernel per chunk. Automatic PyTorch fallback on CPU.
+- **Causal masking in sparse path**: Explicit attention mask prevents future-token leakage at early positions.
+- **KL alignment only in dense path**: Avoids self-referential training signal at long context.
+
 ## Overview
 
 Memoria is a hybrid transformer-cognitive architecture that combines a language model backbone with a persistent, evolving cognitive state (beliefs, edges, goals). The system implements active inference: the model minimizes free energy by maintaining an internal world model that tracks entities, causal relations, and goals across arbitrarily long contexts.
