@@ -13,6 +13,44 @@ Memoria's bet:   capability ∝ N^0.076 × f(architecture, state, experience)
 
 Where `f()` might be worth 1000× of raw parameters.
 
+## Novel Contributions
+
+### Log-Linear DeltaProduct (H layers)
+
+The backbone recurrent layer is a novel composition of two research contributions that has not been implemented before:
+
+- **DeltaProduct** (NeurIPS 2025): Multi-Householder error-correcting state updates. Each token triggers n_h=3 steps of online gradient descent on the recurrent state via Householder reflections. The state actively *learns* from prediction errors at every token.
+- **Log-Linear Attention** (ICLR 2026): Fenwick tree hierarchical state management. Instead of one fixed-size state, maintains ~log₂(T) states at different temporal resolutions. Recent tokens get high-res individual states, distant tokens are compressed into coarser levels.
+
+**Nobody has combined these.** The Log-Linear paper (Guo, Yang, Dao, Kim) tested their framework only with Mamba-2 and Gated DeltaNet (single Householder step, n_h=1). DeltaProduct (Siems et al.) used only flat single-state recurrence. We compose them: each level of the Fenwick tree gets error-corrected via 3 Householder reflections. The result is hierarchical error-correcting recurrence — a recurrent layer that both *learns* at every token AND maintains multi-scale temporal context.
+
+**Implementation approach**: We use FLA's optimized Triton kernel (`chunk_gated_delta_product`) for the intra-chunk computation, and manage the inter-chunk Fenwick tree hierarchy in PyTorch. The two modifications are orthogonal — DeltaProduct's Householder interleaving affects intra-chunk token processing, the Fenwick tree affects inter-chunk state propagation. No custom Triton kernel needed.
+
+### Learning Continuum
+
+The architecture creates a continuous learning hierarchy with no gaps between timescales:
+
+| Timescale | Mechanism | What it learns | State type |
+|-----------|-----------|---------------|------------|
+| **Every token** | DeltaProduct Householder steps | Fast error correction (entity changed, fact updated, pronoun resolved) | KV memory matrix per Fenwick level |
+| **Every few tokens** | Fenwick tree level merges | Automatic temporal consolidation (recent detail → coarser long-term) | Hierarchical state promotion |
+| **Every chunk** | TTT gradient steps | Deep structural adaptation (domain patterns, user style) | MLP weight deltas |
+| **Every step** | Pass 2 (12 operations) | Discrete structure (new belief, new edge, goal transitions) | Cognitive state slots |
+
+Previous architectures have gaps: Mamba-2 compresses passively between TTT steps (no learning). Transformers have no within-sequence learning at all. DeltaProduct fills the token-level gap, and the Fenwick tree adds the automatic consolidation level that mirrors what Pass 2's sleep/consolidation does for beliefs.
+
+### Five Memory Systems
+
+| System | Mechanism | Range | Scaling | Timescale |
+|--------|-----------|-------|---------|-----------|
+| **MLA** | Exact softmax attention | W tokens | O(W) | Immediate |
+| **DeltaProduct state** | Error-correcting KV matrix | Unlimited | O(1) per level | Continuous |
+| **Fenwick hierarchy** | Log-growing temporal levels | Unlimited | O(log T) | Multi-scale |
+| **Cognitive state** | Explicit beliefs + edges + goals | Unlimited | O(1) fixed slots | Persistent (cross-session) |
+| **Engram** | Hash-based N-gram lookup | Unlimited | O(1) | Static |
+
+Each system handles something the others cannot. MLA gives exact local recall. DeltaProduct error-corrects within-sequence state. The Fenwick hierarchy provides multi-scale temporal context. Cognitive state stores discrete facts that survive across sessions. Engram handles static patterns at zero cost. No single system is redundant.
+
 ## Overview
 
 Memoria is a hybrid transformer-cognitive architecture that combines a language model backbone with a persistent, evolving cognitive state (beliefs, edges, goals). The system implements active inference: the model minimizes free energy by maintaining an internal world model that tracks entities, causal relations, and goals across arbitrarily long contexts.
@@ -100,16 +138,24 @@ Input tokens [B, T]
 
 ## Backbone Components
 
-### Layer Types ("DDDEL" Pattern)
+### Layer Types ("HHHHL" Pattern)
 
-The `window_pattern` string defines per-layer architecture. Default "DDDEL" = 3 GatedDeltaProduct₃ + 1 Log-Linear GDN + 1 MLA per 5-layer cycle.
+The `window_pattern` string defines per-layer architecture. Default "HHHHL" = 4 Log-Linear DeltaProduct₃ + 1 MLA per 5-layer cycle.
 
 | Type | Class | Scaling | When to use |
 |------|-------|---------|-------------|
-| **D** (DeltaProduct) | `DeltaProductBlock` | O(T) linear | Default — error-correcting recurrence with state tracking |
-| **E** (Log-Linear GDN) | `LogLinearGDNBlock` | O(T log T) | Hierarchical multi-scale context via Fenwick tree |
+| **H** (Log-Linear DeltaProduct) | `LogLinearDeltaProductBlock` | O(T log T) | **Default — error-correcting recurrence + Fenwick tree hierarchy (novel)** |
+| **D** (DeltaProduct) | `DeltaProductBlock` | O(T) linear | Flat error-correcting recurrence (fast training fallback) |
+| **E** (Log-Linear GDN) | `LogLinearGDNBlock` | O(T log T) | Hierarchical GDN with fused kernel (fast + hierarchical fallback) |
 | **S** (Sliding Window) | `SlidingWindowAttention` | O(T×W) | Legacy — local attention with RotorQuant KV compression |
 | **L** (MLA Global) | `MLACausalSelfAttention` | O(T²) or O(T×W) | Periodic dense attention with latent KV compression |
+
+Available patterns:
+| Pattern | Description | Training Speed | Expressivity |
+|---------|-------------|---------------|-------------|
+| **HHHHL** | 4 Log-Linear DeltaProduct₃ + 1 MLA | Moderate (sequential chunks) | **Maximum** |
+| DDDEL | 3 DeltaProduct₃ + 1 Log-Linear GDN + 1 MLA | Fast (all fused kernels) | High |
+| DDDML | 3 DeltaProduct₃ + 1 MLA | Fastest | Good |
 
 ### GatedDeltaProduct₃ (D layers)
 
@@ -944,11 +990,13 @@ memoria/training/
   cognitive_seed.py  — Cross-run belief transfer via content matching
 
 memoria/model/
-  config.py          — TransformerConfig, StateConfig, TrainingConfig, presets
-  transformer.py     — Hybrid transformer (DeltaProduct/Log-Linear GDN/MLA), YaRN RoPE, ReLU²
-  memoria_model.py   — MemoriaModel: transformer + state + interfaces + DFlash
-  pretrained_model.py — PretrainedMemoriaModel: frozen HF backbone + interfaces
-  dflash_head.py     — DFlash block diffusion draft head for speculative decoding
+  config.py              — TransformerConfig, StateConfig, TrainingConfig, presets
+  transformer.py         — Hybrid transformer (H/D/E/MLA dispatch), YaRN RoPE, ReLU²
+  deltaproduct_layers.py — DeltaProductBlock (D), LogLinearDeltaProductBlock (H), LogLinearGDNBlock (E)
+  fenwick_state.py       — FenwickStateTree: O(log T) hierarchical state for Log-Linear layers
+  memoria_model.py       — MemoriaModel: transformer + state + interfaces + DFlash
+  pretrained_model.py    — PretrainedMemoriaModel: frozen HF backbone + interfaces
+  dflash_head.py         — DFlash block diffusion draft head for speculative decoding
 
 memoria/core/
   state.py           — CognitiveState: beliefs, edges, goals, meta-parameters

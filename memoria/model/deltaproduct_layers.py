@@ -237,10 +237,13 @@ class LogLinearDeltaProductBlock(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         # cos/sin ignored — recurrent layer, no positional encoding
-        return self._forward_impl(x)
+        # FLA Triton kernels require bfloat16 — autocast the entire forward
+        input_dtype = x.dtype
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            out = self._forward_impl(x)
+        return out.to(input_dtype)
 
     def _forward_impl(self, x: Tensor) -> Tensor:
-        input_dtype = x.dtype
         B, T, D = x.shape
         C = self.chunk_size
         H = self.num_heads
@@ -310,18 +313,17 @@ class LogLinearDeltaProductBlock(nn.Module):
             # Query Fenwick tree for initial state
             init_state = fenwick.query(lw_c)  # [B, H, K, V]
 
-            # Run DeltaProduct chunk kernel (requires bfloat16)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                out_c = chunk_gated_delta_product(
-                    q=q_c,
-                    k=k_c,
-                    v=v_c,
-                    g=g_c,
-                    beta=beta_c,
-                    num_householder=n_h,
-                    initial_state=init_state,
-                    output_final_state=True,
-                )
+            # Run DeltaProduct chunk kernel
+            out_c = chunk_gated_delta_product(
+                q=q_c,
+                k=k_c,
+                v=v_c,
+                g=g_c,
+                beta=beta_c,
+                num_householder=n_h,
+                initial_state=init_state,
+                output_final_state=True,
+            )
 
             if isinstance(out_c, tuple):
                 chunk_output, final_state = out_c[0], out_c[1]
@@ -346,7 +348,7 @@ class LogLinearDeltaProductBlock(nn.Module):
         output = output * o_gate.sigmoid()
         output = self.o_proj(output)
 
-        return output.to(input_dtype)
+        return output
 
 
 # ═══════════════════════════════════════════════════════════════════════════
