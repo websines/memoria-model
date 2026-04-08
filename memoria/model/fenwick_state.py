@@ -133,6 +133,12 @@ class FenwickStateTree:
             level_scales: [batch_size, num_heads, num_levels] — data-dependent
                 level weights for this chunk (used for weighted merging)
         """
+        # Detach states from computation graph — the kernel handles per-chunk
+        # gradients internally. Fenwick states carry values for initial_state
+        # seeding, not gradient paths across chunks. Level scale gradients
+        # still flow through query() because level_scales retains grad_fn.
+        chunk_state = chunk_state.detach()
+
         # Level 0 always gets the latest chunk state
         self.states[0] = chunk_state
         self.active[0] = True
@@ -143,8 +149,6 @@ class FenwickStateTree:
 
         if merge_level > 0:
             # Merge levels 0..merge_level into level merge_level
-            # The merged state is a sum of lower-level states
-            # (weighted by level_scales for data-dependent merging)
             target_level = merge_level
             merged = torch.zeros_like(self.states[0])
 
@@ -157,7 +161,7 @@ class FenwickStateTree:
 
             # Clear merged lower levels (except level 0 which always gets fresh state)
             for l in range(1, merge_level):
-                self.states[l].zero_()
+                self.states[l] = torch.zeros_like(self.states[l])
                 self.active[l] = False
 
         self._chunk_count += 1
