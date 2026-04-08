@@ -698,9 +698,9 @@ No single system covers everything. MLA provides exact local context. DeltaProdu
 
 | Config | Params | Layers | Pattern | Beliefs | Target Hardware |
 |--------|--------|--------|---------|---------|----------------|
-| `small_config()` | ~245M (+117M embed) | 12 | DDDEL | 16K | Single 3090 |
-| `medium_config()` | ~456M | 24 | DDDEL | 32K | 2× 3090 |
-| `large_config()` | ~694M | 24 | DDDEL | 65K | B200 / multi-GPU |
+| `small_config()` | ~245M (+117M embed) | 12 | HHHHL | 16K | Single 3090 |
+| `medium_config()` | ~456M | 24 | HHHHL | 32K | 2× 3090 |
+| `large_config()` | ~694M | 24 | HHHHL | 65K | B200 / multi-GPU |
 | `lfm2_config()` | 350M frozen + 15M adapters | 16 | LFM2 hybrid | 16K | Single 3090 |
 | `qwen_config()` | 2B frozen + 25M adapters | 24 | Qwen3.5 hybrid | 32K | Single 24GB GPU |
 

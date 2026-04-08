@@ -237,13 +237,11 @@ class LogLinearDeltaProductBlock(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         # cos/sin ignored — recurrent layer, no positional encoding
-        # FLA Triton kernels require bfloat16 — autocast the entire forward
         input_dtype = x.dtype
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            out = self._forward_impl(x)
-        return out.to(input_dtype)
+        # FLA Triton kernels require bfloat16. Run everything in bf16.
+        _bf = torch.bfloat16
+        xb = x.to(_bf)
 
-    def _forward_impl(self, x: Tensor) -> Tensor:
         B, T, D = x.shape
         C = self.chunk_size
         H = self.num_heads
@@ -251,34 +249,42 @@ class LogLinearDeltaProductBlock(nn.Module):
         V = self.head_v_dim
         n_h = self.num_householder
 
-        # ── Projections ──
-        q = self.q_proj(x)        # [B, T, H*K]
-        k = self.k_proj(x)        # [B, T, H*K*n_h]
-        v = self.v_proj(x)        # [B, T, H*V*n_h]
-        beta = self.b_proj(x)     # [B, T, H*n_h]
-        g_gate = self.a_proj(x)   # [B, T, H] — forget gate (log-space via sigmoid)
-        o_gate = self.g_proj(x)   # [B, T, H*V] — output gate
+        # ── Projections (explicit bf16 weight cast, preserves autograd) ──
+        def _lin(proj, inp):
+            w = proj.weight.to(_bf)
+            b = proj.bias.to(_bf) if proj.bias is not None else None
+            return nn.functional.linear(inp, w, b)
+
+        q = _lin(self.q_proj, xb)
+        k = _lin(self.k_proj, xb)
+        v = _lin(self.v_proj, xb)
+        beta = _lin(self.b_proj, xb)
+        g_gate = _lin(self.a_proj, xb)
+        o_gate = _lin(self.g_proj, xb)
 
         # Short causal convolution
         if self.use_short_conv:
-            q = self.q_conv(q.transpose(1, 2))[..., :T].transpose(1, 2)
-            k = self.k_conv(k.transpose(1, 2))[..., :T].transpose(1, 2)
-            v = self.v_conv(v.transpose(1, 2))[..., :T].transpose(1, 2)
+            def _conv_bf16(conv, t):
+                orig_w = conv.weight.data
+                conv.weight.data = orig_w.to(_bf)
+                out = conv(t.transpose(1, 2))[..., :T].transpose(1, 2)
+                conv.weight.data = orig_w
+                return out
+            q = _conv_bf16(self.q_conv, q)
+            k = _conv_bf16(self.k_conv, k)
+            v = _conv_bf16(self.v_conv, v)
 
         # Activations (FLA convention)
         q = q.view(B, T, H, K)
         k = nn.functional.silu(k).view(B, T, H, K * n_h)
         v = nn.functional.silu(v).view(B, T, H, V * n_h)
         beta = beta.view(B, T, H * n_h).sigmoid()
-        g_gate = nn.functional.logsigmoid(g_gate).view(B, T, H)  # log-space forget gate
+        g_gate = nn.functional.logsigmoid(g_gate).view(B, T, H)
         o_gate = o_gate.view(B, T, H * V)
 
         # ── Level scales (Log-Linear) ──
-        dl = self.l_proj(x)  # [B, T, H*L]
-        dl = dl.view(B, T, H, MAX_NUM_LEVELS)
-        # Data-dependent level weights: softplus(L * dl)
-        level_weights = nn.functional.softplus(self.L.unsqueeze(0).unsqueeze(0) * dl)
-        # [B, T, H, L]
+        dl = _lin(self.l_proj, xb).view(B, T, H, MAX_NUM_LEVELS)
+        level_weights = nn.functional.softplus(self.L.to(_bf).unsqueeze(0).unsqueeze(0) * dl)
 
         # ── Pad sequence to multiple of chunk_size ──
         pad_len = (C - T % C) % C
@@ -293,33 +299,26 @@ class LogLinearDeltaProductBlock(nn.Module):
         T_padded = q.shape[1]
         num_chunks = T_padded // C
 
-        # ── Initialize Fenwick tree ──
-        fenwick = self._get_fenwick(B, x.device, x.dtype)
+        # ── Initialize Fenwick tree (in bf16) ──
+        fenwick = self._get_fenwick(B, x.device, _bf)
 
         # ── Process chunks sequentially with Fenwick state management ──
         outputs = []
         for ci in range(num_chunks):
             s, e = ci * C, (ci + 1) * C
 
-            q_c = q[:, s:e]              # [B, C, H, K]
-            k_c = k[:, s:e]              # [B, C, H, K*n_h]
-            v_c = v[:, s:e]              # [B, C, H, V*n_h]
-            beta_c = beta[:, s:e]        # [B, C, H*n_h]
-            g_c = g_gate[:, s:e]         # [B, C, H]
+            q_c = q[:, s:e]
+            k_c = k[:, s:e]
+            v_c = v[:, s:e]
+            beta_c = beta[:, s:e]
+            g_c = g_gate[:, s:e]
 
-            # Average level scales across chunk positions for Fenwick query
             lw_c = level_weights[:, s:e].mean(dim=1)  # [B, H, L]
-
-            # Query Fenwick tree for initial state
             init_state = fenwick.query(lw_c)  # [B, H, K, V]
 
-            # Run DeltaProduct chunk kernel
+            # Run DeltaProduct chunk kernel (all tensors already bf16)
             out_c = chunk_gated_delta_product(
-                q=q_c,
-                k=k_c,
-                v=v_c,
-                g=g_c,
-                beta=beta_c,
+                q=q_c, k=k_c, v=v_c, g=g_c, beta=beta_c,
                 num_householder=n_h,
                 initial_state=init_state,
                 output_final_state=True,
@@ -333,19 +332,16 @@ class LogLinearDeltaProductBlock(nn.Module):
 
             outputs.append(chunk_output)
 
-            # Update Fenwick tree with chunk's final state
             if final_state is not None:
                 fenwick.update(ci, final_state, lw_c)
 
-        # ── Concat and trim to original length ──
-        output = torch.cat(outputs, dim=1)[:, :T]  # [B, T, H, V]
-
-        # Reshape for output gating and projection
-        output = output.reshape(B, T, H * V)
+        # ── Concat, trim, cast back to input dtype ──
+        output = torch.cat(outputs, dim=1)[:, :T]  # [B, T, H, V] bf16
+        output = output.to(input_dtype).reshape(B, T, H * V)
 
         # Output gate (FLA convention: norm → gate → project)
         output = self.g_norm(output.transpose(1, 2)).transpose(1, 2)
-        output = output * o_gate.sigmoid()
+        output = output * o_gate.to(input_dtype).sigmoid()
         output = self.o_proj(output)
 
         return output
