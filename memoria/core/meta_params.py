@@ -115,6 +115,13 @@ class MetaParams(nn.Module):
         # softplus(1.0) ≈ 1.313 → symmetric with epistemic at start
         self._efe_risk_weight = nn.Parameter(torch.tensor(1.0))
 
+        # losses.py, free_energy.py — Huber transition point for belief matching
+        # Huber loss: quadratic for |error| < delta (precise), linear beyond (robust).
+        # Prevents outlier cosine disagreements from dominating belief update gradients.
+        # softplus(-0.4338) ≈ 0.5 → delta starts at 0.5 (1-cos_sim typical range [0, 0.3] for matches)
+        # Reference: MIRAS/YAAD (arXiv:2504.13173); Huber (1964)
+        self._huber_delta = nn.Parameter(torch.tensor(-0.433780))
+
         # ── A1: Tentative Belief Mode ──
         # Evaluation window: how many steps before evaluating provisional beliefs.
         # softplus(2.0) ≈ 2.127 → we want ~10 steps; softplus(9.99) ≈ 10.0
@@ -376,6 +383,16 @@ class MetaParams(nn.Module):
     def efe_risk_weight(self) -> torch.Tensor:
         """Weight on the risk term in EFE. Range: (0, inf)."""
         return F.softplus(self._efe_risk_weight)
+
+    @property
+    def huber_delta(self) -> torch.Tensor:
+        """Huber loss transition point for belief matching. Range: (0, inf).
+
+        Below delta: quadratic penalty (precise gradient for small errors).
+        Above delta: linear penalty (robust to outlier disagreements).
+        Reference: MIRAS/YAAD (arXiv:2504.13173); Huber (1964).
+        """
+        return F.softplus(self._huber_delta)
 
     # ── A1: Tentative Belief Mode ──
 

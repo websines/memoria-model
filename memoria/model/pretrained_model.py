@@ -314,6 +314,7 @@ class PretrainedMemoriaModel(nn.Module):
                 all_attn_weights, all_retrieved, all_obs_vectors,
                 self.config.state.belief_dim,
                 fe_lambda=self.state.meta_params.fe_lambda,
+                huber_delta=self.state.meta_params.huber_delta,
             )
 
             # Proper Bethe free energy: trains beliefs, edges, relations

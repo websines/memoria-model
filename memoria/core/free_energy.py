@@ -136,7 +136,15 @@ def compute_expected_free_energy(
         ret_flat = retrieved_beliefs.reshape(-1, D)       # [N, D]
         obs_flat = observation.reshape(-1, D)             # [N, D]
         cos_sim = F.cosine_similarity(ret_flat, obs_flat, dim=-1)   # [N]
-        risk = (1.0 - cos_sim).mean()                    # scalar
+        # Huber loss: quadratic for small disagreements, linear for outliers.
+        # Prevents catastrophic belief updates from spurious observation matches.
+        # Reference: MIRAS/YAAD (arXiv:2504.13173); Huber (1964)
+        disagreement = 1.0 - cos_sim                     # [N], range [0, 2]
+        delta = float(state.meta_params.huber_delta)
+        risk = F.huber_loss(
+            disagreement, torch.zeros_like(disagreement),
+            reduction='mean', delta=delta,
+        )                                                 # scalar
     else:
         risk = torch.tensor(0.0, device=device)
 

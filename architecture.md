@@ -293,14 +293,21 @@ I(t, s) = Σ_j w(t,j) · ReLU( q_I(t,j) · k_I(s,j) )
 |------|------|-----------|----------|
 | Full causal | `dsa_enabled=False, mla_window_size=0` | O(T²) | Full, dense |
 | Windowed | `dsa_enabled=False, mla_window_size>0` | O(T×W) | Dense within window |
-| **DSA sparse** | `dsa_enabled=True` | O(T²×d_I/d) + O(T×K) | **Sparse global** |
+| **DSA sparse** | `dsa_enabled=True` | O(T×C×H) scoring + O(T×K) attention | **Sparse global** |
 
-**KL alignment loss**: During phase 1 (short context, dense attention is cheap), the indexer is trained via KL divergence against the dense MLA attention distribution. This teaches it "which tokens would full attention focus on?" After phase 1, KL weight reduces to maintenance level (0.1) while sparse selection activates.
+**Chunk-based scoring**: The indexer never materializes a T×T score matrix. Keys are processed in chunks of C=256: each chunk produces a `[B, T, H, C]` score tensor, reduced across heads to `[B, T, C]`, then merged with a running top-k buffer via `torch.topk` on `[B, T, k+C]`. Memory stays at O(T×max(C,k)×H) regardless of context length. At T=1M, C=256, H=4: peak scoring memory is ~4MB per batch vs ~4TB for the naive T² approach.
+
+**Triton kernel opportunity**: The chunk loop + top-k merge is a natural fit for a fused Triton kernel (one kernel launch per chunk instead of Python loop overhead). Not yet implemented — pure PyTorch chunk loop is the current backend. When Triton is available on the training device, a `@triton.jit` kernel fusing the per-chunk einsum + ReLU + weighted sum + top-k merge would eliminate Python loop overhead and improve L2 cache utilization.
+
+**KL alignment loss**: During phase 1 (short context, dense attention is cheap), the indexer is trained via KL divergence against the dense MLA attention distribution. This teaches it "which tokens would full attention focus on?" At long context (sparse path), KL is skipped — computing the dense target would defeat the purpose of sparse attention, and training the indexer against its own selection is self-referential. The phase 1 KL weight (default 1.0) reduces to maintenance level (0.1) in phase 2+3.
+
+**Causal masking in sparse path**: When gathered keys include future positions (early query positions where t < k), an explicit attention mask zeros out those entries. This prevents information leakage from future tokens even though the indexer's causal mask already biases against selecting them.
 
 **RotorQuant on indexer keys**: Same STE QAT pipeline as KV cache, weights, and beliefs. At d_I=32, RotorQuant's Givens rotations (3-bit: 16 pairs) or quaternion rotations (4-bit: 8 groups) fit perfectly. The model learns indexer representations that survive 3-bit compression.
 
 Memory overhead at 1M tokens:
 - Indexer keys (3-bit RotorQuant): 1M × 32 × 0.375 bytes = **12 MB**
+- Scoring peak (chunk-based): ~4 MB per batch element
 - vs current windowed KV: ~38 MB (saved, since DSA replaces windowed path)
 
 Reference: DeepSeek-V3.2 DSA (arXiv:2512.02556), NSA (arXiv:2502.11089, ACL 2025)
@@ -452,7 +459,7 @@ All losses are computed inside `forward()` so the logits tensor `[B, T, vocab_si
 
 ```
 _uw(L, s) = L / (2·exp(2s)) + s
-L_total = _uw(L_token, σ_token) + α · _uw(L_fe, σ_fe) + α · _uw(L_aux, σ_aux) + w_draft · L_draft
+L_total = _uw(L_token, σ_token) + α · _uw(L_fe, σ_fe) + α · _uw(L_aux, σ_aux) + w_draft · L_draft + w_dsa_kl · L_dsa_kl
 ```
 
 **Pretrained mode** uses fixed weights:
@@ -464,13 +471,14 @@ L_total = L_token + α · L_fe + α · 0.1 · L_utility + α · 0.1 · L_surpris
 | Loss | Source | Trains | Description |
 |------|--------|--------|-------------|
 | **L_token** | `chunked_cross_entropy` | Transformer + interfaces | Next-token prediction. Chunked to bound memory on 151K vocab. |
-| **L_fe_proxy** | `compute_differentiable_free_energy` | Read/write paths | Proxy FE: consistency between retrieved beliefs and observations, minus attention entropy. Trains interface projections. |
+| **L_fe_proxy** | `compute_differentiable_free_energy` | Read/write paths | Proxy FE: Huber loss on cosine disagreement between retrieved beliefs and observations, minus attention entropy. Huber delta is a learned MetaParam (softplus, init 0.5) — quadratic for small errors, linear for outliers. Prevents spurious matches from poisoning persistent beliefs over 500B tokens. Reference: MIRAS/YAAD (arXiv:2504.13173). |
 | **L_fe_bethe** | `compute_bethe_free_energy` | Beliefs, edges, relations | Proper Bethe free energy on the cognitive factor graph. Power Spherical entropy with (d_i−1) counting correction. |
 | **L_utility** | `chunked_cross_entropy` on utility logits | Interface utility heads | Measures whether retrieved beliefs improve token prediction. |
 | **L_surprise** | `TelosModule.surprise_loss` | RND networks, goal system | RND surprise (trains predictor to match target for seen beliefs) + goal status transitions (penalize stalled/failed, reward completed). |
 | **L_halt** | `F.binary_cross_entropy` | RefinementProbe | Teaches the halting probe when to stop refinement loops. Teacher forcing with random oracle loop count. |
 | **L_jac** | DEQ Jacobian regularization | Message passing | Ensures the factor graph fixed-point map stays contractive. Periodic (every 10 steps). |
 | **L_draft** | `DFlashDraftHead.compute_draft_loss` | Draft head layers | Block diffusion draft quality. NOT alpha-gated — trains from step 0. |
+| **L_dsa_kl** | `LightningIndexer.compute_kl_loss` | Indexer projections | KL alignment: trains indexer to predict dense attention distribution. NOT alpha-gated. Full weight phase 1, reduced (0.1) after. Only computed in dense path (short context). |
 
 ### Bethe Free Energy (Factor Graph)
 

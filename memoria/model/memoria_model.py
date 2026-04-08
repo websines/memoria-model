@@ -472,7 +472,10 @@ class MemoriaModel(nn.Module):
         dflash_tapped: dict[int, Tensor] = {}
 
         # DSA: extract active belief vectors for belief-conditioned attention
-        dsa_beliefs = belief_cache.beliefs if self.config.transformer.dsa_enabled else None
+        # belief_cache.beliefs is already [N_active, D] (filtered by from_state)
+        dsa_beliefs = None
+        if self.config.transformer.dsa_enabled and belief_cache.n_active > 0:
+            dsa_beliefs = belief_cache.beliefs
 
         for i, block in enumerate(self.transformer.blocks):
             if self.training and T_total > self.config.transformer.sliding_window_size:
@@ -725,6 +728,7 @@ class MemoriaModel(nn.Module):
                 all_attn_weights, all_retrieved, all_obs_vectors,
                 self.config.state.belief_dim,
                 fe_lambda=self.state.meta_params.fe_lambda,
+                huber_delta=self.state.meta_params.huber_delta,
             )
 
             # Proper Bethe free energy: trains beliefs, edges, relations through the

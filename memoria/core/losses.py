@@ -54,6 +54,7 @@ def compute_differentiable_free_energy(
     observations: list[Tensor],
     belief_dim: int,
     fe_lambda: float | None = None,
+    huber_delta: float | Tensor | None = None,
 ) -> Tensor:
     """Compute free energy proxy over forward-pass tensors (fully differentiable).
 
@@ -96,9 +97,19 @@ def compute_differentiable_free_energy(
 
         # --- Energy: disagreement between retrieved and observed ---
         # retrieved: [B, T, num_heads, D], observations: [B, T, D]
+        # Huber loss: quadratic for small errors, linear for outliers.
+        # Prevents spurious matches from dominating belief update gradients.
+        # Reference: MIRAS/YAAD (arXiv:2504.13173); Huber (1964)
         ret_avg = ret.mean(dim=2)  # [B, T, D] — average over heads
         cos_sim = F.cosine_similarity(ret_avg, obs, dim=-1)  # [B, T]
-        energy_terms.append((1.0 - cos_sim).mean())
+        disagreement = 1.0 - cos_sim  # [B, T], range [0, 2]
+        if huber_delta is not None:
+            energy_terms.append(F.huber_loss(
+                disagreement, torch.zeros_like(disagreement),
+                reduction='mean', delta=float(huber_delta),
+            ))
+        else:
+            energy_terms.append(disagreement.mean())
 
         # --- Entropy: attention distribution entropy ---
         # attn: [B, T, num_heads, N_active]

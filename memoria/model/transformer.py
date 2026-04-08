@@ -459,26 +459,22 @@ class MLACausalSelfAttention(nn.Module):
     ) -> Tensor:
         """Belief-conditioned sparse attention via Lightning Indexer.
 
-        1. Indexer scores all tokens (cheap, d_I=32, RotorQuant compressed)
+        1. Indexer scores tokens chunk-by-chunk (O(T×C) memory, never T²)
         2. Select top-k tokens per query position
         3. Gather sparse KV at selected indices
-        4. Run full MLA attention on sparse subset
-        5. Compute KL alignment loss (training only)
+        4. Run MLA attention on sparse subset with causal masking
+        5. KL alignment loss only in dense path (short context)
 
-        During training at short context (T <= top_k), runs full attention
-        and computes KL loss for indexer alignment.
+        During training at short context (T <= effective_k), runs full
+        attention and computes KL loss for indexer alignment. At long context,
+        sparse path runs without KL (no dense target available).
         """
         from ..core.quantize import gather_sparse_kv
 
         B, T, _, _ = q.shape
         scale = self._yarn_scale / math.sqrt(self.head_dim)
 
-        # Compute indexer scores
-        indexer_scores = self.indexer.compute_scores(x, beliefs)  # [B, T, T]
-
         # Determine top-k for current context
-        # During training: use ratio (so indexer always has to choose)
-        # During inference: use absolute top_k
         if self.training:
             effective_k = max(1, int(T * self.dsa_top_k_ratio))
         else:
@@ -491,7 +487,7 @@ class MLACausalSelfAttention(nn.Module):
             v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
 
         if effective_k >= T:
-            # Full attention (context smaller than top-k) — also get KL target
+            # Dense path: full causal attention + KL alignment for indexer training
             q_t = q.transpose(1, 2)  # [B, H, T, D]
             k_t = k.transpose(1, 2)
             v_t = v.transpose(1, 2)
@@ -500,8 +496,11 @@ class MLACausalSelfAttention(nn.Module):
             )
             y = y.transpose(1, 2)
 
-            # KL alignment loss: compare indexer to dense attention
+            # KL alignment: train indexer against dense attention (only here,
+            # where the true dense target is available)
             if self.training:
+                # Dense scores for KL target (affordable at short T)
+                indexer_scores = self.indexer.compute_dense_scores(x, beliefs)
                 with torch.no_grad():
                     attn_weights = torch.matmul(q_t, k_t.transpose(-2, -1)) * scale
                     causal = torch.triu(
@@ -513,43 +512,35 @@ class MLACausalSelfAttention(nn.Module):
                     indexer_scores, attn_weights
                 )
         else:
-            # Sparse attention: select top-k, gather, attend
-            indices = self.indexer.select_topk(indexer_scores, effective_k)  # [B, T, k]
+            # Sparse path: chunk-based top-k selection, no T² matrix
+            indices, _ = self.indexer.compute_topk(x, effective_k, beliefs)  # [B, T, k]
 
             # Gather sparse KV: [B, T, k, H, D]
             k_sparse, v_sparse = gather_sparse_kv(k, v, indices)
 
-            # Attention: each query attends to its own top-k keys
-            # q: [B, T, H, D] → [B, T, 1, H, D] for bmm with [B, T, k, H, D]
-            # Reshape for per-query attention: merge B,T into batch dim
+            # Per-query attention with causal masking on gathered tokens
             BT = B * T
             q_r = q.reshape(BT, 1, self.n_head, self.head_dim).transpose(1, 2)  # [BT, H, 1, D]
             k_r = k_sparse.reshape(BT, effective_k, self.n_head, self.head_dim).transpose(1, 2)  # [BT, H, k, D]
             v_r = v_sparse.reshape(BT, effective_k, self.n_head, self.head_dim).transpose(1, 2)  # [BT, H, k, D]
 
-            y = F.scaled_dot_product_attention(q_r, k_r, v_r, scale=scale)  # [BT, H, 1, D]
+            # Causal mask: mask out gathered keys that are from future positions.
+            # indices: [B, T, k] — the global position of each gathered key.
+            # query position t should only attend to keys where indices[b,t,j] <= t.
+            query_pos = torch.arange(T, device=q.device).unsqueeze(0).unsqueeze(-1)  # [1, T, 1]
+            future_mask = indices > query_pos  # [B, T, k] — True for future keys
+            future_mask = future_mask.reshape(BT, effective_k)  # [BT, k]
+            # Expand for SDPA: [BT, 1, 1, k] broadcast to [BT, H, 1, k]
+            attn_mask = torch.zeros(BT, 1, 1, effective_k, device=q.device, dtype=q.dtype)
+            attn_mask.masked_fill_(future_mask.unsqueeze(1).unsqueeze(1), float('-inf'))
+
+            y = F.scaled_dot_product_attention(q_r, k_r, v_r, attn_mask=attn_mask, scale=scale)
             y = y.transpose(1, 2).reshape(B, T, self.n_head, self.head_dim)
 
-            # KL loss: during training, periodically compute dense attention for alignment
-            if self.training:
-                # Compute KL on indexer scores vs sparse attention weights
-                # Use the selected indices to build a sparse target
-                with torch.no_grad():
-                    sparse_scores = torch.matmul(q_r, k_r.transpose(-2, -1)) * scale  # [BT, H, 1, k]
-                    sparse_weights = torch.softmax(sparse_scores, dim=-1)  # [BT, H, 1, k]
-                    # Build full-context target from sparse weights
-                    sparse_weights = sparse_weights.squeeze(2).mean(dim=1)  # [BT, k]
-                    full_target = torch.zeros(BT, T, device=q.device, dtype=q.dtype)
-                    idx_flat = indices.reshape(BT, effective_k)
-                    full_target.scatter_(1, idx_flat, sparse_weights)
-                    full_target = full_target.view(B, T, T)
-                    # Normalize
-                    full_target = full_target / (full_target.sum(dim=-1, keepdim=True) + 1e-8)
-                    # Wrap as [B, 1, T, T] for KL computation
-                    attn_weights = full_target.unsqueeze(1)
-                self._last_dsa_kl_loss = self.indexer.compute_kl_loss(
-                    indexer_scores, attn_weights
-                )
+            # No KL loss in sparse path — the indexer was trained via dense-path
+            # KL during phase 1/early training. Computing KL here would be
+            # self-referential (training indexer to match its own selection).
+            self._last_dsa_kl_loss = None
 
         return y
 

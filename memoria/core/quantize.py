@@ -539,8 +539,17 @@ class LightningIndexer(nn.Module):
         I(t, s) = Σ_j w(t,j) · ReLU( q_I(t,j) · k_I(s,j) )
                   + λ · max_b sim(k_I(s), belief_proj(b))
 
+    Chunk-based scoring: to avoid materializing a [B, T, T] matrix, scores are
+    computed in chunks of C keys at a time. Per-query top-k is maintained across
+    chunks via torch.topk merging. Memory: O(T × C × H) instead of O(T² × H).
+
     Reference: DeepSeek-V3.2 (arxiv.org/abs/2512.02556)
+    Reference: NSA (arxiv.org/abs/2502.11089, ACL 2025)
     """
+
+    # Chunk size for scoring — balances memory vs kernel efficiency.
+    # At d_I=32, H=4: chunk of 256 uses [B, T, 4, 256] = 0.25M elements per batch.
+    SCORE_CHUNK_SIZE = 256
 
     def __init__(
         self,
@@ -573,51 +582,149 @@ class LightningIndexer(nn.Module):
         if self.has_beliefs:
             self.belief_proj = nn.Linear(belief_dim, index_dim, bias=False)
 
-    def compute_scores(
+    def compute_topk(
         self,
         hidden: Tensor,
+        top_k: int,
         beliefs: Tensor | None = None,
-    ) -> Tensor:
-        """Compute indexer scores for all token pairs.
+    ) -> tuple[Tensor, Tensor]:
+        """Compute indexer scores chunk-by-chunk and return top-k indices per query.
+
+        Instead of materializing the full [B, T, T] score matrix, processes keys
+        in chunks of SCORE_CHUNK_SIZE and maintains a running top-k per query.
+        Memory: O(B × T × max(C, k) × H) instead of O(B × T² × H).
 
         Args:
             hidden: [B, T, D] — hidden states from transformer
+            top_k: number of tokens to select per query position
             beliefs: [N_active, D_belief] — active belief vectors (optional)
 
         Returns:
-            scores: [B, T, T] — indexer scores (query t, key s)
+            indices: [B, T, k] — selected token indices per query
+            scores_at_indices: [B, T, k] — scores at those indices (for KL loss)
         """
         B, T, _ = hidden.shape
+        device = hidden.device
+        C = self.SCORE_CHUNK_SIZE
+        k = min(top_k, T)
 
         # Project to indexer space
         q = self.q_proj(hidden).view(B, T, self.n_heads, self.index_dim)
-        k = self.k_proj(hidden).view(B, T, self.n_heads, self.index_dim)
+        k_all = self.k_proj(hidden).view(B, T, self.n_heads, self.index_dim)
 
         # STE quantize indexer keys (RotorQuant noise during training)
-        k_flat = k.reshape(-1, self.index_dim)
+        k_flat = k_all.reshape(-1, self.index_dim)
         k_flat = ste_quantize(k_flat, self.quantizer)
-        k = k_flat.view(B, T, self.n_heads, self.index_dim)
+        k_all = k_flat.view(B, T, self.n_heads, self.index_dim)
 
         # Per-head gating: w(t, j) via softmax
         w = torch.softmax(self.head_gate(hidden), dim=-1)  # [B, T, n_heads]
 
-        # Dot-product scores per head: [B, T_q, n_heads, T_k]
-        # q: [B, T, H, d_I], k: [B, T, H, d_I]
-        # score_per_head[b, t, j, s] = q[b,t,j] · k[b,s,j]
-        scores_per_head = torch.einsum('bthd,bshd->bths', q, k)
-
-        # ReLU gate — only positively correlated tokens contribute
-        scores_per_head = torch.relu(scores_per_head)
-
-        # Weighted sum across heads: I(t, s) = Σ_j w(t,j) · ReLU(q·k)
-        # w: [B, T, H] → [B, T, H, 1], scores: [B, T, H, T]
-        scores = (w.unsqueeze(-1) * scores_per_head).sum(dim=2)  # [B, T, T]
-
-        # Belief conditioning: additive bias from belief relevance
+        # Belief bias: precompute per-token bias [B, T] (column bias, shared by all queries)
+        belief_bias = None
         if self.has_beliefs and beliefs is not None and beliefs.shape[0] > 0:
-            scores = self._add_belief_bias(scores, k, beliefs)
+            belief_bias = self._compute_belief_bias(k_all, beliefs)  # [B, T]
 
-        # Causal mask — can only attend to past tokens
+        # Running top-k across chunks
+        best_scores = torch.full((B, T, k), float('-inf'), device=device, dtype=hidden.dtype)
+        best_indices = torch.zeros(B, T, k, dtype=torch.long, device=device)
+
+        for chunk_start in range(0, T, C):
+            chunk_end = min(chunk_start + C, T)
+            C_actual = chunk_end - chunk_start
+
+            # Keys for this chunk: [B, C_actual, H, d_I]
+            k_chunk = k_all[:, chunk_start:chunk_end]
+
+            # Scores per head: [B, T, H, C_actual]
+            # q: [B, T, H, d_I], k_chunk: [B, C_actual, H, d_I]
+            scores_per_head = torch.einsum('bthd,bchd->bthc', q, k_chunk)
+            scores_per_head = torch.relu(scores_per_head)
+
+            # Weighted sum across heads: [B, T, C_actual]
+            chunk_scores = (w.unsqueeze(-1) * scores_per_head).sum(dim=2)
+
+            # Add belief bias for this chunk's key positions
+            if belief_bias is not None:
+                chunk_scores = chunk_scores + self.belief_lambda * belief_bias[:, chunk_start:chunk_end].unsqueeze(1)
+
+            # Causal mask: query t can only attend to key s where s <= t
+            # chunk key positions are [chunk_start, chunk_end)
+            key_positions = torch.arange(chunk_start, chunk_end, device=device)  # [C_actual]
+            query_positions = torch.arange(T, device=device)  # [T]
+            # mask[t, c] = True if key_positions[c] > t (future token)
+            causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)  # [T, C_actual]
+            chunk_scores.masked_fill_(causal_mask.unsqueeze(0), float('-inf'))
+
+            # Merge this chunk's top-k with running top-k
+            # Global indices for this chunk
+            chunk_indices = torch.arange(chunk_start, chunk_end, device=device)
+            chunk_indices = chunk_indices.unsqueeze(0).unsqueeze(0).expand(B, T, -1)  # [B, T, C_actual]
+
+            # Concatenate with running best: [B, T, k + C_actual]
+            merged_scores = torch.cat([best_scores, chunk_scores], dim=-1)
+            merged_indices = torch.cat([best_indices, chunk_indices], dim=-1)
+
+            # Take top-k from merged
+            topk_scores, topk_pos = merged_scores.topk(k, dim=-1)
+            best_scores = topk_scores
+            best_indices = merged_indices.gather(-1, topk_pos)
+
+        return best_indices, best_scores
+
+    def _compute_belief_bias(
+        self,
+        k: Tensor,
+        beliefs: Tensor,
+    ) -> Tensor:
+        """Compute per-token belief relevance bias.
+
+        Args:
+            k: [B, T, n_heads, d_I] — indexer keys
+            beliefs: [N_active, D_belief] — active belief vectors
+
+        Returns:
+            bias: [B, T] — max belief similarity per token
+        """
+        b_proj = self.belief_proj(beliefs)  # [N_active, d_I]
+        k_avg = k.mean(dim=2)  # [B, T, d_I]
+        sim = torch.einsum('btd,nd->btn', k_avg, b_proj)  # [B, T, N_active]
+        return sim.max(dim=-1).values  # [B, T]
+
+    def compute_dense_scores(
+        self,
+        hidden: Tensor,
+        beliefs: Tensor | None = None,
+    ) -> Tensor:
+        """Compute full [B, T, T] score matrix (for KL alignment at short context).
+
+        Only called during training when T is small enough that dense is affordable.
+
+        Args:
+            hidden: [B, T, D]
+            beliefs: [N_active, D_belief] (optional)
+
+        Returns:
+            scores: [B, T, T] — full indexer score matrix with causal mask
+        """
+        B, T, _ = hidden.shape
+
+        q = self.q_proj(hidden).view(B, T, self.n_heads, self.index_dim)
+        k = self.k_proj(hidden).view(B, T, self.n_heads, self.index_dim)
+
+        k_flat = k.reshape(-1, self.index_dim)
+        k_flat = ste_quantize(k_flat, self.quantizer)
+        k = k_flat.view(B, T, self.n_heads, self.index_dim)
+
+        w = torch.softmax(self.head_gate(hidden), dim=-1)
+        scores_per_head = torch.einsum('bthd,bshd->bths', q, k)
+        scores_per_head = torch.relu(scores_per_head)
+        scores = (w.unsqueeze(-1) * scores_per_head).sum(dim=2)
+
+        if self.has_beliefs and beliefs is not None and beliefs.shape[0] > 0:
+            belief_bias = self._compute_belief_bias(k, beliefs)
+            scores = scores + self.belief_lambda * belief_bias.unsqueeze(1)
+
         causal_mask = torch.triu(
             torch.full((T, T), float('-inf'), device=scores.device, dtype=scores.dtype),
             diagonal=1,
@@ -625,64 +732,6 @@ class LightningIndexer(nn.Module):
         scores = scores + causal_mask
 
         return scores
-
-    def _add_belief_bias(
-        self,
-        scores: Tensor,
-        k: Tensor,
-        beliefs: Tensor,
-    ) -> Tensor:
-        """Add belief-conditioned bias to indexer scores.
-
-        For each key token s, compute max similarity to any active belief.
-        This biases attention toward tokens relevant to current cognitive state.
-
-        Args:
-            scores: [B, T, T] — current indexer scores
-            k: [B, T, n_heads, d_I] — indexer keys
-            beliefs: [N_active, D_belief] — active belief vectors
-
-        Returns:
-            scores with belief bias added: [B, T, T]
-        """
-        # Project beliefs to indexer space
-        b_proj = self.belief_proj(beliefs)  # [N_active, d_I]
-
-        # Average across indexer heads for belief matching
-        k_avg = k.mean(dim=2)  # [B, T, d_I]
-
-        # Similarity: [B, T, N_active]
-        sim = torch.einsum('btd,nd->btn', k_avg, b_proj)
-
-        # Max belief relevance per token: [B, T]
-        belief_score = sim.max(dim=-1).values
-
-        # Add as column bias (same bias for all query positions)
-        scores = scores + self.belief_lambda * belief_score.unsqueeze(1)
-
-        return scores
-
-    def select_topk(
-        self,
-        scores: Tensor,
-        k: int,
-    ) -> Tensor:
-        """Select top-k token indices per query position.
-
-        Args:
-            scores: [B, T, T] — indexer scores
-            k: number of tokens to select per query
-
-        Returns:
-            indices: [B, T, k] — selected token indices
-        """
-        # Clamp k to available tokens
-        T = scores.shape[-1]
-        k = min(k, T)
-
-        # Top-k selection per query position
-        _, indices = scores.topk(k, dim=-1)  # [B, T, k]
-        return indices
 
     def compute_kl_loss(
         self,
@@ -699,26 +748,20 @@ class LightningIndexer(nn.Module):
             KL divergence loss (scalar)
         """
         # Aggregate dense attention across heads (L1-normalized as in DSA paper)
-        # attn_weights: [B, H, T, T] → [B, T, T]
-        target = attn_weights.sum(dim=1)  # sum across heads
-        target = target / (target.sum(dim=-1, keepdim=True) + 1e-8)  # L1 normalize
+        target = attn_weights.sum(dim=1)  # [B, T, T]
+        target = target / (target.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Replace -inf in scores with large negative finite value for log_softmax
+        # Replace -inf with large negative finite value for log_softmax
         scores_safe = indexer_scores.clone()
         scores_safe[scores_safe == float('-inf')] = -1e9
 
-        # KL(target || pred) — target is the "true" distribution
-        # Only compute where target > 0 to avoid 0 * log(0) = NaN
         log_pred = torch.log_softmax(scores_safe, dim=-1)
-        # Mask out zero-target entries
         nonzero = target > 1e-10
         kl_elem = torch.zeros_like(target)
         kl_elem[nonzero] = target[nonzero] * (
             target[nonzero].log() - log_pred[nonzero]
         )
-        kl = kl_elem.sum(dim=-1)
-
-        return kl.mean()
+        return kl_elem.sum(dim=-1).mean()
 
 
 def gather_sparse_kv(
