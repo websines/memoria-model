@@ -111,8 +111,12 @@ class DeltaProductBlock(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         # cos/sin ignored — DeltaProduct uses recurrent state for ordering
+        # FLA Triton kernels require bfloat16 — cast internally, cast back
+        orig_dtype = x.dtype
+        if x.dtype == torch.float32:
+            x = x.bfloat16()
         out, _, _ = self.deltaproduct(x)
-        return out
+        return out.to(orig_dtype)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -235,6 +239,11 @@ class LogLinearDeltaProductBlock(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         # cos/sin ignored — recurrent layer, no positional encoding
+        # FLA Triton kernels require bfloat16 — cast internally, cast back
+        orig_dtype = x.dtype
+        if x.dtype == torch.float32:
+            x = x.bfloat16()
+
         B, T, D = x.shape
         C = self.chunk_size
         H = self.num_heads
@@ -340,7 +349,7 @@ class LogLinearDeltaProductBlock(nn.Module):
         output = output * o_gate.sigmoid()
         output = self.o_proj(output)
 
-        return output
+        return output.to(orig_dtype)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -386,5 +395,8 @@ class LogLinearGDNBlock(nn.Module):
         self._yarn_scale = 1.0
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        orig_dtype = x.dtype
+        if x.dtype == torch.float32:
+            x = x.bfloat16()
         out, _, _ = self.hgdn(x)
-        return out
+        return out.to(orig_dtype)

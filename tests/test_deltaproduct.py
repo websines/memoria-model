@@ -406,6 +406,7 @@ class TestFullModelIntegration:
                 deltaproduct_expand_v=2,
                 loglinear_chunk_size=32,
                 mla_latent_dim=32,
+                mla_rope_dim=16,
                 interface_every=5, interface_num_heads=2, interface_top_k=8,
             ),
             state=StateConfig(
