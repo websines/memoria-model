@@ -297,7 +297,7 @@ I(t, s) = Σ_j w(t,j) · ReLU( q_I(t,j) · k_I(s,j) )
 
 **Chunk-based scoring**: The indexer never materializes a T×T score matrix. Keys are processed in chunks of C=256: each chunk produces a `[B, T, H, C]` score tensor, reduced across heads to `[B, T, C]`, then merged with a running top-k buffer via `torch.topk` on `[B, T, k+C]`. Memory stays at O(T×max(C,k)×H) regardless of context length. At T=1M, C=256, H=4: peak scoring memory is ~4MB per batch vs ~4TB for the naive T² approach.
 
-**Triton kernel opportunity**: The chunk loop + top-k merge is a natural fit for a fused Triton kernel (one kernel launch per chunk instead of Python loop overhead). Not yet implemented — pure PyTorch chunk loop is the current backend. When Triton is available on the training device, a `@triton.jit` kernel fusing the per-chunk einsum + ReLU + weighted sum + top-k merge would eliminate Python loop overhead and improve L2 cache utilization.
+**Triton fused scoring kernel**: When Triton is available (CUDA training), `_fused_chunk_score_kernel` fuses the per-chunk dot product + ReLU + head-weighted sum + belief bias + causal mask into a single `@triton.jit` kernel. One program per (b, t) query per chunk; accumulates in float32 regardless of input dtype (bf16 safe). `HAS_BB` is `tl.constexpr` — dead-code-eliminated when no beliefs. The top-k merge remains in PyTorch (`torch.topk` uses radix selection which is hard to beat). On CPU or without Triton, `_topk_pytorch` provides an identical pure-PyTorch fallback. Dispatch is automatic via `_triton_available and hidden.is_cuda`.
 
 **KL alignment loss**: During phase 1 (short context, dense attention is cheap), the indexer is trained via KL divergence against the dense MLA attention distribution. This teaches it "which tokens would full attention focus on?" At long context (sparse path), KL is skipped — computing the dense target would defeat the purpose of sparse attention, and training the indexer against its own selection is self-referential. The phase 1 KL weight (default 1.0) reduces to maintenance level (0.1) in phase 2+3.
 
@@ -371,7 +371,7 @@ The cognitive state is a persistent, slot-based world model with four regions:
 ### Meta Region
 
 - `meta`: `[32]` — learned meta-parameters (β, accumulated_surprise, thresholds, etc.)
-- `meta_params`: `MetaParams` — 40 learned constants replacing hardcoded hyperparameters throughout the system (sigmoid/softplus constrained, initialized to original values)
+- `meta_params`: `MetaParams` — 63 learned constants replacing hardcoded hyperparameters throughout the system (sigmoid/softplus constrained, initialized to original values)
 
 ### Belief Metadata Buffers
 
@@ -1104,9 +1104,9 @@ memoria/model/
 
 memoria/core/
   state.py           — CognitiveState: beliefs, edges, goals, meta-parameters
-  free_energy.py     — Bethe FE, EFE, Power Spherical entropy
-  losses.py          — chunked_cross_entropy, differentiable FE proxy
-  quantize.py        — RotorQuant/PolarQuant quantization, STE, KV cache, belief store, DSA Lightning Indexer
+  free_energy.py     — Bethe FE, EFE (Huber-robust risk term), Power Spherical entropy
+  losses.py          — chunked_cross_entropy, differentiable FE proxy (Huber-robust belief matching)
+  quantize.py        — RotorQuant/PolarQuant quantization, STE, KV cache, belief store, DSA Lightning Indexer + Triton fused scoring kernel
   polar.py           — Polar coordinate utilities for belief representation
   ttt.py             — In-Place TTT with Titans/LaCT/DeltaProduct enhancements
   message_passing.py — Factor graph message passing with DEQ solver
@@ -1117,7 +1117,7 @@ memoria/interface/
   write_path.py      — WritePath, WriteCandidate, pack/unpack for distributed
 
 memoria/core/
-  meta_params.py     — 40 learned MetaParams replacing hardcoded constants (sigmoid/softplus constrained)
+  meta_params.py     — 63 learned MetaParams replacing hardcoded constants (sigmoid/softplus constrained, incl. huber_delta)
 
 memoria/cognition/
   pass2.py           — Pass 2 orchestrator (12 structural operations)

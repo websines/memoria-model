@@ -49,6 +49,14 @@ try:
 except ImportError:
     pass
 
+_triton_available = False
+try:
+    import triton
+    import triton.language as tl
+    _triton_available = True
+except ImportError:
+    pass
+
 
 # ── STE (Straight-Through Estimator) ──
 
@@ -524,6 +532,68 @@ def get_cage_lambda(step: int, config) -> float:
 
 # ── DSA: Belief-Conditioned Lightning Indexer ──
 
+# ── Triton kernel for fused chunk scoring ──
+# Fuses: dot product + ReLU + head-weighted sum + belief bias + causal mask
+# into a single kernel launch per chunk. Eliminates 5 separate kernel launches
+# and reduces global memory traffic (q, w loaded once instead of per-op).
+
+if _triton_available:
+    @triton.jit
+    def _fused_chunk_score_kernel(
+        Q, K, W, BB, OUT,
+        T,                          # sequence length (runtime)
+        CHUNK_START,                # start index of current key chunk (runtime)
+        CHUNK_C: tl.constexpr,      # chunk size (compile-time)
+        H: tl.constexpr,            # number of indexer heads
+        D: tl.constexpr,            # indexer dim per head
+        HAS_BB: tl.constexpr,       # whether belief bias is provided
+        BELIEF_LAMBDA,              # belief bias scaling (runtime float)
+    ):
+        """Fused indexer chunk scoring: one program per (b, t) query.
+
+        Computes for each query position t and key chunk [CHUNK_START, CHUNK_START+C):
+            score[c] = Σ_h w[h] * ReLU(q[h] · k[chunk_start+c, h]) + λ*bb[chunk_start+c]
+        with causal masking (future keys → -inf).
+
+        Tensors assumed contiguous:
+            Q: [B*T, H, D]  K: [B*T, H, D]  W: [B*T, H]
+            BB: [B*T] (flattened belief bias)  OUT: [B*T, CHUNK_C]
+        """
+        pid = tl.program_id(0)
+        b = pid // T
+        t = pid % T
+
+        c_off = tl.arange(0, CHUNK_C)
+        key_pos = CHUNK_START + c_off      # global key positions
+        valid = (key_pos < T) & (key_pos <= t)  # in-range + causal
+
+        HD = H * D
+        d_off = tl.arange(0, D)
+        acc = tl.zeros([CHUNK_C], dtype=tl.float32)
+
+        for h in range(H):
+            # q[pid, h, :] → [D]
+            q_vec = tl.load(Q + pid * HD + h * D + d_off).to(tl.float32)
+
+            # k[b*T + key_pos, h, :] → [C, D]
+            k_base = (b * T + key_pos)[:, None] * HD + h * D + d_off[None, :]
+            k_mat = tl.load(K + k_base, mask=valid[:, None], other=0.0).to(tl.float32)
+
+            dot = tl.sum(k_mat * q_vec[None, :], axis=1)  # [C]
+            dot = tl.maximum(dot, 0.0)                      # ReLU
+
+            w_val = tl.load(W + pid * H + h).to(tl.float32)
+            acc += w_val * dot
+
+        if HAS_BB:
+            bb_idx = b * T + key_pos
+            bb_vals = tl.load(BB + bb_idx, mask=(key_pos < T), other=0.0).to(tl.float32)
+            acc += BELIEF_LAMBDA * bb_vals
+
+        acc = tl.where(valid, acc, float('-inf'))
+        tl.store(OUT + pid * CHUNK_C + c_off, acc)
+
+
 class LightningIndexer(nn.Module):
     """Learned sparse token selector for MLA with belief conditioning.
 
@@ -594,6 +664,10 @@ class LightningIndexer(nn.Module):
         in chunks of SCORE_CHUNK_SIZE and maintains a running top-k per query.
         Memory: O(B × T × max(C, k) × H) instead of O(B × T² × H).
 
+        Dispatches to Triton kernel when available (fuses dot product + ReLU +
+        weighted sum + belief bias + causal mask into one kernel per chunk),
+        falls back to PyTorch on CPU or when Triton is not installed.
+
         Args:
             hidden: [B, T, D] — hidden states from transformer
             top_k: number of tokens to select per query position
@@ -601,7 +675,7 @@ class LightningIndexer(nn.Module):
 
         Returns:
             indices: [B, T, k] — selected token indices per query
-            scores_at_indices: [B, T, k] — scores at those indices (for KL loss)
+            scores_at_indices: [B, T, k] — scores at those indices
         """
         B, T, _ = hidden.shape
         device = hidden.device
@@ -625,47 +699,91 @@ class LightningIndexer(nn.Module):
         if self.has_beliefs and beliefs is not None and beliefs.shape[0] > 0:
             belief_bias = self._compute_belief_bias(k_all, beliefs)  # [B, T]
 
-        # Running top-k across chunks
-        best_scores = torch.full((B, T, k), float('-inf'), device=device, dtype=hidden.dtype)
+        # Dispatch: Triton on CUDA, PyTorch fallback on CPU
+        if _triton_available and hidden.is_cuda:
+            return self._topk_triton(q, k_all, w, belief_bias, B, T, k, C, device)
+        return self._topk_pytorch(q, k_all, w, belief_bias, B, T, k, C, device, hidden.dtype)
+
+    def _topk_triton(
+        self, q: Tensor, k_all: Tensor, w: Tensor,
+        belief_bias: Tensor | None, B: int, T: int, k: int, C: int, device,
+    ) -> tuple[Tensor, Tensor]:
+        """Chunk-based top-k with fused Triton scoring kernel."""
+        BT = B * T
+
+        # Flatten to [B*T, H, D] contiguous for the kernel
+        q_flat = q.reshape(BT, self.n_heads, self.index_dim).contiguous()
+        k_flat = k_all.reshape(BT, self.n_heads, self.index_dim).contiguous()
+        w_flat = w.reshape(BT, self.n_heads).contiguous()
+        bb_flat = belief_bias.reshape(BT).contiguous() if belief_bias is not None else torch.empty(1, device=device)
+
+        # Output buffer (reused each chunk — kernel writes all C positions)
+        chunk_scores = torch.empty(BT, C, device=device, dtype=torch.float32)
+
+        # Running top-k
+        best_scores = torch.full((BT, k), float('-inf'), device=device, dtype=torch.float32)
+        best_indices = torch.zeros(BT, k, dtype=torch.long, device=device)
+
+        # Chunk indices buffer (padded to C, clamped to T-1 for invalid positions;
+        # those positions have -inf scores so they'll never win the top-k)
+        grid = (BT,)
+
+        for chunk_start in range(0, T, C):
+            _fused_chunk_score_kernel[grid](
+                q_flat, k_flat, w_flat, bb_flat, chunk_scores,
+                T, chunk_start,
+                CHUNK_C=C,
+                H=self.n_heads,
+                D=self.index_dim,
+                HAS_BB=(belief_bias is not None),
+                BELIEF_LAMBDA=self.belief_lambda,
+            )
+
+            # Indices for this chunk (padded to C, clamped for out-of-range)
+            chunk_end = min(chunk_start + C, T)
+            C_actual = chunk_end - chunk_start
+            chunk_idx = torch.arange(chunk_start, chunk_start + C, device=device).clamp(max=T - 1)
+            chunk_idx = chunk_idx.unsqueeze(0).expand(BT, -1)
+
+            # Merge with running top-k
+            merged_scores = torch.cat([best_scores, chunk_scores], dim=-1)
+            merged_indices = torch.cat([best_indices, chunk_idx], dim=-1)
+            topk_scores, topk_pos = merged_scores.topk(k, dim=-1)
+            best_scores = topk_scores
+            best_indices = merged_indices.gather(-1, topk_pos)
+
+        return best_indices.view(B, T, k), best_scores.view(B, T, k)
+
+    def _topk_pytorch(
+        self, q: Tensor, k_all: Tensor, w: Tensor,
+        belief_bias: Tensor | None, B: int, T: int, k: int, C: int, device, dtype,
+    ) -> tuple[Tensor, Tensor]:
+        """Chunk-based top-k with pure PyTorch ops (CPU / no-Triton fallback)."""
+        best_scores = torch.full((B, T, k), float('-inf'), device=device, dtype=dtype)
         best_indices = torch.zeros(B, T, k, dtype=torch.long, device=device)
 
         for chunk_start in range(0, T, C):
             chunk_end = min(chunk_start + C, T)
             C_actual = chunk_end - chunk_start
 
-            # Keys for this chunk: [B, C_actual, H, d_I]
             k_chunk = k_all[:, chunk_start:chunk_end]
-
-            # Scores per head: [B, T, H, C_actual]
-            # q: [B, T, H, d_I], k_chunk: [B, C_actual, H, d_I]
             scores_per_head = torch.einsum('bthd,bchd->bthc', q, k_chunk)
             scores_per_head = torch.relu(scores_per_head)
-
-            # Weighted sum across heads: [B, T, C_actual]
             chunk_scores = (w.unsqueeze(-1) * scores_per_head).sum(dim=2)
 
-            # Add belief bias for this chunk's key positions
             if belief_bias is not None:
                 chunk_scores = chunk_scores + self.belief_lambda * belief_bias[:, chunk_start:chunk_end].unsqueeze(1)
 
-            # Causal mask: query t can only attend to key s where s <= t
-            # chunk key positions are [chunk_start, chunk_end)
-            key_positions = torch.arange(chunk_start, chunk_end, device=device)  # [C_actual]
-            query_positions = torch.arange(T, device=device)  # [T]
-            # mask[t, c] = True if key_positions[c] > t (future token)
-            causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)  # [T, C_actual]
+            key_positions = torch.arange(chunk_start, chunk_end, device=device)
+            query_positions = torch.arange(T, device=device)
+            causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
             chunk_scores.masked_fill_(causal_mask.unsqueeze(0), float('-inf'))
 
-            # Merge this chunk's top-k with running top-k
-            # Global indices for this chunk
             chunk_indices = torch.arange(chunk_start, chunk_end, device=device)
-            chunk_indices = chunk_indices.unsqueeze(0).unsqueeze(0).expand(B, T, -1)  # [B, T, C_actual]
+            chunk_indices = chunk_indices.unsqueeze(0).unsqueeze(0).expand(B, T, -1)
 
-            # Concatenate with running best: [B, T, k + C_actual]
             merged_scores = torch.cat([best_scores, chunk_scores], dim=-1)
             merged_indices = torch.cat([best_indices, chunk_indices], dim=-1)
-
-            # Take top-k from merged
             topk_scores, topk_pos = merged_scores.topk(k, dim=-1)
             best_scores = topk_scores
             best_indices = merged_indices.gather(-1, topk_pos)
