@@ -106,10 +106,10 @@ class FenwickStateTree:
         """
         # level_scales: [B, H, L] → [L, B, H, 1, 1] for broadcasting
         weights = level_scales.permute(2, 0, 1).unsqueeze(-1).unsqueeze(-1)
-        # states: [L, B, H, K, V]
-        # Weighted sum across levels, masking inactive
+        # states: [L, B, H, K, V] — detached from graph (values only,
+        # gradients flow through weights/level_scales, not stored states)
         mask = self.active.view(self.num_levels, 1, 1, 1, 1).float()
-        weighted = self.states * weights * mask
+        weighted = self.states.detach() * weights * mask
         init_state = weighted.sum(dim=0)  # [B, H, K, V]
         return init_state
 
