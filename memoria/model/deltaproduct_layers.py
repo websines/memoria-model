@@ -111,12 +111,10 @@ class DeltaProductBlock(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         # cos/sin ignored — DeltaProduct uses recurrent state for ordering
-        # FLA Triton kernels require bfloat16 — cast internally, cast back
-        orig_dtype = x.dtype
-        if x.dtype == torch.float32:
-            x = x.bfloat16()
-        out, _, _ = self.deltaproduct(x)
-        return out.to(orig_dtype)
+        # FLA Triton kernels require bfloat16 — autocast handles dtype seamlessly
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            out, _, _ = self.deltaproduct(x)
+        return out.to(x.dtype)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -239,11 +237,10 @@ class LogLinearDeltaProductBlock(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         # cos/sin ignored — recurrent layer, no positional encoding
-        # FLA Triton kernels require bfloat16 — cast internally, cast back
-        orig_dtype = x.dtype
-        if x.dtype == torch.float32:
-            x = x.bfloat16()
+        return self._forward_impl(x)
 
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        input_dtype = x.dtype
         B, T, D = x.shape
         C = self.chunk_size
         H = self.num_heads
@@ -313,18 +310,18 @@ class LogLinearDeltaProductBlock(nn.Module):
             # Query Fenwick tree for initial state
             init_state = fenwick.query(lw_c)  # [B, H, K, V]
 
-            # Run DeltaProduct chunk kernel
-            # The kernel expects specific tensor layouts — reshape to match
-            out_c = chunk_gated_delta_product(
-                q=q_c,
-                k=k_c,
-                v=v_c,
-                g=g_c,
-                beta=beta_c,
-                num_householder=n_h,
-                initial_state=init_state,
-                output_final_state=True,
-            )
+            # Run DeltaProduct chunk kernel (requires bfloat16)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                out_c = chunk_gated_delta_product(
+                    q=q_c,
+                    k=k_c,
+                    v=v_c,
+                    g=g_c,
+                    beta=beta_c,
+                    num_householder=n_h,
+                    initial_state=init_state,
+                    output_final_state=True,
+                )
 
             if isinstance(out_c, tuple):
                 chunk_output, final_state = out_c[0], out_c[1]
@@ -349,7 +346,7 @@ class LogLinearDeltaProductBlock(nn.Module):
         output = output * o_gate.sigmoid()
         output = self.o_proj(output)
 
-        return output.to(orig_dtype)
+        return output.to(input_dtype)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -395,8 +392,6 @@ class LogLinearGDNBlock(nn.Module):
         self._yarn_scale = 1.0
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-        orig_dtype = x.dtype
-        if x.dtype == torch.float32:
-            x = x.bfloat16()
-        out, _, _ = self.hgdn(x)
-        return out.to(orig_dtype)
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            out, _, _ = self.hgdn(x)
+        return out.to(x.dtype)

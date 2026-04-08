@@ -432,7 +432,7 @@ class TestFullModelIntegration:
         model.init_weights()
         tokens = torch.randint(0, 256, (2, 64), device='cuda')
         targets = torch.randint(0, 256, (2, 64), device='cuda')
-        result = model(tokens, targets, current_step=0, alpha=0.0)
+        result = model(tokens, targets, alpha=0.0)
         assert 'loss' in result
         assert result['loss'].isfinite()
 
@@ -442,7 +442,7 @@ class TestFullModelIntegration:
         model.init_weights()
         tokens = torch.randint(0, 256, (2, 64), device='cuda')
         targets = torch.randint(0, 256, (2, 64), device='cuda')
-        result = model(tokens, targets, current_step=0, alpha=0.0)
+        result = model(tokens, targets, alpha=0.0)
         result['loss'].backward()
         # Check that DeltaProduct params got gradients
         for block in model.transformer.blocks:
