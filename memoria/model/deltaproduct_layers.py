@@ -262,14 +262,16 @@ class LogLinearDeltaProductBlock(nn.Module):
         g_gate = _lin(self.a_proj, xb)
         o_gate = _lin(self.g_proj, xb)
 
-        # Short causal convolution
+        # Short causal convolution (explicit weight cast, no in-place data swap)
         if self.use_short_conv:
             def _conv_bf16(conv, t):
-                orig_w = conv.weight.data
-                conv.weight.data = orig_w.to(_bf)
-                out = conv(t.transpose(1, 2))[..., :T].transpose(1, 2)
-                conv.weight.data = orig_w
-                return out
+                return nn.functional.conv1d(
+                    t.transpose(1, 2),
+                    conv.weight.to(_bf),
+                    conv.bias.to(_bf) if conv.bias is not None else None,
+                    stride=conv.stride, padding=conv.padding,
+                    dilation=conv.dilation, groups=conv.groups,
+                )[..., :T].transpose(1, 2)
             q = _conv_bf16(self.q_conv, q)
             k = _conv_bf16(self.k_conv, k)
             v = _conv_bf16(self.v_conv, v)
