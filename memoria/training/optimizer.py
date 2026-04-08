@@ -97,7 +97,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     """Set up optimizer with per-group learning rates.
 
     Scratch mode (MemoriaModel):
-    - 2D matrix params in transformer blocks (attention, MLP, Mamba) → Muon
+    - 2D matrix params in transformer blocks (attention, MLP, DeltaProduct) → Muon
     - 1D params in transformer blocks (biases, norms) → AdamW
     - Embedding / unembedding → AdamW
     - Scalar params (lambdas) → AdamW with higher LR

@@ -25,18 +25,31 @@ class TransformerConfig:
     n_kv_head: int = 6
     n_embd: int = 768
 
-    # Attention pattern: M = Mamba-2, S = Sliding window, L = Long/global (MLA)
-    # "M" = all Mamba (cognitive state handles global context, O(T) linear)
-    # "MMMML" = 4 Mamba + 1 MLA per cycle (hybrid, recommended for scratch training)
+    # Attention pattern: H = Log-Linear DeltaProduct, D = DeltaProduct, E = Log-Linear GDN,
+    #                    S = Sliding window, L = Long/global (MLA)
+    # "HHHHL" = 4 Log-Linear DeltaProduct₃ + 1 MLA per cycle (maximum expressivity)
+    # "DDDEL" = 3 DeltaProduct₃ + 1 Log-Linear GDN + 1 MLA (fast training, separate layers)
+    # "DDDML" = 3 DeltaProduct₃ + 1 MLA per cycle (simplest upgrade from Mamba-2)
     # "S" = all sliding window (legacy, O(T×W))
-    # "SSSL" = 3 sliding + 1 global per cycle (for models without cognitive state)
-    window_pattern: str = "MMMML"
+    window_pattern: str = "HHHHL"
     sliding_window_size: int = 4096   # local window for S layers
 
-    # Mamba-2 parameters (for M layers)
-    mamba_d_state: int = 64           # SSM state expansion factor (64 or 128)
-    mamba_d_conv: int = 4             # local convolution width
-    mamba_expand: int = 2             # block expansion factor (inner_dim = expand * d_model)
+    # GatedDeltaProduct parameters (for D and H layers)
+    deltaproduct_n_householder: int = 3       # Householder reflections per token (expressivity knob)
+    deltaproduct_head_dim: int = 128          # key dimension per head
+    deltaproduct_expand_v: int = 2            # value dim = head_dim × expand_v
+    deltaproduct_allow_neg_eigval: bool = True  # [-1,1] eigenvalues — REQUIRED for state tracking
+    deltaproduct_conv_size: int = 4           # short causal convolution width
+    deltaproduct_use_forget_gate: bool = True  # scalar forget gate
+    deltaproduct_use_short_conv: bool = True   # pre-SSM convolution
+
+    # Log-Linear parameters (for H and E layers)
+    loglinear_chunk_size: int = 64            # chunk size for Fenwick tree (must be 64 for Log-Linear)
+
+    # Legacy Mamba-2 parameters (for M layers — kept for backward compat with old configs)
+    mamba_d_state: int = 64
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
 
     # RoPE position encoding — native long context, no scaling
     # High base frequency for native 200K support (like Llama 3 at 128K)
@@ -52,7 +65,7 @@ class TransformerConfig:
     mla_rope_dim: int = 64            # RoPE dimensions kept uncompressed in MLA
     mla_window_size: int = 0          # sliding window for MLA layers (0 = full attention)
                                       # At long context (>128K), use 65536-131072 to avoid O(T²)
-                                      # Cognitive state + Mamba-2 handle beyond-window coherence
+                                      # Cognitive state + DeltaProduct handle beyond-window coherence
 
     # State interface placement
     interface_every: int = 4          # insert state interface every N layers
@@ -172,7 +185,7 @@ def small_config() -> MemoriaConfig:
     return MemoriaConfig(
         transformer=TransformerConfig(
             n_layer=12, n_head=6, n_kv_head=6, n_embd=768,
-            window_pattern="MMMML",  # 4 Mamba + 1 MLA per 5-layer cycle
+            window_pattern="HHHHL",  # 4 Log-Linear DeltaProduct₃ + 1 MLA per 5-layer cycle
             mla_latent_dim=192,      # enable MLA for L layers (latent = n_embd/4)
             interface_every=4,
         ),
@@ -198,7 +211,7 @@ def medium_config() -> MemoriaConfig:
     return MemoriaConfig(
         transformer=TransformerConfig(
             n_layer=24, n_head=8, n_kv_head=8, n_embd=1024,
-            window_pattern="MMMML",  # 4 Mamba + 1 MLA per 5-layer cycle
+            window_pattern="HHHHL",  # 4 Log-Linear DeltaProduct₃ + 1 MLA per 5-layer cycle
             mla_latent_dim=256,      # enable MLA for L layers (latent = n_embd/4)
             interface_every=4,
         ),
@@ -224,7 +237,7 @@ def large_config() -> MemoriaConfig:
     return MemoriaConfig(
         transformer=TransformerConfig(
             n_layer=24, n_head=10, n_kv_head=10, n_embd=1280,
-            window_pattern="MMMML",  # 4 Mamba + 1 MLA per 5-layer cycle
+            window_pattern="HHHHL",  # 4 Log-Linear DeltaProduct₃ + 1 MLA per 5-layer cycle
             mla_latent_dim=320,      # enable MLA for L layers (latent = n_embd/4)
             interface_every=4,
         ),

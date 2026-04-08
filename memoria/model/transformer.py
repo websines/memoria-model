@@ -213,9 +213,22 @@ class SlidingWindowAttention(nn.Module):
         return out
 
 
-# ── Mamba-2 Selective Scan (M layers) ──
+# ── DeltaProduct / Log-Linear layers (D, H, E layers) ──
 
-# Try to import mamba-ssm for Mamba-2 support
+_fla_available = False
+_hattention_available = False
+try:
+    from .deltaproduct_layers import (
+        DeltaProductBlock, LogLinearDeltaProductBlock, LogLinearGDNBlock,
+        _fla_available as _fla_avail, _hattention_available as _hattention_avail,
+    )
+    _fla_available = _fla_avail
+    _hattention_available = _hattention_avail
+except ImportError:
+    pass
+
+# ── Mamba-2 Selective Scan (M layers — legacy) ──
+
 _mamba_available = False
 try:
     from mamba_ssm import Mamba2
@@ -282,7 +295,7 @@ class MLACausalSelfAttention(nn.Module):
     - Full causal (mla_window_size=0): O(T²) — use for shorter contexts
     - Windowed (mla_window_size>0): O(T×W) — use for long context (>128K)
       With RotorQuant KV compression, windowed MLA uses ~38 MB at 1M tokens.
-      Cognitive state + Mamba-2 handle coherence beyond the window.
+      Cognitive state + DeltaProduct handle coherence beyond the window.
     """
 
     def __init__(self, config: TransformerConfig, layer_idx: int):
@@ -533,9 +546,17 @@ class Block(nn.Module):
         pattern = config.window_pattern
         attn_type = pattern[layer_idx % len(pattern)] if pattern else 'F'
 
-        if attn_type == 'M' and _mamba_available:
+        if attn_type == 'H' and _fla_available:
+            self.attn = LogLinearDeltaProductBlock(config, layer_idx)
+        elif attn_type == 'D' and _fla_available:
+            self.attn = DeltaProductBlock(config, layer_idx)
+        elif attn_type == 'E' and _hattention_available:
+            self.attn = LogLinearGDNBlock(config, layer_idx)
+        elif attn_type in ('H', 'D', 'E') and _fla_available:
+            self.attn = DeltaProductBlock(config, layer_idx)
+        elif attn_type == 'M' and _mamba_available:
             self.attn = MambaBlock(config, layer_idx)
-        elif attn_type == 'M' or attn_type == 'S':
+        elif attn_type in ('M', 'S', 'H', 'D', 'E'):
             self.attn = SlidingWindowAttention(config, layer_idx)
         elif attn_type == 'L' and config.mla_latent_dim > 0:
             self.attn = MLACausalSelfAttention(config, layer_idx)
@@ -683,7 +704,10 @@ class Transformer(nn.Module):
 
         for block in self.blocks:
             attn = block.attn
-            if isinstance(attn, MambaBlock):
+            if isinstance(attn, (DeltaProductBlock, LogLinearDeltaProductBlock, LogLinearGDNBlock)):
+                # DeltaProduct/Log-Linear layers use their own internal init — skip
+                pass
+            elif isinstance(attn, MambaBlock):
                 # Mamba-2 uses its own internal initialization — skip
                 pass
             elif isinstance(attn, MLACausalSelfAttention):

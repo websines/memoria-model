@@ -46,7 +46,7 @@ Input tokens [B, T]
 └──────────────────────────────────────────────────────────────┘
        │
        ▼
-┌─ Transformer Block 0 (Mamba-2 / SWA / MLA) ──────────────────┐
+┌─ Transformer Block 0 (DeltaProduct / Log-Linear GDN / MLA) ──┐
 │  resid_lambda[i] * x + x0_lambda[i] * x0                      │
 │  x = x + attn(norm(x), cos, sin)                               │
 │  x = x + mlp(norm(x))        [ReLU² activation]                │
@@ -100,30 +100,90 @@ Input tokens [B, T]
 
 ## Backbone Components
 
-### Layer Types ("MMMML" Pattern)
+### Layer Types ("DDDEL" Pattern)
 
-The `window_pattern` string defines per-layer architecture. Default "MMMML" = 4 Mamba-2 + 1 MLA per 5-layer cycle.
+The `window_pattern` string defines per-layer architecture. Default "DDDEL" = 3 GatedDeltaProduct₃ + 1 Log-Linear GDN + 1 MLA per 5-layer cycle.
 
 | Type | Class | Scaling | When to use |
 |------|-------|---------|-------------|
-| **M** (Mamba-2) | `MambaBlock` | O(T) linear | Default — handles recurrent long-range memory |
+| **D** (DeltaProduct) | `DeltaProductBlock` | O(T) linear | Default — error-correcting recurrence with state tracking |
+| **E** (Log-Linear GDN) | `LogLinearGDNBlock` | O(T log T) | Hierarchical multi-scale context via Fenwick tree |
 | **S** (Sliding Window) | `SlidingWindowAttention` | O(T×W) | Legacy — local attention with RotorQuant KV compression |
 | **L** (MLA Global) | `MLACausalSelfAttention` | O(T²) or O(T×W) | Periodic dense attention with latent KV compression |
 
-### Mamba-2 (M layers)
+### GatedDeltaProduct₃ (D layers)
 
-Wraps `mamba_ssm.Mamba2` — selective state space model with input-dependent gating:
+Wraps `fla.layers.GatedDeltaProduct` — error-correcting recurrence via products of Householder reflections with gated forgetting:
 
 ```
-h_t = (1 - Δ·σ(B_t)) × h_{t-1} + Δ·σ(B_t) × (A × x_t)
+For each token t, apply n_h=3 Householder reflection steps:
+  H_{t,j} = (I - β_{t,j} · k_{t,j} · k_{t,j}ᵀ) · H_{t,j-1} + β_{t,j} · k_{t,j} · v_{t,j}ᵀ
+With forget gate:
+  H_t = g_t · H_{t,3}
+Output:
+  o_t = H_t · q_t
 ```
 
-- `d_state=64`: SSM latent dimension (selective scan state)
-- `d_conv=4`: local convolution width (captures immediate context)
-- `expand=2`: inner dimension = 2 × d_model
-- **No KV cache**: recurrent state is fixed size (~400 KB total across all M layers)
+Each step computes "what did I predict at key k vs what I see as value v" and corrects the state to reduce that error. This is online gradient descent on an associative recall loss — the recurrent layer *learns* at every token, not just compresses.
+
+**Eigenvalue range [-1,1] is critical.** With β ∈ [0, 2], eigenvalues of each Householder reflection span [-1, 1]. This enables the state to represent permutations, negation, and cyclic state transitions — operations that real-valued diagonal SSMs (Mamba-2) fundamentally cannot express. The DeltaProduct paper shows that models restricted to [0, 1] eigenvalues completely fail at state-tracking benchmarks regardless of depth or n_h. This is THE architectural reason DeltaProduct succeeds at entity tracking where Mamba-2 fails.
+
+**Three Householder reflections (n_h=3)** can approximate any orthogonal state transition matrix (Cartan-Dieudonné theorem). This means the recurrent layer can represent any rotation, reflection, or permutation of its internal state — the maximum expressivity achievable with O(1) inference state.
+
+- `num_householder=3`: Householder reflections per token (the expressivity knob)
+- `head_dim=128`: key dimension per head
+- `expand_v=2`: value dimension = head_dim × 2
+- `allow_neg_eigval=True`: enables [-1,1] eigenvalue range (REQUIRED)
+- `conv_size=4`: short causal convolution (captures immediate context)
+- `use_forget_gate=True`: scalar forget gate g_t ∈ [0,1]
+- **State**: d_k × d_v matrix per head (key-value memory, not a diagonal vector)
+- **No KV cache**: recurrent state is fixed size regardless of sequence length
 - **No RoPE needed**: sequence ordering implicit in recurrence
+- **Spectral norm ≤ 1**: guaranteed by Householder construction, ensures stability at arbitrary sequence lengths (critical for SkyLadder progressive context extension)
+- **Length extrapolation**: minimal degradation extrapolating from training length to 4×+ (DeltaProduct paper, Figures 8, 16-18)
 - Drop-in replacement for attention: `[B, T, D] → [B, T, D]`
+
+**Learning hierarchy with TTT**: DeltaProduct handles fast, shallow error corrections at every token (entity state changed, fact updated, pronoun resolved). TTT handles deeper structural adaptations at chunk boundaries (domain adaptation, user-specific patterns). Pass 2 handles discrete operations (new belief, new edge) that no gradient can express. This creates a learning continuum across timescales with no gap between token-level and chunk-level learning.
+
+Reference: DeltaProduct (NeurIPS 2025, arXiv:2502.10297)
+Reference: Gated Delta Networks (ICLR 2025, arXiv:2412.06464)
+Library: `flash-linear-attention` (fla-org/flash-linear-attention)
+
+### Log-Linear GDN (E layers)
+
+Wraps `hattention.HGatedDeltaNet` — Gated DeltaNet enhanced with a logarithmically growing hierarchical state via Fenwick tree decomposition:
+
+```
+Standard GDN: 1 fixed-size state S_t per head
+Log-Linear GDN: ~log₂(T) states {S_t⁰, S_t¹, ..., S_tᴸ} per head
+
+Each level covers an exponentially larger chunk of history:
+  Level 0: current token (size 1)
+  Level 1: last 1 token
+  Level 2: last 2 tokens
+  Level 3: last 4 tokens
+  ...
+  Level L: last 2^(L-1) tokens
+
+Output: o_t = Σ_l λ_t^(l) · q_tᵀ · S_t^(l)
+  where λ_t^(l) are data-dependent level weights (learned)
+```
+
+At 200K tokens: log₂(200K) ≈ 17 levels. Recent tokens get individual high-resolution states, distant tokens are compressed into coarser levels. The data-dependent λ weights let the model learn how much to trust each temporal scale.
+
+**Why a separate layer type (not applied to DeltaProduct)**: Log-Linear is an orthogonal enhancement that can theoretically "lift" any linear attention mechanism. However, Log-Linear DeltaProduct (combining Fenwick tree with multi-Householder products) has not been implemented — it would require a custom Triton kernel merging `chunk_gated_delta_product` with `chunk_h_gated_delta_rule`. Using Log-Linear GDN (n_h=1) as a dedicated E layer type gives us the hierarchical memory benefit now, while DeltaProduct₃ layers handle the error-correction role. Future work: merge them into a single Log-Linear DeltaProduct layer.
+
+**Inductive bias**: The Fenwick tree compresses distant tokens more aggressively and keeps recent tokens at high resolution. This complements MLA (exact local attention) and cognitive state (exact distant recall via beliefs). The E layer provides a middle ground — approximate multi-scale context that neither the D layers (fixed-size state, no temporal hierarchy) nor the L layers (exact but windowed) offer.
+
+- O(T log T) compute, O(log T) state per head
+- Surpasses FlashAttention-2 throughput at sequences > 8K
+- GDN base with single-step delta rule (n_h=1) + gated forgetting
+- Data-dependent level scales via learned projection + per-head learnable L parameter
+- No KV cache — hierarchical compressed state instead
+
+Reference: Log-Linear Attention (ICLR 2026, arXiv:2506.04761)
+Reference: Gated Delta Networks (ICLR 2025, arXiv:2412.06464)
+Library: `hattention` (HanGuo97/log-linear-attention) + `flash-linear-attention`
 
 ### MLA (L layers) — Multi-Head Latent Attention
 
@@ -565,20 +625,26 @@ For loop_i in range(max_loops):
 - **Cost**: ~3-4× per token (amortized by DFlash speculative decoding)
 - **Advantage over text CoT**: no output tokens wasted, vector representations richer than language, TTT adapts weights during reasoning, different beliefs retrieved each loop as understanding shifts
 
-## Four Memory Systems
+## Five Memory Systems
 
-Memoria maintains coherence at any context length through four complementary memory systems:
+Memoria maintains coherence at any context length through five complementary memory systems:
 
 | System | Range | Scaling | Timescale | What it stores |
 |--------|-------|---------|-----------|---------------|
 | **MLA attention** | W tokens (window) | O(W) constant | Immediate | Dense local context, every detail |
-| **Mamba-2 state** | Unlimited | O(1) fixed | Continuous | Compressed recurrent memory, sequential patterns |
+| **DeltaProduct state** | Unlimited | O(1) fixed | Continuous | Error-corrected recurrent memory, entity tracking |
+| **Log-Linear GDN state** | Unlimited | O(log T) growing | Multi-scale | Hierarchical temporal context, recent=high-res, distant=compressed |
 | **Cognitive state** | Unlimited | O(1) fixed slots | Persistent | Facts, relations, goals — survives across sessions |
 | **Engram** | Unlimited | O(1) hash | Static | Common N-gram patterns, signatures, idioms |
 
-Memory at 1M tokens (small config, 2 MLA layers, W=128K, RotorQuant 3-bit): **~65 MB total**.
+Memory at 1M tokens (small config, 2 MLA layers, W=128K, RotorQuant 3-bit):
+- MLA KV: ~38 MB (windowed + compressed)
+- DeltaProduct state: ~2 MB per layer (fixed d_k × d_v matrix)
+- Log-Linear GDN state: ~0.6 MB per layer × log₂(1M) ≈ 20 levels
+- Cognitive state: ~26 MB (65K beliefs × 256 dims)
+- **Total: ~80 MB** — grows logarithmically, not linearly
 
-No single system covers everything. MLA provides dense recent context. Mamba carries compressed signal forward. Cognitive state stores discrete facts retrievable by content. Engram handles static patterns with zero distance penalty.
+No single system covers everything. MLA provides exact local context. DeltaProduct error-corrects within-sequence state. Log-Linear GDN maintains multi-scale temporal hierarchy. Cognitive state stores discrete facts retrievable by content. Engram handles static patterns with zero distance penalty.
 
 ## Model Configurations
 
@@ -586,9 +652,9 @@ No single system covers everything. MLA provides dense recent context. Mamba car
 
 | Config | Params | Layers | Pattern | Beliefs | Target Hardware |
 |--------|--------|--------|---------|---------|----------------|
-| `small_config()` | ~245M (+117M embed) | 12 | MMMML | 16K | Single 3090 |
-| `medium_config()` | ~456M | 24 | MMMML | 32K | 2× 3090 |
-| `large_config()` | ~694M | 24 | MMMML | 65K | B200 / multi-GPU |
+| `small_config()` | ~245M (+117M embed) | 12 | DDDEL | 16K | Single 3090 |
+| `medium_config()` | ~456M | 24 | DDDEL | 32K | 2× 3090 |
+| `large_config()` | ~694M | 24 | DDDEL | 65K | B200 / multi-GPU |
 | `lfm2_config()` | 350M frozen + 15M adapters | 16 | LFM2 hybrid | 16K | Single 3090 |
 | `qwen_config()` | 2B frozen + 25M adapters | 24 | Qwen3.5 hybrid | 32K | Single 24GB GPU |
 
@@ -755,7 +821,7 @@ naturally converge toward representations where information sits in directions t
 
 MLA layers (L in "MMMML") default to full causal attention O(T²). At long context (>128K),
 this becomes prohibitive. Setting `mla_window_size > 0` gives MLA a sliding window, reducing
-cost to O(T × W) while cognitive state + Mamba-2 handle beyond-window coherence.
+cost to O(T × W) while cognitive state + DeltaProduct + Log-Linear GDN handle beyond-window coherence.
 
 ```
 mla_window_size = 0       → full causal O(T²), short context training
@@ -767,14 +833,16 @@ Four memory systems stack to maintain coherence at any context length:
 | System | Range | Scaling | Role |
 |--------|-------|---------|------|
 | **MLA attention** | W tokens (window) | O(W) constant | Dense local context |
-| **Mamba-2 state** | Unlimited | O(1) fixed | Compressed recurrent memory |
+| **DeltaProduct state** | Unlimited | O(1) fixed | Error-corrected recurrent memory |
+| **Log-Linear GDN state** | Unlimited | O(log T) growing | Hierarchical multi-scale context |
 | **Cognitive state** | Unlimited | O(1) fixed slots | Persistent beliefs, edges, goals |
 | **Engram** | Unlimited | O(1) hash | Static N-gram patterns |
 
 Memory at 1M tokens (small config, 2 MLA layers, W=128K, RotorQuant 3-bit):
 - MLA KV: ~38 MB (windowed + compressed)
-- Mamba-2 state: ~400 KB (fixed)
-- Total: **~65 MB** — same as at 10K tokens
+- DeltaProduct state: ~2 MB per layer (fixed)
+- Log-Linear GDN state: ~12 MB (log₂(1M) ≈ 20 levels)
+- Total: **~80 MB** — grows logarithmically, not linearly
 
 ### Blockwise Attention (Inference)
 
@@ -833,7 +901,7 @@ At 1M tokens with W=128K, D=128: ~38 MB MLA KV vs ~3 GB uncompressed.
 
 Standard autoregressive generation with cognitive state active:
 
-1. **Prefill**: Process full prompt through model. Beliefs form, Engram activates, Mamba state builds.
+1. **Prefill**: Process full prompt through model. Beliefs form, Engram activates, DeltaProduct + Log-Linear GDN states build.
 2. **Decode**: Generate tokens one-by-one. Each token triggers read path (retrieve beliefs), write path (buffer observations), TTT (adapt weights).
 3. **Between chunks**: Pass 2 runs — allocate beliefs, create edges, update goals. Dream phase if at sequence boundary.
 4. **Cognitive state persists**: After generation ends, beliefs/edges/goals remain for next conversation.
@@ -877,7 +945,7 @@ memoria/training/
 
 memoria/model/
   config.py          — TransformerConfig, StateConfig, TrainingConfig, presets
-  transformer.py     — Hybrid transformer (SWA/Mamba-2/MLA), YaRN RoPE, ReLU²
+  transformer.py     — Hybrid transformer (DeltaProduct/Log-Linear GDN/MLA), YaRN RoPE, ReLU²
   memoria_model.py   — MemoriaModel: transformer + state + interfaces + DFlash
   pretrained_model.py — PretrainedMemoriaModel: frozen HF backbone + interfaces
   dflash_head.py     — DFlash block diffusion draft head for speculative decoding
