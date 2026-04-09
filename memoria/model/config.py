@@ -136,6 +136,23 @@ class TransformerConfig:
     weight_qat_bits: int = 4           # default bit-width for weight QAT (0 = disabled)
     weight_qat_mlp_bits: int = 3       # MLP weights get more aggressive quantization (0 = use weight_qat_bits)
 
+    # BLT (Byte Latent Transformer) — tokenizer-free byte-level I/O
+    # Replaces token embedding/LM head with byte encoder/decoder.
+    # Global backbone operates on patches (compressed byte groups).
+    # Eliminates: 117M-param LM head, softmax bottleneck, gradient bottleneck.
+    # LM head drops to 197K params (768 × 260 byte vocab).
+    # Local layers use DeltaProduct (O(T), same kernel as backbone).
+    # Reference: BLT (Meta, arXiv:2412.09871) — byte latent transformer
+    # Reference: MambaByte (arXiv:2401.13660) — byte-level SSM
+    # Reference: EvaByte (2025) — linear attention + bytes
+    blt_enabled: bool = False          # enable byte-level I/O (replaces token vocab)
+    blt_local_dim: int = 384           # local encoder/decoder hidden dim (< n_embd)
+    blt_patch_size: int = 6            # bytes per patch (6 ≈ BPE token length)
+    blt_local_layers: int = 2          # DeltaProduct layers in encoder AND decoder
+    blt_byte_vocab: int = 260          # 256 bytes + BOS + EOS + PAD + SEP
+    blt_n_byte_heads: int = 4          # multi-byte prediction heads (for DFlash)
+    blt_head_dim: int = 64             # head dim for local DeltaProduct layers
+
     # DFlash block diffusion draft head (speculative decoding)
     # Three improvements over baseline block diffusion:
     # 1. KV injection: per-layer K/V projections for tapped features (not concat)

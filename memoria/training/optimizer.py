@@ -322,7 +322,32 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
-    # 18. DFlash draft head (block diffusion speculative decoding)
+    # 18a. BLT byte encoder (byte embedding, N-gram conv, local DeltaProduct, pooling)
+    if hasattr(model, 'blt_enabled') and model.blt_enabled:
+        enc_params = [p for p in model.byte_encoder.parameters() if p.requires_grad]
+        if enc_params:
+            param_groups.append({
+                'params': enc_params,
+                'lr': tc.interface_lr,  # same LR as interface layers
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
+    # 18b. BLT byte decoder (down projection, local DeltaProduct, byte heads)
+    if hasattr(model, 'blt_enabled') and model.blt_enabled:
+        dec_params = [p for p in model.byte_decoder.parameters() if p.requires_grad]
+        if dec_params:
+            param_groups.append({
+                'params': dec_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
+    # 19. DFlash draft head (block diffusion speculative decoding)
+    # (was group 18 before BLT groups were added)
     # Includes: draft layers, mask_embed, pos_embed, feature_proj, out_norm,
     # and per-layer KV injection projections (k_inject, v_inject).
     # KV injection projections are RotorQuant 3-bit eligible (marked with _qat_bits).

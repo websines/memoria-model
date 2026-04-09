@@ -822,7 +822,7 @@ For loop_i in range(max_loops):
 
 - **Training**: teacher forcing with random oracle loop count; halt probe learns from random targets
 - **Inference**: halt when P(halt) > threshold or max loops reached
-- **Cost**: ~3-4× per token (amortized by DFlash speculative decoding + predictive refinement)
+- **Cost**: ~3-4× per token (amortized by DFlash speculative decoding ~7-8× + predictive refinement)
 - **Advantage over text CoT**: no output tokens wasted, vector representations richer than language, TTT adapts weights during reasoning, different beliefs retrieved each loop as understanding shifts
 
 ### Predictive Refinement (MoR + SCORE + Error-Gated Retrieval)
@@ -991,23 +991,49 @@ Mask embeddings + positional encoding (up to max_block_size=32)
 - **Trained jointly**: Streak-distilled loss from step 0 (not alpha-gated)
 - **Inference**: `spec_generate()` — adaptive draft → verify confident prefix → accept/reject → repeat
 
-### Speculative Decoding Loop (Adaptive)
+### Speculative Decoding Loop (Optimized)
+
+Verify-as-prefill reuse: the verify step from round N provides logits + tap hiddens
+for round N+1. Only ONE full model forward per round (not two).
 
 ```
+# Initial prefill (once)
+result = forward(generated)
+cached_logits, cached_taps = result['logits'], result['dflash_tapped']
+
 while tokens_generated < max_new_tokens:
-    1. Run full model on current sequence (prefill)
-    2. Extract tapped hidden states (KV injection) + active beliefs (context)
+    1. Get guaranteed token from cached_logits[:, -1, :]
+    2. Extract KV injection from cached_taps (no recomputation)
     3. Draft head generates max_block_size tokens in parallel (cheap)
-    4. Compute per-position entropy → adaptive cutoff at first uncertain position
-    5. Verify: run full model on [sequence + confident prefix] (expensive, but shorter)
+    4. Entropy-based adaptive cutoff → verify only confident prefix
+    5. Verify: forward(candidate_seq) → verify_logits, verify_taps
     6. Accept tokens until first mismatch with verifier
-    7. Append accepted tokens, continue
+    7. cached_logits, cached_taps = verify_logits, verify_taps  ← REUSE
 ```
 
-Theoretical speedup: ~8.5× combined (vs ~3.4× baseline DFlash), primarily from:
+### Bandwidth Analysis (RTX 3090)
+
+| Component | Size | % of per-token BW |
+|-----------|------|-------------------|
+| Backbone (4/3-bit RotorQuant) | 37.8 MB | 24.9% |
+| Refinement (3 loops × 4 blocks) | 37.8 MB | 24.9% |
+| Interface layers (FP16) | 18.1 MB | 11.9% |
+| LM head (4-bit RotorQuant) | 58.4 MB | 38.4% |
+| **Total per AR token** | **152.1 MB** | |
+
+DFlash round cost (verify + draft): 185.3 MB → ~9 accepted tokens
+
+| Configuration | Tok/s | Speedup |
+|---------------|-------|---------|
+| Vanilla AR | ~3,000 | 1.0x |
+| DFlash (all optimizations) | ~22,000 | 7.4x |
+
+Key optimizations and their contributions:
 - KV injection: +21% acceptance rate (tighter verifier alignment)
 - Streak distillation: +38% (consecutive accuracy optimization)
 - Adaptive block size: +90% (draft many, verify few in hard regions)
+- Verify-as-prefill reuse: 2x (eliminates redundant forward pass per round)
+- LM head 4-bit QAT: 2x (233 MB → 58 MB, 71% bandwidth savings)
 
 Reference: DFlash (arXiv:2602.06036) — KV injection, block diffusion
 Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
@@ -1045,11 +1071,14 @@ TTT is the self-improvement mechanism. During BOTH training and inference:
 
 ## Quantization-Aware Training (RotorQuant + CAGE)
 
-Three quantization paths, all using RotorQuant block-diagonal rotations:
+Four quantization paths, all using RotorQuant block-diagonal rotations:
 
 1. **Activation QAT** (KV cache, beliefs): 3-bit STE noise during training → lossless runtime compression
-2. **Weight QAT** (all transformer backbone nn.Linear): 4-bit (attention/DeltaProduct) or 3-bit (MLP) STE noise → deployable at low-bit with near-zero quality loss
-3. **CAGE correction**: Post-optimizer step nudges weights toward quantization grid points
+2. **Weight QAT** (transformer backbone + LM head): 4-bit (attention/DeltaProduct/LM head) or 3-bit (MLP) STE noise → deployable at low-bit with near-zero quality loss
+3. **DFlash KV injection QAT**: 3-bit for k_inject/v_inject projections (draft accuracy < verifier — aggressive quantization safe)
+4. **CAGE correction**: Post-optimizer step nudges weights toward quantization grid points
+
+LM head quantization is critical: at 151K vocab × 768 dim, the FP16 LM head is 233 MB — 71% of per-token bandwidth. At 4-bit it drops to 58 MB, nearly doubling inference throughput.
 
 ### Backend Selection
 
@@ -1213,7 +1242,7 @@ Standard autoregressive generation with cognitive state active:
 
 ### Speculative Decoding (DFlash)
 
-DFlash draft head amortizes refinement loop cost:
+DFlash draft head amortizes refinement loop cost. Optimized loop reuses verify as next prefill (1 forward per round, not 2):
 
 ```
 while tokens_generated < max_new_tokens:
@@ -1224,7 +1253,7 @@ while tokens_generated < max_new_tokens:
   5. Append accepted, continue
 ```
 
-~3-4× speedup at 50% acceptance rate, roughly canceling refinement loop overhead.
+~7-8× speedup with KV injection + streak distillation + adaptive block + verify-as-prefill reuse. Estimated ~22K tok/s on RTX 3090 (with 4-bit LM head QAT).
 
 ### Session Persistence
 

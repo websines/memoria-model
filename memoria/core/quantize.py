@@ -398,17 +398,29 @@ def apply_weight_qat(model: nn.Module, bits: int = 4, mlp_bits: int = 0) -> list
     if mlp_bits == 0:
         mlp_bits = bits
 
-    # Only quantize modules under transformer.blocks
-    # This naturally skips: wte, lm_head, interfaces, state, dflash_head, etc.
+    # Quantize modules under transformer.blocks + LM head + annotated DFlash modules.
+    # Skips: wte (embedding lookup needs precision for rare tokens), interfaces,
+    # state, and other cognitive modules.
     patched = []
 
     transformer = getattr(model, 'transformer', None)
     if transformer is None:
         return []
 
+    # ── LM head: biggest per-token bandwidth bottleneck ──
+    # At 151K vocab × 768 dim, the LM head is 233 MB at FP16 (71% of per-token BW).
+    # Quantizing to 4-bit saves 175 MB per forward pass. QAT training teaches the
+    # model to produce representations robust to 4-bit head projection.
+    # Note: lm_head is a separate nn.Linear, NOT tied to wte (embedding).
+    lm_head = getattr(transformer, 'lm_head', None)
+    if lm_head is not None and isinstance(lm_head, nn.Linear):
+        wrapped = WeightQuantLinear(lm_head, bits=bits)
+        transformer.lm_head = wrapped
+        patched.append(f"lm_head ({bits}-bit)")
+
     blocks = getattr(transformer, 'blocks', None)
     if blocks is None:
-        return []
+        return patched
 
     for block_idx, block in enumerate(blocks):
         # Collect targets first to avoid mutating module tree during iteration
