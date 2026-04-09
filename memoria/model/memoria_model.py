@@ -372,13 +372,16 @@ class MemoriaModel(nn.Module):
         # via scalable lookup as a complementary sparsity axis.
         # Tokenizer name for Engram compression table — empty string means no compression
         engram_tokenizer = config.pretrained_model if config.backbone == "pretrained" else ""
+        blt_on = getattr(config.transformer, 'blt_enabled', False)
         self.engram_cache = EngramCache(
-            hidden_dim=config.transformer.n_embd,
-            vocab_size=config.transformer.vocab_size,
+            # BLT mode: EngramCache operates on byte IDs at local_dim
+            # Token mode: operates on token IDs at n_embd
+            hidden_dim=config.transformer.blt_local_dim if blt_on else config.transformer.n_embd,
+            vocab_size=config.transformer.blt_byte_vocab if blt_on else config.transformer.vocab_size,
             table_size=getattr(config.transformer, 'engram_table_size', 50000),
             n_heads=getattr(config.transformer, 'engram_n_heads', 4),
             embed_dim_per_head=getattr(config.transformer, 'engram_embed_dim', 0),
-            tokenizer_name=engram_tokenizer,
+            tokenizer_name="" if blt_on else engram_tokenizer,  # no tokenizer compression for bytes
         )
 
         # ── Refinement Loops (Mamba-inspired iterative reasoning) ──
@@ -547,9 +550,14 @@ class MemoriaModel(nn.Module):
         # Hash-based O(1) lookup for common N-gram patterns. Runs BEFORE any
         # transformer block, augmenting the embedding with static knowledge.
         # The context-aware gate suppresses hash collision noise.
-        # Only applied to real token positions (not working memory suffix).
-        # Skipped when BLT is active — ByteEncoder's N-gram conv replaces this.
-        if not self.blt_enabled:
+        # Only applied to real token/byte positions (not working memory suffix).
+        # BLT mode: EngramCache hashes byte N-grams at local_dim, injected into
+        # byte_hidden (the encoder skip connection) so both encoder and decoder benefit.
+        if self.blt_enabled:
+            # Inject into byte encoder's hidden stream (local_dim space)
+            engram_out = self.engram_cache(_blt_byte_hidden, idx)  # [B, T_bytes, local_dim]
+            _blt_byte_hidden = _blt_byte_hidden + engram_out
+        else:
             engram_out = self.engram_cache(x[:, :T, :], idx)  # [B, T, H]
             x = torch.cat([x[:, :T, :] + engram_out, x[:, T:, :]], dim=1) if M > 0 else x + engram_out
 

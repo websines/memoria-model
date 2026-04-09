@@ -47,9 +47,11 @@ Previous architectures have gaps: Mamba-2 compresses passively between TTT steps
 | **DeltaProduct state** | Error-correcting KV matrix | Unlimited | O(1) per level | Continuous |
 | **Fenwick hierarchy** | Log-growing temporal levels | Unlimited | O(log T) | Multi-scale |
 | **Cognitive state** | Explicit beliefs + edges + goals | Unlimited | O(1) fixed slots | Persistent (cross-session) |
-| **Engram** | Hash-based N-gram lookup | Unlimited | O(1) | Static |
+| **Engram** | Hash-based N-gram lookup (token mode) | Unlimited | O(1) | Static |
 
 Each system handles something the others cannot. MLA+DSA gives exact sparse recall across the full context, guided by cognitive state beliefs. DeltaProduct error-corrects within-sequence state. The Fenwick hierarchy provides multi-scale temporal context. Cognitive state stores discrete facts that survive across sessions and directs MLA's sparse attention. Engram handles static patterns at zero cost. No single system is redundant.
+
+**BLT mode:** When `blt_enabled=True`, EngramCache is reconfigured for byte IDs (vocab=260, hidden_dim=local_dim=384) and hashes byte N-grams ("th", "the", "ing") instead of token N-grams. Its output is injected into `byte_hidden` (the encoder's skip connection) so both the encoder's DeltaProduct layers AND the decoder benefit. This stacks with the ByteEncoder's learned causal N-gram conv — EngramCache provides O(1) hash-table patterns, the conv provides learned local context.
 
 ### Self-Modifying Architecture
 
@@ -70,6 +72,7 @@ Memoria is a self-modifying architecture: the system changes its own compute gra
 | 8 | Adaptive depth | Variable computation depth per belief (ACT halting) + per-position refinement routing (MoR) | `adaptive_depth.py`, `memoria_model.py:RefinementRouter` |
 | 9 | Message passing + dream | Belief positions shift via loopy BP on the causal graph | `message_passing.py` |
 | 10 | Parallel goal pursuit | Per-head goal routing in read path (MoH-style); different heads pursue different goals simultaneously | `read_path.py:GoalRouter` |
+| 11 | BLT byte encoding | Learned byte→patch compression replaces fixed tokenizer; N-gram conv replaces EngramCache hash tables | `blt.py:ByteEncoder` |
 
 **The recursive autoresearch loop.** These mechanisms don't operate independently — they form a closed loop of self-directed architectural modification:
 
@@ -615,8 +618,10 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 15 | Message passing (relation transform + DEQ) | 0.01 | Factor graph inference |
 | 16 | Kendall/Gal log_sigma | 0.5 | Uncertainty weighting params |
 | 17 | Hypothesis generator | 0.01 | Autoresearch loop |
-| 18 | DFlash draft head (+ KV injection) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block. Injection projections 3-bit RotorQuant. |
-| 19 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
+| 18a | BLT byte encoder | 0.01 | Byte embedding + N-gram conv + LocalDeltaProduct + strided pool |
+| 18b | BLT byte decoder | 0.01 | Down projection + LocalDeltaProduct + 4 multi-byte heads |
+| 19 | DFlash draft head (+ KV injection) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block. Injection projections 3-bit RotorQuant. |
+| 20 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
 | — | GoalRouter (PARL per-head routing) | 0.01 | Included in group 5 (interface params) |
 | M | 2D matrix params (attention, MLP) | 0.04 | **Muon optimizer** (separate from AdamW) |
 
@@ -956,6 +961,105 @@ Uses HuggingFace Accelerate with `find_unused_parameters=True` (cognitive state 
 | TTT deltas (delta_A, delta_B) | NOT synchronized (requires_grad=False, modified via .data) — each rank adapts independently |
 | Pass 2 | Runs on rank 0 only, barrier after completion |
 
+## BLT — Byte Latent Transformer (Tokenizer-Free I/O)
+
+Replaces the 151K-token embedding (117M params) + LM head (117M params) with a byte-level encoder/decoder (3.6M params total). The global DeltaProduct backbone operates on patches (compressed byte groups), while lightweight local layers handle byte↔patch conversion.
+
+**Why this is critical:**
+- LM head was **71% of per-token inference bandwidth** (233 MB FP16)
+- Softmax bottleneck: 768-dim cannot represent 151K output distributions
+- Gradient bottleneck: 99.5% of gradient signal lost through 151K LM head
+- BLT eliminates all three: 260 byte classes, 768 >> 260 (overcomplete)
+
+### Architecture
+
+```
+Raw bytes [B, T_bytes]
+  → ByteEncoder:
+    byte_embed(260 → local_dim=384)
+    + causal N-gram conv (8-byte receptive field, learned)
+    + 2× LocalDeltaProduct (O(T), 1 Householder, head_dim=64)
+    + strided Conv1d pool (stride=patch_size=6) → patches
+    + Linear(local_dim → n_embd=768)
+  → patches [B, P, 768]
+  → byte_hidden [B, T_bytes, 384] (skip connection for decoder)
+    + EngramCache injection (hash-table byte N-grams, O(1) lookup)
+
+      ↓ (P = T_bytes / 6, ~4-6× shorter than bytes)
+
+  Global DeltaProduct Backbone (unchanged, operates on patches)
+    12-48 layers × HHHHL pattern
+    State interfaces every 4 layers (read/write beliefs at patch level)
+    Refinement loops on upper layers
+    TTT gradient steps (patch-level targets: last byte per patch)
+
+      ↓
+
+  → ByteDecoder:
+    Linear(n_embd → local_dim)
+    + repeat_interleave to byte positions
+    + intra-patch positional encoding
+    + gated skip connection from encoder byte_hidden
+    + 2× LocalDeltaProduct (O(T))
+    → 4 multi-byte prediction heads (each 384 → 260, ~100K params)
+  → byte_logits [B, T_bytes, 260]
+```
+
+### Key Properties
+
+| Property | Token-level (old) | BLT (new) |
+|----------|------------------|-----------|
+| Vocab / output classes | 151,936 | **260** (256 bytes + 4 special) |
+| Embedding params | 117M | **100K** (260 × 384) |
+| LM head params | 117M | **100K** per head (× 4 heads = 400K) |
+| Active model params (small) | 395M | **146M** (62% smaller) |
+| Per-token BW (LM head) | 233 MB (FP16) / 58 MB (4-bit) | **0.4 MB** |
+| Softmax bottleneck | Yes (768 << 151K) | **None** (768 >> 260) |
+| Gradient pass-through | 0.5% | **100%** (overcomplete) |
+| Tokenizer required | Yes (Qwen3 BPE) | **None** (raw bytes) |
+
+### Local DeltaProduct Layers
+
+Same GatedDeltaProduct kernel as global backbone but lighter:
+- 1 Householder reflection (vs 3 in global) — byte patterns are simpler
+- local_dim=384 (vs n_embd=768) — bytes need less capacity
+- O(T) on byte sequences — handles 4-6× longer sequences naturally
+- Falls back to causal conv + gated MLP on CPU (no FLA Triton)
+
+### Multi-Byte Prediction Heads
+
+4 independent prediction heads on the decoder output:
+- Head 0: predicts next byte (standard autoregressive)
+- Head k: predicts byte k+1 ahead (for multi-step DFlash speculation)
+- Each head: Linear(384 → 260) = 100K params
+- Total: 400K params (was 117M shared LM head)
+
+### Scaling
+
+| Model size | LM head % of backbone (old) | BLT I/O % of backbone |
+|------------|---------------------------|----------------------|
+| 400M | 235% | 7.3% |
+| 2B | 44% | 0.5% |
+| 7B | 17% | 0.1% |
+| 30B | 5% | 0.03% |
+
+BLT I/O cost vanishes at scale. The freed params (92M at 400M, ~900M at 7B) can be reinvested as additional backbone layers.
+
+### Inference Throughput (RTX 3090, small_config)
+
+| Config | Text bytes/s | vs Vanilla AR |
+|--------|-------------|---------------|
+| Vanilla AR (151K, FP16 head) | 5,600/s | 1.0× |
+| DFlash + 4-bit head (best token-level) | 88,500/s | 15.9× |
+| **BLT + DFlash** | **182,000/s** | **32.7×** |
+
+Reference: BLT (Meta, arXiv:2412.09871) — byte latent transformer, tested at 400M-8B
+Reference: MambaByte (arXiv:2401.13660) — byte-level SSM, proved SSM+bytes works
+Reference: EvaByte (HKU NLP, 2025) — linear attention + bytes + multi-byte heads
+Reference: Bolmo (Allen AI, arXiv:2512.15586) — mLSTM byte encoder at 1B-7B
+Reference: ByteFlow (arXiv:2603.03583) — learned byte segmentation
+Reference: LM head gradient bottleneck (arXiv:2603.10145) — 95-99% gradient loss
+
 ## DFlash Speculative Decoding
 
 Native block diffusion draft head for inference acceleration. Especially valuable because refinement loops multiply per-token cost by ~4×. Three improvements over baseline:
@@ -1078,7 +1182,7 @@ Four quantization paths, all using RotorQuant block-diagonal rotations:
 3. **DFlash KV injection QAT**: 3-bit for k_inject/v_inject projections (draft accuracy < verifier — aggressive quantization safe)
 4. **CAGE correction**: Post-optimizer step nudges weights toward quantization grid points
 
-LM head quantization is critical: at 151K vocab × 768 dim, the FP16 LM head is 233 MB — 71% of per-token bandwidth. At 4-bit it drops to 58 MB, nearly doubling inference throughput.
+LM head quantization is critical in token mode: at 151K vocab × 768 dim, the FP16 LM head is 233 MB — 71% of per-token bandwidth. At 4-bit it drops to 58 MB. With BLT enabled, the LM head is replaced by byte decoder heads (260 classes, 0.4 MB total) — the bottleneck disappears entirely.
 
 ### Backend Selection
 
@@ -1282,7 +1386,8 @@ memoria/model/
   transformer.py         — Hybrid transformer (H/D/E/MLA dispatch), YaRN RoPE, ReLU²
   deltaproduct_layers.py — DeltaProductBlock (D), LogLinearDeltaProductBlock (H), LogLinearGDNBlock (E)
   fenwick_state.py       — FenwickStateTree: O(log T) hierarchical state for Log-Linear layers
-  memoria_model.py       — MemoriaModel: transformer + state + interfaces + DFlash
+  memoria_model.py       — MemoriaModel: transformer + state + interfaces + BLT + DFlash
+  blt.py                 — BLT byte encoder/decoder (tokenizer-free byte-level I/O)
   pretrained_model.py    — PretrainedMemoriaModel: frozen HF backbone + interfaces
   dflash_head.py         — DFlash block diffusion draft head for speculative decoding
 
