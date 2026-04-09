@@ -85,6 +85,17 @@ class TransformerConfig:
     refinement_halt_threshold: float = 0.7  # P(halt) above this exits the loop
     refinement_gate_init: float = 0.1       # lifeline gate initial value (per-dim)
 
+    # Predictive refinement (MoR + SCORE + error-gated retrieval)
+    # Per-position routing: lightweight router decides which positions need further
+    # refinement. Contractive scaling: later loops contribute geometrically smaller
+    # corrections. Error-gated retrieval: skip belief re-query for small-delta positions.
+    # All thresholds are learned MetaParams — no hardcoded magic numbers.
+    # Reference: MoR (NeurIPS 2025, arXiv:2507.10524) — per-token adaptive recursion
+    # Reference: SCORE (arXiv:2603.10544) — contractive recurrent depth
+    # Reference: PonderNet (arXiv:2107.05407) — learned halting
+    # Reference: Two-Scale Latent Dynamics (NeurIPS 2025, arXiv:2509.23314)
+    predictive_refinement: bool = True  # enable per-position adaptive refinement
+
     # Read gate initial bias (sigmoid(x) ≈ opening fraction)
     read_gate_init_bias: float = 2.0        # sigmoid(2.0) ≈ 0.88 — starts mostly open
 

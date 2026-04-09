@@ -67,7 +67,7 @@ Memoria is a self-modifying architecture: the system changes its own compute gra
 | 5 | Cognitive controller | Learned policy over rates of layers 0-4 (how aggressively to self-modify) | `cognitive_controller.py` |
 | 6 | SGM safety gate | Statistical validation of modifications (e-value testing) | `safety_gate.py` |
 | 7 | Telos goal generation | Creates new goals from surprise → changes what the system optimizes for | `telos_module.py` |
-| 8 | Adaptive depth | Variable computation depth per belief (ACT halting) | `adaptive_depth.py` |
+| 8 | Adaptive depth | Variable computation depth per belief (ACT halting) + per-position refinement routing (MoR) | `adaptive_depth.py`, `memoria_model.py:RefinementRouter` |
 | 9 | Message passing + dream | Belief positions shift via loopy BP on the causal graph | `message_passing.py` |
 
 **The recursive autoresearch loop.** These mechanisms don't operate independently — they form a closed loop of self-directed architectural modification:
@@ -535,6 +535,7 @@ L_total = L_token + α · L_fe + α · 0.1 · L_utility + α · 0.1 · L_surpris
 | **L_utility** | `chunked_cross_entropy` on utility logits | Interface utility heads | Measures whether retrieved beliefs improve token prediction. |
 | **L_surprise** | `TelosModule.surprise_loss` | RND networks, goal system | RND surprise (trains predictor to match target for seen beliefs) + goal status transitions (penalize stalled/failed, reward completed). |
 | **L_halt** | `F.binary_cross_entropy` | RefinementProbe | Teaches the halting probe when to stop refinement loops. Teacher forcing with random oracle loop count. |
+| **L_ponder** | `ponder_cost × mean(gate)` | RefinementRouter | Per-position penalty for continuing refinement. Ponder cost is a learned MetaParam. Encourages router to halt positions early. Reference: PonderNet (arXiv:2107.05407). |
 | **L_jac** | DEQ Jacobian regularization | Message passing | Ensures the factor graph fixed-point map stays contractive. Periodic (every 10 steps). |
 | **L_draft** | `DFlashDraftHead.compute_draft_loss` | Draft head layers | Block diffusion draft quality. NOT alpha-gated — trains from step 0. |
 | **L_dsa_kl** | `LightningIndexer.compute_kl_loss` | Indexer projections | KL alignment: trains indexer to predict dense attention distribution. NOT alpha-gated. Full weight phase 1, reduced (0.1) after. Only computed in dense path (short context). |
@@ -589,6 +590,7 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 16 | Kendall/Gal log_sigma | 0.5 | Uncertainty weighting params |
 | 17 | Hypothesis generator | 0.01 | Autoresearch loop |
 | 18 | DFlash draft head | 0.01 | Block diffusion speculative decoding |
+| 19 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
 | M | 2D matrix params (attention, MLP) | 0.04 | **Muon optimizer** (separate from AdamW) |
 
 Gradient clipping (`clip_grad_norm_`) is applied only to AdamW params. Muon's Newton-Schulz orthogonalization produces unit-spectral-norm updates, making pre-clip counterproductive.
@@ -785,15 +787,58 @@ For loop_i in range(max_loops):
   2. Re-run upper transformer blocks on current hidden states
   3. Lifeline anchor: real tokens += gate × original_hidden (prevent drift)
      Working memory suffix: evolves freely (true scratchpad)
-  4. Re-query beliefs via last interface (retrieve-reason-retrieve cycle)
+  3b. Predictive refinement (loop > 0): contractive scaling + per-position routing
+  4. Re-query beliefs via last interface (error-gated: skip if delta < threshold)
   5. TTT gradient step on upper MLP deltas (self-improvement within reasoning)
   6. HaltingHead probe: P(halt) — stop early if confident enough
 ```
 
 - **Training**: teacher forcing with random oracle loop count; halt probe learns from random targets
 - **Inference**: halt when P(halt) > threshold or max loops reached
-- **Cost**: ~3-4× per token (amortized by DFlash speculative decoding)
+- **Cost**: ~3-4× per token (amortized by DFlash speculative decoding + predictive refinement)
 - **Advantage over text CoT**: no output tokens wasted, vector representations richer than language, TTT adapts weights during reasoning, different beliefs retrieved each loop as understanding shifts
+
+### Predictive Refinement (MoR + SCORE + Error-Gated Retrieval)
+
+Three complementary mechanisms make later refinement loops cheaper and more focused, with all thresholds as learned MetaParams:
+
+**1. SCORE-style contractive scaling**: step size `dt = (1 - contraction_rate)^l` shrinks geometrically per loop. Two-Scale Latent Dynamics (arXiv:2509.23314) empirically confirms that later iterations in recurrent-depth transformers produce smaller, increasingly orthogonal updates — the contraction rate formalizes this.
+
+**2. MoR-style per-position routing**: a lightweight `RefinementRouter` (hidden_dim+1 → bottleneck → 1, sigmoid) examines the delta vector (what this loop changed) and produces a per-position gate ∈ (0, 1). Positions where the gate is near zero have effectively converged — their contribution from this loop is suppressed. The router sees the delta *content* (not just magnitude), so it can learn which kinds of changes matter (e.g., belief-retrieval-induced changes vs noise).
+
+**3. Error-gated retrieval**: the belief re-query step (Step 4) is the most expensive operation in the loop. With predictive refinement, the per-position delta norms determine whether enough positions changed meaningfully to justify re-querying beliefs. When fewer positions have significant deltas than the learned retrieval threshold, the re-query is skipped entirely.
+
+```
+Loop 0: full computation (establishes the "prediction")
+Loop 1+: delta = blocks(x) - x_pre
+          dt = (1 - contraction_rate)^loop_i          ← learned MetaParam
+          gate = router(delta, loop_fraction)          ← per-position [B, S, 1]
+          x = x_pre + dt * gate * delta                ← gated update
+          if active_frac < retrieval_threshold:         ← learned MetaParam
+              skip belief re-query (error-gated)
+```
+
+**Ponder loss**: the mean gate value across loops is penalized by a learned ponder cost (MetaParam, softplus). This encourages the router to halt positions early when possible, discovering the optimal compute/quality tradeoff rather than using a hardcoded budget.
+
+**Interaction with existing mechanisms**:
+- The HaltingHead decides *when to stop the loop entirely* (global). The router decides *which positions update within each loop* (per-position). They're complementary.
+- The lifeline anchor applies *before* the router gate, so token positions are still anchored even when the router partially suppresses their delta.
+- Working memory positions are routed like any other position — the router learns to keep WM open when it's actively being written and close it when stable.
+
+**MetaParams** (all learned, no hardcoded thresholds):
+
+| Parameter | Activation | Init | Controls |
+|-----------|-----------|------|----------|
+| `refinement_contraction_rate` | sigmoid | 0.2 | SCORE step-size decay per loop |
+| `refinement_retrieval_threshold` | sigmoid | 0.1 | Min delta fraction for belief re-query |
+| `refinement_ponder_cost` | softplus | 0.5 | Regularization penalty for continuing |
+
+**References**:
+- MoR: Mixture-of-Recursions (NeurIPS 2025, arXiv:2507.10524) — per-token adaptive recursion depth
+- SCORE: Contractive Recurrent Depth (arXiv:2603.10544) — ODE-inspired step-size control
+- PonderNet (arXiv:2107.05407) — learned halting with geometric prior
+- Two-Scale Latent Dynamics (NeurIPS 2025, arXiv:2509.23314) — geometric evidence for contractive refinement
+- DeltaLLM (arXiv:2507.19608) — temporal sparsity via delta thresholding
 
 ## Five Memory Systems
 

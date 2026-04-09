@@ -334,6 +334,18 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
+    # 19. Refinement router (MoR-style per-position adaptive refinement)
+    if hasattr(model, 'refinement_router'):
+        router_params = [p for p in model.refinement_router.parameters() if p.requires_grad]
+        if router_params:
+            param_groups.append({
+                'params': router_params,
+                'lr': tc.interface_lr,  # same LR as interface layers
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 

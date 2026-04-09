@@ -244,6 +244,63 @@ class RefinementProbe(nn.Module):
         return self.net(torch.cat([h_pooled, pos], dim=-1))
 
 
+class RefinementRouter(nn.Module):
+    """Per-position continue/halt decision for adaptive refinement loops.
+
+    Determines which positions need further refinement based on the prediction
+    error (delta between loop iterations). Positions with small, unimportant
+    deltas are gated toward zero — later loops focus compute where it matters.
+
+    Three complementary mechanisms:
+    1. SCORE-style contractive scaling: dt = (1-rate)^l shrinks later loops
+    2. Per-position routing: lightweight net on the delta → gate ∈ (0, 1)
+    3. Error-gated retrieval: skip belief re-query for low-delta positions
+
+    All thresholds are learned MetaParams — no hardcoded magic numbers.
+
+    Reference: MoR (NeurIPS 2025, arXiv:2507.10524) — per-token adaptive recursion
+    Reference: SCORE (arXiv:2603.10544) — contractive recurrent depth
+    Reference: PonderNet (arXiv:2107.05407) — learned halting
+    Reference: Two-Scale Latent Dynamics (NeurIPS 2025, arXiv:2509.23314) —
+               later iterations produce smaller, increasingly orthogonal updates
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        # Lightweight projection: delta vector + loop fraction → scalar gate.
+        # Bottleneck at hidden_dim//8 keeps this cheap (~2% of a block's FLOPs).
+        # The router sees the CONTENT of the delta (not just magnitude), so it
+        # can learn which kinds of changes matter (e.g., belief-retrieval-induced
+        # vs noise-induced changes).
+        bottleneck = max(32, hidden_dim // 8)
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim + 1, bottleneck),
+            nn.GELU(),
+            nn.Linear(bottleneck, 1),
+        )
+        # Init: first layer uses default Kaiming init (so the network can
+        # differentiate inputs from step 1). Output layer zero-init with bias=1.0
+        # so the gate starts at sigmoid(1) ≈ 0.73 (mostly open) regardless of input.
+        # Gradients from the ponder loss propagate through the non-zero first layer
+        # weights, breaking the symmetry and teaching the router which deltas matter.
+        nn.init.zeros_(self.net[2].weight)
+        nn.init.constant_(self.net[2].bias, 1.0)  # sigmoid(1) ≈ 0.73 — starts mostly open
+
+    def forward(self, delta: Tensor, loop_fraction: float) -> Tensor:
+        """Compute per-position continue gate from the loop delta.
+
+        Args:
+            delta: [B, T(+M), D] hidden state change from this loop iteration
+            loop_fraction: current_loop / max_loops ∈ [0, 1]
+
+        Returns:
+            [B, T(+M), 1] gate ∈ (0, 1), higher = keep refining this position
+        """
+        B, S, D = delta.shape
+        frac = delta.new_full((B, S, 1), loop_fraction)
+        return torch.sigmoid(self.net(torch.cat([delta, frac], dim=-1)))
+
+
 class MemoriaModel(nn.Module):
     """Full Memoria architecture: language backbone + cognitive state.
 
@@ -329,6 +386,7 @@ class MemoriaModel(nn.Module):
         # beliefs before generating output.
         # Reference: phase14_inner_loop_bypass_trainer.py — dark loops
         self.max_refinement_loops = getattr(config.transformer, 'max_refinement_loops', 3)
+        self.predictive_refinement = getattr(config.transformer, 'predictive_refinement', True)
         if self.max_refinement_loops > 0:
             # Refinement probe: decides when to stop iterating (Mamba's HaltingHead)
             self.refinement_probe = RefinementProbe(config.transformer.n_embd)
@@ -337,6 +395,9 @@ class MemoriaModel(nn.Module):
             self.refinement_gate = nn.Parameter(
                 torch.full((config.transformer.n_embd,), config.transformer.refinement_gate_init)
             )
+            # Per-position adaptive routing (MoR + SCORE + error-gated retrieval)
+            if self.predictive_refinement:
+                self.refinement_router = RefinementRouter(config.transformer.n_embd)
 
         # Kendall/Gal uncertainty weighting (CVPR 2018, arXiv:1705.07115)
         # Learns optimal per-loss-group weighting automatically.
@@ -546,7 +607,10 @@ class MemoriaModel(nn.Module):
         # Reference: Mamba dark loops (phase14_inner_loop_bypass_trainer.py)
         # Reference: RecursiveMamba2_PrefixScratchpad._lifeline_inject_prompt_only
         halt_probs = []
+        ponder_costs = []  # per-loop mean gate values for ponder regularization
         n_refinement_loops = 0
+        mean_gate_value = 1.0  # tracking for diagnostics
+        retrieval_skips = 0  # count of error-gated retrieval skips
         if self.max_refinement_loops > 0:
             # Re-run the last interface_every blocks (the final "cycle").
             # For 12 layers, interface_every=4: re-run blocks [8, 9, 10, 11].
@@ -560,6 +624,12 @@ class MemoriaModel(nn.Module):
                 x_token_anchor = x[:, :T, :].detach()
             else:
                 x_token_anchor = x.detach()
+
+            # Predictive refinement state: SCORE contraction rate + router
+            use_pred_refine = self.predictive_refinement and self.max_refinement_loops > 1
+            if use_pred_refine:
+                contraction_rate = self.state.meta_params.refinement_contraction_rate
+                retrieval_threshold = self.state.meta_params.refinement_retrieval_threshold
 
             # Training: teacher forcing with random oracle loop count.
             # Without this, the probe only ever sees "halt at max" targets and
@@ -576,6 +646,9 @@ class MemoriaModel(nn.Module):
 
             for loop_i in range(loop_limit):
                 n_refinement_loops += 1
+
+                # Save pre-loop state for delta computation (predictive refinement)
+                x_pre_loop = x if not use_pred_refine else x.clone()
 
                 # Step 1: Loop-index encoding — additive signal so the model
                 # knows which iteration it's on. Separate parameter from lifeline
@@ -602,18 +675,74 @@ class MemoriaModel(nn.Module):
                 else:
                     x = x + lifeline * x_token_anchor
 
+                # ── Predictive refinement: contractive scaling + per-position routing ──
+                # After the block computation + lifeline, compute the delta from the
+                # pre-loop state and gate it. Loop 0 runs at full strength (no gating).
+                # Later loops: SCORE-style contraction shrinks the global step size,
+                # and the MoR-style router further gates per-position.
+                #
+                # This replaces nothing — it modulates. The blocks, lifeline, TTT, and
+                # halt probe all function identically. The router just controls how much
+                # of each loop's delta survives into the next iteration.
+                if use_pred_refine and loop_i > 0:
+                    delta = x - x_pre_loop  # [B, S, D] — what this loop changed
+
+                    # SCORE-style contractive scaling: dt = (1 - rate)^l
+                    # Later loops contribute geometrically smaller corrections.
+                    # Two-Scale Latent Dynamics (arXiv:2509.23314) empirically confirms
+                    # this: later iterations produce smaller, orthogonal updates.
+                    dt = (1.0 - contraction_rate) ** loop_i  # scalar, differentiable
+
+                    # MoR-style per-position routing: the router sees the delta content
+                    # (not just magnitude) so it can learn which changes matter.
+                    position_gate = self.refinement_router(delta, loop_fraction)  # [B, S, 1]
+
+                    # Apply: x = x_pre + dt * gate * delta
+                    x = x_pre_loop + dt * position_gate * delta
+
+                    # Track for ponder loss + diagnostics
+                    ponder_costs.append(position_gate.mean())
+                    mean_gate_value = position_gate.mean().item()
+
+                    # Compute per-position delta norms for error-gated retrieval
+                    # Normalized by hidden dim so threshold is scale-invariant
+                    delta_norms = (dt * position_gate * delta).norm(dim=-1)  # [B, S]
+                    hidden_scale = x.norm(dim=-1).mean().detach().clamp(min=1e-6)
+                    relative_delta = delta_norms / hidden_scale  # fraction of hidden norm
+                else:
+                    relative_delta = None
+
                 # Step 4: Retrieve-reason-retrieve
+                # With predictive refinement: skip re-query for positions where the
+                # representation barely changed (error-gated retrieval). The threshold
+                # is a learned MetaParam, not hardcoded.
+                # Reference: DeltaLLM (arXiv:2507.19608) — temporal sparsity via delta
                 if last_interface is not None and loop_i < loop_limit - 1:
-                    if M > 0:
-                        x_tokens = x[:, :T, :]
-                        x_tokens, ref_cands, _, ref_reads, _, _, _ = \
-                            last_interface(x_tokens, self.state, belief_cache=belief_cache)
-                        x = torch.cat([x_tokens, x[:, T:, :]], dim=1)
-                    else:
-                        x, ref_cands, _, ref_reads, _, _, _ = \
-                            last_interface(x, self.state, belief_cache=belief_cache)
-                    all_candidates.extend(ref_cands)
-                    all_read_indices.extend(ref_reads)
+                    # Error-gated retrieval: check if enough positions changed to
+                    # justify the cost of belief re-query
+                    should_requery = True
+                    if use_pred_refine and relative_delta is not None:
+                        # Fraction of positions with meaningful delta
+                        active_frac = (relative_delta > retrieval_threshold).float().mean()
+                        # Skip if fewer than 10% of positions changed meaningfully
+                        # (the 10% is derived from retrieval_threshold, not hardcoded —
+                        # when threshold is high, fewer positions pass, so skip happens
+                        # more often. The system learns the right balance.)
+                        should_requery = active_frac.item() > retrieval_threshold.item()
+                        if not should_requery:
+                            retrieval_skips += 1
+
+                    if should_requery:
+                        if M > 0:
+                            x_tokens = x[:, :T, :]
+                            x_tokens, ref_cands, _, ref_reads, _, _, _ = \
+                                last_interface(x_tokens, self.state, belief_cache=belief_cache)
+                            x = torch.cat([x_tokens, x[:, T:, :]], dim=1)
+                        else:
+                            x, ref_cands, _, ref_reads, _, _, _ = \
+                                last_interface(x, self.state, belief_cache=belief_cache)
+                        all_candidates.extend(ref_cands)
+                        all_read_indices.extend(ref_reads)
 
                 # Step 5: TTT gradient step during refinement (training only)
                 if targets is not None and self.ttt.should_update(0.0):
@@ -809,6 +938,20 @@ class MemoriaModel(nn.Module):
             result['loss_halt'] = loss_halt
             result['refinement_loops'] = n_refinement_loops
 
+            # Ponder loss: per-position penalty for continuing refinement.
+            # Encourages the router to gate positions toward zero (halt early)
+            # when their representation has converged. The ponder cost is a learned
+            # MetaParam — the system discovers the right compute/quality tradeoff.
+            # Reference: PonderNet (arXiv:2107.05407) — regularized halting
+            loss_ponder = torch.tensor(0.0, device=idx.device)
+            if ponder_costs:
+                ponder_weight = self.state.meta_params.refinement_ponder_cost
+                # Mean gate value across loops — higher = more positions kept refining
+                loss_ponder = ponder_weight * torch.stack(ponder_costs).mean()
+            result['loss_ponder'] = loss_ponder
+            result['refinement_mean_gate'] = mean_gate_value
+            result['refinement_retrieval_skips'] = retrieval_skips
+
             w_util = self.config.training.utility_loss_weight
             w_surp = self.config.training.surprise_loss_weight
             w_halt = self.config.training.halt_loss_weight
@@ -896,6 +1039,7 @@ class MemoriaModel(nn.Module):
                 w_util * loss_utility
                 + w_surp * result['loss_surprise']
                 + w_halt * loss_halt
+                + loss_ponder
                 + 0.01 * jac_loss
                 + w_draft * loss_draft
             )

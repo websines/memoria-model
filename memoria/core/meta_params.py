@@ -280,6 +280,23 @@ class MetaParams(nn.Module):
         # sigmoid(0.0) = 0.5 → moderate threshold for flagging contradictions
         self._replay_contradiction_threshold = nn.Parameter(torch.tensor(0.0))
 
+        # ── F1: Predictive Refinement (MoR + SCORE) ──
+        # Contraction rate: SCORE-style step-size decay per loop iteration.
+        # dt(l) = (1 - contraction_rate)^l → later loops contribute smaller deltas.
+        # sigmoid(-1.386) ≈ 0.2 → dt decays as 0.8^l (loop 0: 1.0, loop 1: 0.8, loop 2: 0.64)
+        # Reference: SCORE (arXiv:2603.10544) — contractive recurrent depth
+        self._refinement_contraction_rate = nn.Parameter(torch.tensor(-1.386294))
+        # Retrieval delta threshold: minimum per-position delta L2-norm to trigger
+        # belief re-query in the retrieve-reason-retrieve step.
+        # sigmoid(-2.197) ≈ 0.1 → skip re-query when delta < 10% of mean hidden norm
+        # Reference: DeltaLLM (arXiv:2507.19608) — temporal sparsity via delta threshold
+        self._refinement_retrieval_threshold = nn.Parameter(torch.tensor(-2.197225))
+        # Ponder cost: per-position penalty for continuing refinement. Scales the
+        # ponder regularization loss that encourages the router to halt early.
+        # softplus(-0.693) ≈ 0.5 → moderate penalty, allows continued refinement when needed
+        # Reference: PonderNet (arXiv:2107.05407) — learned halting with geometric prior
+        self._refinement_ponder_cost = nn.Parameter(torch.tensor(-0.693147))
+
     # ---------------------------------------------------------------------- #
     # Properties — apply activation to yield constrained values               #
     # ---------------------------------------------------------------------- #
@@ -635,3 +652,20 @@ class MetaParams(nn.Module):
     def replay_contradiction_threshold(self) -> torch.Tensor:
         """Message disagreement threshold for cross-temporal contradiction. Range: (0, 1)."""
         return torch.sigmoid(self._replay_contradiction_threshold)
+
+    # ── F1: Predictive Refinement ──
+
+    @property
+    def refinement_contraction_rate(self) -> torch.Tensor:
+        """SCORE-style step-size decay per loop. dt(l) = (1-rate)^l. Range: (0, 1)."""
+        return torch.sigmoid(self._refinement_contraction_rate)
+
+    @property
+    def refinement_retrieval_threshold(self) -> torch.Tensor:
+        """Min delta L2-norm fraction to trigger belief re-query. Range: (0, 1)."""
+        return torch.sigmoid(self._refinement_retrieval_threshold)
+
+    @property
+    def refinement_ponder_cost(self) -> torch.Tensor:
+        """Per-position penalty for continuing refinement. Range: (0, inf)."""
+        return F.softplus(self._refinement_ponder_cost)

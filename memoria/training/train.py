@@ -533,6 +533,10 @@ def train(
                 'dflash/loss_draft': result.get('loss_draft', torch.tensor(0.0)).item(),
                 'cage_lambda': cage_lam if config.transformer.weight_qat_bits > 0 else 0.0,
                 'dsa/kl_loss': result.get('loss_dsa_kl', torch.tensor(0.0)).item(),
+                'refinement/loss_ponder': result.get('loss_ponder', torch.tensor(0.0)).item(),
+                'refinement/mean_gate': result.get('refinement_mean_gate', 1.0),
+                'refinement/retrieval_skips': result.get('refinement_retrieval_skips', 0),
+                'refinement/loops': result.get('refinement_loops', 0),
             }
             # Per-operation pass2 diagnostics — essential for isolating which
             # of the 12 structural operations is misbehaving during training.
