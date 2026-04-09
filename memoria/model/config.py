@@ -137,9 +137,19 @@ class TransformerConfig:
     weight_qat_mlp_bits: int = 3       # MLP weights get more aggressive quantization (0 = use weight_qat_bits)
 
     # DFlash block diffusion draft head (speculative decoding)
+    # Three improvements over baseline block diffusion:
+    # 1. KV injection: per-layer K/V projections for tapped features (not concat)
+    # 2. Streak distillation: position-weighted CE + expected streak bonus
+    # 3. Adaptive block size: entropy-based cutoff, draft max but verify fewer
+    # All thresholds are learned MetaParams — no hardcoded magic numbers.
+    # Reference: DFlash (arXiv:2602.06036) — KV injection, block diffusion
+    # Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
+    # Reference: FailFast (arXiv:2512.20573) — adaptive block size
+    # Reference: DEER (arXiv:2512.15176) — single-step diffusion drafting
     dflash_enabled: bool = False       # enable DFlash draft head
     dflash_n_layers: int = 3           # draft head layers (small — this is the "fast" path)
-    dflash_block_size: int = 8         # tokens to draft per speculation step
+    dflash_block_size: int = 8         # training window (tokens per training sample)
+    dflash_max_block_size: int = 32    # inference max (adaptive cutoff reduces to block_size in hard regions)
     dflash_loss_weight: float = 0.1    # weight for draft training loss
 
 

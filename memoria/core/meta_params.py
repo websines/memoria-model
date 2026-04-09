@@ -295,6 +295,23 @@ class MetaParams(nn.Module):
         # Reference: D3PO (arXiv:2602.07764) — diversity regularization
         self._parl_goal_diversity_threshold = nn.Parameter(torch.tensor(-0.847298))
 
+        # ── F3: DFlash — Streak Distillation + Adaptive Block Size ──
+        # Streak decay: per-position weight decay λ in streak distillation.
+        # Position i gets weight λ^i — earlier positions weighted higher.
+        # sigmoid(1.735) ≈ 0.85 → position 7 weight = 0.85^7 ≈ 0.32
+        # Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
+        self._dflash_streak_decay = nn.Parameter(torch.tensor(1.735085))
+        # Streak weight: scales the expected streak length bonus in draft loss.
+        # softplus(-2.302) ≈ 0.1 → mild initial streak bonus
+        # Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
+        self._dflash_streak_weight = nn.Parameter(torch.tensor(-2.302585))
+        # Entropy threshold: per-position draft logit entropy cutoff (in nats).
+        # Positions above this threshold are considered uncertain → skip verification.
+        # softplus(1.694) ≈ 2.0 nats (confident predictions ≈ 0.5-1.5 nats,
+        # uniform over 151936 vocab ≈ 11.9 nats)
+        # Reference: FailFast (arXiv:2512.20573) — adaptive speculation length
+        self._dflash_entropy_threshold = nn.Parameter(torch.tensor(1.694596))
+
         # ── F1: Predictive Refinement (MoR + SCORE) ──
         # Contraction rate: SCORE-style step-size decay per loop iteration.
         # dt(l) = (1 - contraction_rate)^l → later loops contribute smaller deltas.
@@ -684,6 +701,37 @@ class MetaParams(nn.Module):
     def parl_goal_diversity_threshold(self) -> torch.Tensor:
         """Min normalized entropy for diverse goal pursuit. Range: (0, 1)."""
         return torch.sigmoid(self._parl_goal_diversity_threshold)
+
+    # ── F3: DFlash — Streak Distillation + Adaptive Block Size ──
+
+    @property
+    def dflash_streak_decay(self) -> torch.Tensor:
+        """Per-position weight decay λ for streak distillation. Range: (0, 1).
+
+        Position i gets weight λ^i. Values near 1.0 = uniform weighting,
+        near 0.5 = strong early emphasis. Speculative decoding stops at
+        first mismatch, so early accuracy dominates acceptance rate.
+        """
+        return torch.sigmoid(self._dflash_streak_decay)
+
+    @property
+    def dflash_streak_weight(self) -> torch.Tensor:
+        """Weight on expected streak length bonus in draft loss. Range: (0, inf).
+
+        Scales the negative expected streak term that directly optimizes
+        P(consecutive correct predictions). Complementary to position-weighted CE.
+        """
+        return F.softplus(self._dflash_streak_weight)
+
+    @property
+    def dflash_entropy_threshold(self) -> torch.Tensor:
+        """Per-position entropy cutoff for adaptive block sizing. Range: (0, inf).
+
+        Draft positions with entropy above this (in nats) are considered uncertain.
+        Verification is truncated before the first uncertain position.
+        Confident predictions ≈ 0.5-1.5 nats; uniform ≈ 11.9 nats.
+        """
+        return F.softplus(self._dflash_entropy_threshold)
 
     # ── F1: Predictive Refinement ──
 

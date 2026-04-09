@@ -323,6 +323,9 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             })
 
     # 18. DFlash draft head (block diffusion speculative decoding)
+    # Includes: draft layers, mask_embed, pos_embed, feature_proj, out_norm,
+    # and per-layer KV injection projections (k_inject, v_inject).
+    # KV injection projections are RotorQuant 3-bit eligible (marked with _qat_bits).
     if hasattr(model, 'dflash_enabled') and model.dflash_enabled:
         dflash_params = [p for p in model.dflash_head.parameters() if p.requires_grad]
         if dflash_params:

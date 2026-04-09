@@ -446,6 +446,27 @@ def apply_weight_qat(model: nn.Module, bits: int = 4, mlp_bits: int = 0) -> list
             path = f"blocks.{block_idx}.{name}"
             patched.append(f"{path} ({target_bits}-bit)")
 
+    # ── DFlash KV injection: quantize modules annotated with _qat_bits ──
+    # KV injection projections are marked with _qat_bits = 3 for aggressive
+    # quantization. Draft accuracy is less critical since the verifier filters.
+    dflash_head = getattr(model, 'dflash_head', None)
+    if dflash_head is not None:
+        dflash_targets = []
+        for name, module in dflash_head.named_modules():
+            if isinstance(module, nn.Linear) and hasattr(module, '_qat_bits'):
+                target_bits = module._qat_bits
+                dflash_targets.append((name, module, target_bits))
+
+        dflash_modules = dict(dflash_head.named_modules())
+        for name, module, target_bits in dflash_targets:
+            parts = name.rsplit('.', 1)
+            parent_name = parts[0] if len(parts) == 2 else ''
+            child_name = parts[-1]
+            parent = dflash_modules[parent_name] if parent_name else dflash_head
+            wrapped = WeightQuantLinear(module, bits=target_bits)
+            setattr(parent, child_name, wrapped)
+            patched.append(f"dflash_head.{name} ({target_bits}-bit)")
+
     return patched
 
 

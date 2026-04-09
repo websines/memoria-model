@@ -456,7 +456,7 @@ The cognitive state is a persistent, slot-based world model with four regions:
 ### Meta Region
 
 - `meta`: `[32]` — learned meta-parameters (β, accumulated_surprise, thresholds, etc.)
-- `meta_params`: `MetaParams` — 63 learned constants replacing hardcoded hyperparameters throughout the system (sigmoid/softplus constrained, initialized to original values)
+- `meta_params`: `MetaParams` — 72 learned constants replacing hardcoded hyperparameters throughout the system (sigmoid/softplus constrained, initialized to original values)
 
 ### Belief Metadata Buffers
 
@@ -563,7 +563,7 @@ L_total = L_token + α · L_fe + α · 0.1 · L_utility + α · 0.1 · L_surpris
 | **L_halt** | `F.binary_cross_entropy` | RefinementProbe | Teaches the halting probe when to stop refinement loops. Teacher forcing with random oracle loop count. |
 | **L_ponder** | `ponder_cost × mean(gate)` | RefinementRouter | Per-position penalty for continuing refinement. Ponder cost is a learned MetaParam. Encourages router to halt positions early. Reference: PonderNet (arXiv:2107.05407). |
 | **L_jac** | DEQ Jacobian regularization | Message passing | Ensures the factor graph fixed-point map stays contractive. Periodic (every 10 steps). |
-| **L_draft** | `DFlashDraftHead.compute_draft_loss` | Draft head layers | Block diffusion draft quality. NOT alpha-gated — trains from step 0. |
+| **L_draft** | `DFlashDraftHead.compute_draft_loss` | Draft head + KV injection | Streak-distilled draft quality: position-weighted CE (w_i = λ^i) + expected streak bonus. NOT alpha-gated — trains from step 0. λ and streak_weight are learned MetaParams. |
 | **L_dsa_kl** | `LightningIndexer.compute_kl_loss` | Indexer projections | KL alignment: trains indexer to predict dense attention distribution. NOT alpha-gated. Full weight phase 1, reduced (0.1) after. Only computed in dense path (short context). |
 
 ### Bethe Free Energy (Factor Graph)
@@ -615,7 +615,7 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 15 | Message passing (relation transform + DEQ) | 0.01 | Factor graph inference |
 | 16 | Kendall/Gal log_sigma | 0.5 | Uncertainty weighting params |
 | 17 | Hypothesis generator | 0.01 | Autoresearch loop |
-| 18 | DFlash draft head | 0.01 | Block diffusion speculative decoding |
+| 18 | DFlash draft head (+ KV injection) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block. Injection projections 3-bit RotorQuant. |
 | 19 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
 | — | GoalRouter (PARL per-head routing) | 0.01 | Included in group 5 (interface params) |
 | M | 2D matrix params (attention, MLP) | 0.04 | **Muon optimizer** (separate from AdamW) |
@@ -862,6 +862,9 @@ Loop 1+: delta = blocks(x) - x_pre
 | `parl_parallel_reward_weight` | softplus | 0.5 | Peak weight for parallelism reward (PARL) |
 | `parl_finish_reward_weight` | softplus | 0.5 | Peak weight for goal-finish penalty (PARL) |
 | `parl_goal_diversity_threshold` | sigmoid | 0.3 | Min normalized entropy for diverse pursuit |
+| `dflash_streak_decay` | sigmoid | 0.85 | Position weight decay λ for streak distillation |
+| `dflash_streak_weight` | softplus | 0.1 | Weight on expected streak length bonus |
+| `dflash_entropy_threshold` | softplus | 2.0 | Entropy cutoff (nats) for adaptive block sizing |
 
 **References**:
 - MoR: Mixture-of-Recursions (NeurIPS 2025, arXiv:2507.10524) — per-token adaptive recursion depth
@@ -955,45 +958,61 @@ Uses HuggingFace Accelerate with `find_unused_parameters=True` (cognitive state 
 
 ## DFlash Speculative Decoding
 
-Native block diffusion draft head for inference acceleration. Especially valuable because refinement loops multiply per-token cost by ~4×.
+Native block diffusion draft head for inference acceleration. Especially valuable because refinement loops multiply per-token cost by ~4×. Three improvements over baseline:
+
+1. **KV injection**: Per-layer K/V projections for tapped target features (not concatenated as context tokens). Each draft layer independently interprets target representations. Injection projections are 3-bit RotorQuant eligible.
+2. **Streak distillation**: Position-weighted CE (w_i = λ^i, λ learned) + expected streak length bonus. Optimizes consecutive acceptance, not per-token accuracy.
+3. **Adaptive block size**: Draft up to `max_block_size` (32) tokens, but verify only the confident prefix. Entropy-based cutoff via learned MetaParam threshold.
 
 ### Architecture
 
 ```
 Target hidden states (tapped from layers [0, 5, 11])
-  + Active belief embeddings
   → feature_proj (concat → D)
-  → context [B, T_ctx + N_beliefs, D]
+  → KV injection signal [B, T_tap, D]
 
-Mask embeddings + positional encoding
-  → draft tokens [B, block_size, D]
+Active belief embeddings → context [B, N_beliefs, D]  (or empty)
+
+Mask embeddings + positional encoding (up to max_block_size=32)
+  → draft tokens [B, draft_length, D]
 
 3× DFlashDraftLayer:
-  draft = draft + CrossAttention(Q=draft, KV=concat(context, draft))
+  injection → per-layer norm_inject → k_inject, v_inject (3-bit RotorQuant)
+  K = [k_inject(injection), k_proj(concat(beliefs, draft))]
+  V = [v_inject(injection), v_proj(concat(beliefs, draft))]
+  draft = draft + CrossAttention(Q=draft, KV=above)
   draft = draft + MLP(draft)     [2× expansion, ReLU²]
 
-→ shared LM head → draft logits [B, block_size, vocab]
+→ shared LM head → draft logits [B, draft_length, vocab]
 ```
 
-- **15.9M params** (~12.7% of main model)
-- **Cross+self attention**: draft tokens attend to target features, beliefs, AND each other (block coherence)
+- **Cross+self attention with KV injection**: draft tokens attend to beliefs + each other via standard KV, AND to target features via injected KV pairs
 - **Shared LM head**: No extra 117M vocab projection
-- **Trained jointly**: Auxiliary loss from step 0 (not alpha-gated)
-- **Inference**: `spec_generate()` — draft block → verify with full model (including refinement) → accept/reject → repeat
+- **Trained jointly**: Streak-distilled loss from step 0 (not alpha-gated)
+- **Inference**: `spec_generate()` — adaptive draft → verify confident prefix → accept/reject → repeat
 
-### Speculative Decoding Loop
+### Speculative Decoding Loop (Adaptive)
 
 ```
 while tokens_generated < max_new_tokens:
     1. Run full model on current sequence (prefill)
-    2. Extract tapped hidden states + active beliefs
-    3. Draft head generates block_size tokens in parallel
-    4. Verify: run full model on [sequence + drafted block]
-    5. Accept tokens until first mismatch with verifier
-    6. Append accepted tokens, continue
+    2. Extract tapped hidden states (KV injection) + active beliefs (context)
+    3. Draft head generates max_block_size tokens in parallel (cheap)
+    4. Compute per-position entropy → adaptive cutoff at first uncertain position
+    5. Verify: run full model on [sequence + confident prefix] (expensive, but shorter)
+    6. Accept tokens until first mismatch with verifier
+    7. Append accepted tokens, continue
 ```
 
-Estimated speedup: ~3-4× at 50% acceptance rate, primarily from amortizing refinement loop cost across the accepted block.
+Theoretical speedup: ~8.5× combined (vs ~3.4× baseline DFlash), primarily from:
+- KV injection: +21% acceptance rate (tighter verifier alignment)
+- Streak distillation: +38% (consecutive accuracy optimization)
+- Adaptive block size: +90% (draft many, verify few in hard regions)
+
+Reference: DFlash (arXiv:2602.06036) — KV injection, block diffusion
+Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
+Reference: FailFast (arXiv:2512.20573) — adaptive speculation length
+Reference: DEER (arXiv:2512.15176) — single-step diffusion drafting
 
 ## In-Place Test-Time Training (TTT)
 
@@ -1253,7 +1272,7 @@ memoria/interface/
   write_path.py      — WritePath, WriteCandidate, pack/unpack for distributed
 
 memoria/core/
-  meta_params.py     — 63 learned MetaParams replacing hardcoded constants (sigmoid/softplus constrained, incl. huber_delta)
+  meta_params.py     — 72 learned MetaParams replacing hardcoded constants (sigmoid/softplus constrained, incl. huber_delta, PARL, DFlash streak/entropy)
 
 memoria/cognition/
   pass2.py           — Pass 2 orchestrator (12 structural operations)

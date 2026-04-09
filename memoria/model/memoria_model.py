@@ -422,6 +422,7 @@ class MemoriaModel(nn.Module):
                 n_heads=tc.n_head,
                 n_layers=tc.dflash_n_layers,
                 block_size=tc.dflash_block_size,
+                max_block_size=getattr(tc, 'dflash_max_block_size', tc.dflash_block_size),
                 n_target_layers=tc.n_layer,
             )
 
@@ -1001,12 +1002,18 @@ class MemoriaModel(nn.Module):
                         if belief_cache.n_active > 0:
                             active_beliefs = belief_cache.active_beliefs
 
-                        draft_context = self.dflash_head.extract_features(
+                        context, injection = self.dflash_head.extract_features(
                             ctx_hiddens, active_beliefs,
                         )
+                        # Streak distillation: learned MetaParams control
+                        # position weighting and expected streak bonus
+                        streak_decay = self.state.meta_params.dflash_streak_decay
+                        streak_weight = self.state.meta_params.dflash_streak_weight
                         loss_draft = self.dflash_head.compute_draft_loss(
-                            draft_context, draft_targets,
+                            context, injection, draft_targets,
                             lm_head_fn=self.transformer.head,
+                            streak_decay=streak_decay,
+                            streak_weight=streak_weight,
                         )
             result['loss_draft'] = loss_draft
 
@@ -1091,14 +1098,13 @@ class MemoriaModel(nn.Module):
         temperature: float = 0.0,
         stop_token_ids: list[int] | None = None,
     ) -> Tensor:
-        """Generate tokens using DFlash speculative decoding.
+        """Generate tokens using DFlash speculative decoding with adaptive block size.
 
-        Draft-verify loop:
-        1. Run full model on current sequence → collect tapped hidden states
-        2. Draft head generates block_size candidate tokens in parallel
-        3. Full model verifies candidates in one pass (with refinement loops)
-        4. Accept tokens until first mismatch with verifier
-        5. Repeat until max_new_tokens or stop token
+        Draft-verify loop with three improvements:
+        1. KV injection: target features injected into draft layer K/V projections
+        2. Adaptive block size: draft max_block_size tokens, verify only the
+           confident prefix (entropy-based cutoff via learned MetaParam threshold)
+        3. Streak distillation (training only): position-weighted CE + streak bonus
 
         Falls back to standard autoregressive if DFlash is not enabled.
 
@@ -1123,7 +1129,8 @@ class MemoriaModel(nn.Module):
                 generated, max_new_tokens, temperature, stop_set,
             )
 
-        block_size = self.dflash_head.block_size
+        max_block = self.dflash_head.max_block_size
+        entropy_threshold = self.state.meta_params.dflash_entropy_threshold.item()
         tokens_generated = 0
 
         while tokens_generated < max_new_tokens:
@@ -1139,10 +1146,7 @@ class MemoriaModel(nn.Module):
                 generated = torch.cat([generated, next_token.unsqueeze(0)], dim=1)
                 break
 
-            # ── Step 2: Extract features for draft head ──
-            # Re-run to collect tapped hidden states (forward already computed them
-            # but we need to access dflash_tapped which is local to forward).
-            # More efficient: run forward_blocks and tap directly.
+            # ── Step 2: Extract features for draft head (KV injection) ──
             tap_hiddens = self._collect_tap_hiddens(generated)
 
             # Context: last 64 positions of tapped features
@@ -1153,14 +1157,35 @@ class MemoriaModel(nn.Module):
             active_mask = self.state.get_active_mask()
             active_beliefs = self.state.beliefs.data[active_mask] if active_mask.any() else None
 
-            draft_context = self.dflash_head.extract_features(ctx_hiddens, active_beliefs)
+            context, injection = self.dflash_head.extract_features(
+                ctx_hiddens, active_beliefs,
+            )
 
-            # ── Step 3: Draft block_size tokens in parallel ──
-            draft_logits = self.dflash_head(draft_context, lm_head_fn=self.transformer.head)
-            draft_tokens = self._sample_token(draft_logits.squeeze(0), temperature)  # [block_size]
+            # ── Step 3: Draft max_block tokens in parallel (cheap) ──
+            remaining = max_new_tokens - tokens_generated - 1  # -1 for guaranteed token
+            draft_length = min(max_block, max(remaining, 1))
+            draft_logits = self.dflash_head(
+                context, lm_head_fn=self.transformer.head,
+                injection=injection, draft_length=draft_length,
+            )  # [1, draft_length, vocab]
+
+            # ── Step 3b: Adaptive block size — entropy-based cutoff ──
+            # Only verify the confident prefix to save verification cost
+            entropy = self.dflash_head.compute_entropy(draft_logits)  # [1, draft_length]
+            above_threshold = (entropy.squeeze(0) > entropy_threshold)
+            if above_threshold.any():
+                # First uncertain position → verify up to (but not including) it
+                adaptive_size = above_threshold.nonzero(as_tuple=True)[0][0].item()
+                adaptive_size = max(adaptive_size, 1)  # always draft at least 1
+            else:
+                adaptive_size = draft_length
+
+            draft_tokens = self._sample_token(
+                draft_logits[:, :adaptive_size].squeeze(0), temperature,
+            )  # [adaptive_size]
 
             # Build candidate sequence: guaranteed token + drafted tokens
-            candidate_tokens = torch.cat([next_token, draft_tokens], dim=0)  # [1 + block_size]
+            candidate_tokens = torch.cat([next_token, draft_tokens], dim=0)
             candidate_seq = torch.cat([
                 generated,
                 candidate_tokens.unsqueeze(0),
@@ -1168,15 +1193,12 @@ class MemoriaModel(nn.Module):
 
             # ── Step 4: Verify with full model (includes refinement loops) ──
             verify_result = self.forward(candidate_seq)
-            verify_logits = verify_result['logits']  # [1, T + 1 + block_size, vocab]
+            verify_logits = verify_result['logits']
 
-            # Compare verifier's predictions with draft tokens.
-            # verify_logits[:, T-1, :] should predict next_token (already guaranteed).
-            # verify_logits[:, T, :] should predict draft_tokens[0], etc.
             T_orig = generated.shape[1]
             n_accepted = 1  # the guaranteed next_token is always accepted
 
-            for j in range(block_size):
+            for j in range(adaptive_size):
                 verify_token = self._sample_token(
                     verify_logits[:, T_orig + j, :], temperature,
                 )
