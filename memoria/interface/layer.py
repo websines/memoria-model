@@ -40,6 +40,7 @@ class StateInterfaceLayer(nn.Module):
         layer_idx: int = 0,
         n_interfaces: int = 1,
         read_gate_init_bias: float = 2.0,
+        parallel_goals: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -51,6 +52,7 @@ class StateInterfaceLayer(nn.Module):
             num_heads=num_heads,
             top_k=top_k,
             read_gate_init_bias=read_gate_init_bias,
+            parallel_goals=parallel_goals,
         )
         self.write_path = WritePath(
             hidden_dim=hidden_dim,

@@ -111,6 +111,7 @@ def run_pass2(
     total_steps: int = 1,
     belief_advantage: float = 0.0,
     current_fe: float = 0.0,
+    training_progress: float = 0.0,
 ) -> dict:
     """Structural cleanup pass after gradient-based updates.
 
@@ -135,7 +136,9 @@ def run_pass2(
 
     # ── 0. Controller actions (learned structural decisions) ──
     actions = state.controller.get_actions(state)
-    dense_reward = state.controller.compute_dense_reward(state, belief_advantage)
+    dense_reward = state.controller.compute_dense_reward(
+        state, belief_advantage, training_progress=training_progress,
+    )
     state.controller.record_reward(dense_reward)
     stats['controller_actions'] = actions
 

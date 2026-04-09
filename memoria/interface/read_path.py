@@ -87,6 +87,103 @@ class BeliefCache:
         return BeliefCache(indices=indices, beliefs=beliefs, angles=angles, radii=radii)
 
 
+class GoalRouter(nn.Module):
+    """Per-head goal assignment for PARL-style parallel goal pursuit.
+
+    Computes a soft assignment matrix [H, G] that routes each read head
+    to a different active goal. Uses Gumbel-Softmax for differentiable
+    discrete routing during training, hard argmax during inference.
+
+    When fewer goals than heads: extra heads get uniform (shared) routing.
+    When more goals than heads: goals compete for head assignments.
+
+    Reference: MoH (arXiv:2410.11842) — mixture-of-head attention routing
+    Reference: MOORE (arXiv:2311.11385) — orthogonal expert specialization
+    """
+
+    def __init__(self, belief_dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        # Projects per-goal features → per-head assignment logits
+        # Input: goal angle (D) + priority (1)
+        # Output: [H] logits per goal (how much this goal wants each head)
+        bottleneck = max(32, belief_dim // 4)
+        self.goal_to_head = nn.Sequential(
+            nn.Linear(belief_dim + 1, bottleneck),
+            nn.GELU(),
+            nn.Linear(bottleneck, num_heads),
+        )
+        # Init output near-zero → starts with uniform routing (all heads shared)
+        nn.init.zeros_(self.goal_to_head[-1].weight)
+        nn.init.zeros_(self.goal_to_head[-1].bias)
+
+        # Learned temperature for Gumbel-Softmax routing
+        # softplus(0.0) ≈ 0.693 → moderate temperature
+        self._routing_log_temp = nn.Parameter(torch.tensor(0.0))
+
+    @property
+    def routing_temperature(self) -> torch.Tensor:
+        return F.softplus(self._routing_log_temp).clamp(min=0.1)
+
+    def forward(
+        self,
+        goal_embeddings: Tensor,
+        goal_priorities: Tensor | None,
+        belief_angles: Tensor,
+    ) -> Tensor:
+        """Compute per-head goal-belief attention bias.
+
+        Args:
+            goal_embeddings: [G, D] active goal embeddings
+            goal_priorities: [G] or None
+            belief_angles: [N_active, D] belief unit vectors
+
+        Returns:
+            [num_heads, N_active] per-head attention bias
+        """
+        G = goal_embeddings.shape[0]
+        N_active = belief_angles.shape[0]
+        device = goal_embeddings.device
+
+        if G == 0 or N_active == 0:
+            return torch.zeros(self.num_heads, N_active, device=device)
+
+        # Goal features: angle + priority
+        goal_radii = goal_embeddings.norm(dim=-1).clamp(min=1e-8)
+        goal_angles = goal_embeddings / goal_radii.unsqueeze(-1)
+        priorities = goal_priorities if goal_priorities is not None else torch.ones(G, device=device)
+        goal_features = torch.cat([goal_angles, priorities.unsqueeze(-1)], dim=-1)  # [G, D+1]
+
+        # Per-goal head preference: [G, H]
+        head_logits = self.goal_to_head(goal_features)  # [G, H]
+
+        # Soft assignment: [H, G] — each head's distribution over goals
+        # Transpose so we softmax over goals per head
+        tau = self.routing_temperature
+        if self.training:
+            # Gumbel-Softmax with differentiable temperature
+            # Manual implementation to keep tau in the gradient graph
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(head_logits.T) + 1e-20) + 1e-20)
+            assignment = F.softmax((head_logits.T + gumbel_noise) / tau, dim=-1)  # [H, G]
+        else:
+            # Hard assignment at inference (deterministic)
+            assignment = F.softmax(head_logits.T / tau, dim=-1)  # [H, G]
+
+        # Weight by priority
+        assignment = assignment * priorities.unsqueeze(0)  # [H, G]
+        # Re-normalize per head
+        assignment = assignment / assignment.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+        # Per-goal belief similarity: [G, N_active]
+        goal_belief_sim = goal_angles @ belief_angles.T  # [G, N_active]
+
+        # Per-head bias: weighted combination of goal-belief similarities
+        # [H, G] @ [G, N_active] → [H, N_active]
+        bias = assignment @ goal_belief_sim
+
+        return bias
+
+
 class ReadPath(nn.Module):
     """Content-addressable retrieval from belief region.
 
@@ -96,7 +193,7 @@ class ReadPath(nn.Module):
     """
 
     def __init__(self, hidden_dim: int, belief_dim: int, num_heads: int = 4, top_k: int = 32,
-                 read_gate_init_bias: float = 2.0):
+                 read_gate_init_bias: float = 2.0, parallel_goals: bool = True):
         """
         Args:
             hidden_dim: transformer hidden dimension
@@ -104,12 +201,14 @@ class ReadPath(nn.Module):
             num_heads: number of retrieval heads (parallel queries)
             top_k: max beliefs to attend over (sparse, for efficiency)
             read_gate_init_bias: initial bias for read gate sigmoid (higher = more open)
+            parallel_goals: enable PARL-style per-head goal routing
         """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.belief_dim = belief_dim
         self.num_heads = num_heads
         self.top_k = top_k
+        self.parallel_goals = parallel_goals
 
         # Project hidden state → query in belief space
         self.query_proj = nn.Linear(hidden_dim, belief_dim * num_heads, bias=False)
@@ -117,8 +216,11 @@ class ReadPath(nn.Module):
         # Project retrieved beliefs → hidden space
         self.output_proj = nn.Linear(belief_dim * num_heads, hidden_dim, bias=False)
 
-        # Goal modulation: project goal embeddings to attention bias
-        self.goal_gate = nn.Linear(belief_dim, num_heads, bias=False)
+        # Goal modulation: per-head routing (PARL) or unified gate (legacy)
+        if self.parallel_goals:
+            self.goal_router = GoalRouter(belief_dim, num_heads)
+        else:
+            self.goal_gate = nn.Linear(belief_dim, num_heads, bias=False)
 
         # Learnable temperature for Hopfield attention (per head)
         self.log_temperature = nn.Parameter(torch.zeros(num_heads))
@@ -289,6 +391,8 @@ class ReadPath(nn.Module):
         scores = scores * temperature.view(1, 1, self.num_heads, 1)
 
         # Goal modulation: bias scores toward goal-relevant beliefs
+        # PARL mode: per-head routing (each head pursues a different goal)
+        # Legacy mode: unified gate (all heads get same max-goal bias)
         if goal_embeddings is not None and len(goal_embeddings) > 0:
             goal_bias = self._compute_goal_bias(
                 goal_embeddings, goal_priorities, active_angles
@@ -339,7 +443,12 @@ class ReadPath(nn.Module):
     ) -> Tensor:
         """Compute goal-directed attention bias.
 
-        Beliefs aligned with active goals get boosted.
+        PARL mode (parallel_goals=True): GoalRouter assigns each head to a
+        different goal via Gumbel-Softmax routing. Head 0 might pursue "API docs"
+        while head 1 pursues "find bug" — different beliefs get boosted per head.
+
+        Legacy mode (parallel_goals=False): max similarity across goals,
+        same bias broadcast to all heads.
 
         Args:
             goal_embeddings: [N_goals, D]
@@ -349,22 +458,20 @@ class ReadPath(nn.Module):
         Returns:
             [num_heads, N_active] attention bias
         """
-        # Goal angles
+        if self.parallel_goals:
+            # PARL per-head goal routing
+            return self.goal_router(goal_embeddings, goal_priorities, belief_angles)
+
+        # Legacy: unified goal gate (all heads get same bias)
         goal_radii = goal_embeddings.norm(dim=-1).clamp(min=EPSILON)
         goal_angles = goal_embeddings / goal_radii.unsqueeze(-1)
 
-        # Similarity between each belief and each goal
         sim = belief_angles @ goal_angles.T  # [N_active, N_goals]
-
-        # Weight by priority
         if goal_priorities is not None:
-            sim = sim * goal_priorities.unsqueeze(0)  # broadcast priorities
+            sim = sim * goal_priorities.unsqueeze(0)
 
-        # Max similarity across goals (each belief gets its best goal match)
         max_goal_sim = sim.max(dim=-1).values  # [N_active]
 
-        # Project through goal gate to get per-head bias
-        # goal_gate: [D] → [num_heads], applied as a learned scaling per head
         gate_weights = torch.sigmoid(self.goal_gate(goal_angles.mean(dim=0)))  # [num_heads]
         bias = gate_weights.unsqueeze(-1) * max_goal_sim.unsqueeze(0)  # [num_heads, N_active]
 

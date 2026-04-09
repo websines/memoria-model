@@ -471,6 +471,7 @@ def train(
                 total_steps=max_steps,
                 belief_advantage=belief_advantage_ema,
                 current_fe=_current_fe,
+                training_progress=step / max(max_steps, 1),
             )
         else:
             pass2_stats = {
@@ -537,6 +538,11 @@ def train(
                 'refinement/mean_gate': result.get('refinement_mean_gate', 1.0),
                 'refinement/retrieval_skips': result.get('refinement_retrieval_skips', 0),
                 'refinement/loops': result.get('refinement_loops', 0),
+                # PARL parallel goal pursuit metrics
+                'parl/goal_diversity': pass2_stats.get('controller_actions', {}).get('_goal_diversity', 0.0) if isinstance(pass2_stats.get('controller_actions'), dict) else 0.0,
+                'parl/goal_completion_rate': pass2_stats.get('controller_actions', {}).get('_goal_completion_rate', 0.0) if isinstance(pass2_stats.get('controller_actions'), dict) else 0.0,
+                'parl/goals_with_hypotheses': pass2_stats.get('goals_with_hypotheses', 0),
+                'parl/training_progress': step / max(max_steps, 1),
             }
             # Per-operation pass2 diagnostics — essential for isolating which
             # of the 12 structural operations is misbehaving during training.

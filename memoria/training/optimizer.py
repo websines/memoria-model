@@ -334,7 +334,12 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
-    # 19. Refinement router (MoR-style per-position adaptive refinement)
+    # 19. Goal routers (PARL-style per-head goal assignment in read paths)
+    # NOTE: GoalRouter params are already included in group 5 (interface params)
+    # since model.interfaces.parameters() traverses all submodules including
+    # read_path.goal_router. No separate group needed — they train at interface_lr.
+
+    # 20. Refinement router (MoR-style per-position adaptive refinement)
     if hasattr(model, 'refinement_router'):
         router_params = [p for p in model.refinement_router.parameters() if p.requires_grad]
         if router_params:

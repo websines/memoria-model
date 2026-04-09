@@ -280,6 +280,21 @@ class MetaParams(nn.Module):
         # sigmoid(0.0) = 0.5 → moderate threshold for flagging contradictions
         self._replay_contradiction_threshold = nn.Parameter(torch.tensor(0.0))
 
+        # ── F2: PARL — Internal Parallel Goal Pursuit ──
+        # Parallel reward weight: scales r_parallel (goal diversity reward).
+        # Annealed by (1 - training_progress) externally — this controls the peak.
+        # softplus(-0.693) ≈ 0.5 → moderate initial reward for parallelism
+        # Reference: PARL (Kimi K2.5, arXiv:2602.02276) — staged reward shaping
+        self._parl_parallel_reward_weight = nn.Parameter(torch.tensor(-0.693147))
+        # Finish reward weight: scales r_finish (penalizes abandoned goals).
+        # softplus(-0.693) ≈ 0.5 → moderate penalty for unfinished goals
+        self._parl_finish_reward_weight = nn.Parameter(torch.tensor(-0.693147))
+        # Goal diversity threshold: minimum normalized entropy over active goal
+        # hypothesis counts to count as "diverse" pursuit.
+        # sigmoid(-0.847) ≈ 0.3 → 30% of max entropy = minimal diversity
+        # Reference: D3PO (arXiv:2602.07764) — diversity regularization
+        self._parl_goal_diversity_threshold = nn.Parameter(torch.tensor(-0.847298))
+
         # ── F1: Predictive Refinement (MoR + SCORE) ──
         # Contraction rate: SCORE-style step-size decay per loop iteration.
         # dt(l) = (1 - contraction_rate)^l → later loops contribute smaller deltas.
@@ -652,6 +667,23 @@ class MetaParams(nn.Module):
     def replay_contradiction_threshold(self) -> torch.Tensor:
         """Message disagreement threshold for cross-temporal contradiction. Range: (0, 1)."""
         return torch.sigmoid(self._replay_contradiction_threshold)
+
+    # ── F2: PARL — Internal Parallel Goal Pursuit ──
+
+    @property
+    def parl_parallel_reward_weight(self) -> torch.Tensor:
+        """Peak weight for parallelism reward (annealed externally). Range: (0, inf)."""
+        return F.softplus(self._parl_parallel_reward_weight)
+
+    @property
+    def parl_finish_reward_weight(self) -> torch.Tensor:
+        """Peak weight for goal-finish penalty (annealed externally). Range: (0, inf)."""
+        return F.softplus(self._parl_finish_reward_weight)
+
+    @property
+    def parl_goal_diversity_threshold(self) -> torch.Tensor:
+        """Min normalized entropy for diverse goal pursuit. Range: (0, 1)."""
+        return torch.sigmoid(self._parl_goal_diversity_threshold)
 
     # ── F1: Predictive Refinement ──
 

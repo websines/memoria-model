@@ -55,20 +55,21 @@ Each system handles something the others cannot. MLA+DSA gives exact sparse reca
 
 Memoria is a self-modifying architecture: the system changes its own compute graph — the number of nodes, the topology of edges, the optimization objective, and the parameters governing those modifications — at runtime. This is not parameter tuning within a fixed graph. The graph itself grows, splits, prunes, and rewires based on what the system learns.
 
-**10 self-modification mechanisms, organized in a recursive hierarchy:**
+**11 self-modification mechanisms, organized in a recursive hierarchy:**
 
 | Layer | Mechanism | What changes at runtime | Module |
 |-------|-----------|------------------------|--------|
 | 0 | Belief allocation/eviction | Number of active nodes in factor graph | `belief_update.py`, `state.py` |
 | 1 | Edge proposal/pruning | Causal graph topology (which beliefs connect) | `edge_proposal.py`, `state.py` |
 | 2 | Structural plasticity | Belief splitting (polysemantic → children) and pruning | `structural_plasticity.py` |
-| 3 | Provisional beliefs + autoresearch | Hypothesis beliefs generated, tested, promoted or killed | `autoresearch.py`, `provisional.py` |
+| 3 | Provisional beliefs + autoresearch | Hypothesis beliefs generated, tested, promoted or killed; PARL fair round-robin allocation | `autoresearch.py`, `provisional.py` |
 | 4 | SRWM | Meta-parameters become state-dependent via fast-weight matrix | `srwm.py` |
-| 5 | Cognitive controller | Learned policy over rates of layers 0-4 (how aggressively to self-modify) | `cognitive_controller.py` |
+| 5 | Cognitive controller | PARL staged reward: r_perf + r_parallel + r_finish (annealed). Learned policy over rates of layers 0-4 | `cognitive_controller.py` |
 | 6 | SGM safety gate | Statistical validation of modifications (e-value testing) | `safety_gate.py` |
 | 7 | Telos goal generation | Creates new goals from surprise → changes what the system optimizes for | `telos_module.py` |
 | 8 | Adaptive depth | Variable computation depth per belief (ACT halting) + per-position refinement routing (MoR) | `adaptive_depth.py`, `memoria_model.py:RefinementRouter` |
 | 9 | Message passing + dream | Belief positions shift via loopy BP on the causal graph | `message_passing.py` |
+| 10 | Parallel goal pursuit | Per-head goal routing in read path (MoH-style); different heads pursue different goals simultaneously | `read_path.py:GoalRouter` |
 
 **The recursive autoresearch loop.** These mechanisms don't operate independently — they form a closed loop of self-directed architectural modification:
 
@@ -99,6 +100,31 @@ All belief matching losses use Huber loss instead of raw cosine disagreement. Th
 **Why this matters for self-modification.** The write gate fires on ~12% of tokens. Over 500B training tokens, that's ~60B match operations. If 1% are spurious matches (cosine outlier sensitivity), that's 600M bad belief updates poisoning the persistent cognitive state. Beliefs are persistent — a bad update at token 50M is still there at token 500B unless consolidation catches it. Huber matching is cheap insurance (one MetaParam, zero architectural changes) that keeps the cognitive state clean over long training runs. The cleaner the state, the better the recursive self-modification loop works — every mechanism in the hierarchy depends on belief quality.
 
 Applied in `compute_differentiable_free_energy` (L_fe_proxy energy term) and `compute_expected_free_energy` (EFE risk term). Reference: MIRAS/YAAD (arXiv:2504.13173); Huber (1964).
+
+### PARL-Style Internal Parallel Goal Pursuit
+
+Multiple active goals are pursued simultaneously through three coordinated mechanisms:
+
+**1. Multi-head goal routing (GoalRouter).** Each read path head is softly assigned to a different active goal via Gumbel-Softmax routing. With H=4 heads and G=3 goals, head 0 retrieves beliefs relevant to goal A, head 1 retrieves for goal B, head 2 for goal C, and head 3 gets shared (uniform). The router learns when to specialize heads vs. when to share them. Zero-init output → starts with uniform routing (backward compatible), learns to specialize.
+
+**2. Batched autoresearch with fair allocation.** Hypothesis generation is already batched across goals (one forward pass through `HypothesisGenerator`). Allocation is now fair round-robin: available slots are distributed proportionally across viable goals weighted by hypothesis success EMA, instead of first-come-first-served which starves later goals.
+
+**3. PARL staged reward shaping.** The cognitive controller receives three reward components:
+- `r_perf`: belief_advantage + state deltas (always active)
+- `r_parallel`: rewards diverse goal pursuit (normalized entropy over per-goal hypothesis counts)
+- `r_finish`: penalizes abandoned goals (prevents spurious parallelism from gaming r_parallel)
+
+`r_parallel` and `r_finish` are multiplied by `(1 - training_progress)` — they anneal to zero over training. This teaches the controller that parallelism is genuinely better for performance, then removes the crutch. All weights are learned MetaParams.
+
+**Anti-serial-collapse mechanism.** Without PARL, the controller naturally collapses to serial goal pursuit because investing in one goal reduces reward variance. The staged reward breaks this equilibrium during early training (when r_parallel > 0), and by the time it anneals out, the policy has learned the structural advantages of parallel pursuit.
+
+State encoding extended to 10 features (was 8): +goal_diversity (normalized entropy), +goal_completion_rate.
+
+Reference: PARL (Kimi K2.5, arXiv:2602.02276) — staged reward, serial collapse prevention
+Reference: MoH (arXiv:2410.11842) — mixture-of-head attention routing
+Reference: MOORE (arXiv:2311.11385) — orthogonal expert specialization
+Reference: D3PO (arXiv:2602.07764) — provable diversity regularization
+Reference: GCR-PPO (arXiv:2509.14816) — per-objective gradient decomposition
 
 ### Belief-Conditioned Sparse Attention (DSA)
 
@@ -476,7 +502,7 @@ Beliefs progress through four levels based on evidence and access:
 Hopfield-style content-addressable retrieval with goal modulation:
 
 1. **Query projection**: `hidden [B, T, H] → query [B, T, num_heads, D]`
-2. **Goal modulation**: active Telos goals bias attention toward goal-relevant beliefs
+2. **Goal modulation**: PARL per-head routing (`GoalRouter`) assigns each head to a different active goal via Gumbel-Softmax. Legacy: unified `goal_gate` bias across all heads.
 3. **Depth-conditioned temperature**: early interfaces retrieve broadly, late interfaces focus
 4. **Top-k sparse attention**: only k beliefs per position (32-64), avoids O(N_active) cost
 5. **Post-retrieval convolution**: depthwise 1D conv adds coherence between positions (Engram ShortConv)
@@ -591,6 +617,7 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 17 | Hypothesis generator | 0.01 | Autoresearch loop |
 | 18 | DFlash draft head | 0.01 | Block diffusion speculative decoding |
 | 19 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
+| — | GoalRouter (PARL per-head routing) | 0.01 | Included in group 5 (interface params) |
 | M | 2D matrix params (attention, MLP) | 0.04 | **Muon optimizer** (separate from AdamW) |
 
 Gradient clipping (`clip_grad_norm_`) is applied only to AdamW params. Muon's Newton-Schulz orthogonalization produces unit-spectral-norm updates, making pre-clip counterproductive.
@@ -832,11 +859,16 @@ Loop 1+: delta = blocks(x) - x_pre
 | `refinement_contraction_rate` | sigmoid | 0.2 | SCORE step-size decay per loop |
 | `refinement_retrieval_threshold` | sigmoid | 0.1 | Min delta fraction for belief re-query |
 | `refinement_ponder_cost` | softplus | 0.5 | Regularization penalty for continuing |
+| `parl_parallel_reward_weight` | softplus | 0.5 | Peak weight for parallelism reward (PARL) |
+| `parl_finish_reward_weight` | softplus | 0.5 | Peak weight for goal-finish penalty (PARL) |
+| `parl_goal_diversity_threshold` | sigmoid | 0.3 | Min normalized entropy for diverse pursuit |
 
 **References**:
 - MoR: Mixture-of-Recursions (NeurIPS 2025, arXiv:2507.10524) — per-token adaptive recursion depth
 - SCORE: Contractive Recurrent Depth (arXiv:2603.10544) — ODE-inspired step-size control
 - PonderNet (arXiv:2107.05407) — learned halting with geometric prior
+- PARL (Kimi K2.5, arXiv:2602.02276) — staged reward, serial collapse prevention
+- MoH (arXiv:2410.11842) — mixture-of-head attention routing
 - Two-Scale Latent Dynamics (NeurIPS 2025, arXiv:2509.23314) — geometric evidence for contractive refinement
 - DeltaLLM (arXiv:2507.19608) — temporal sparsity via delta thresholding
 

@@ -1,4 +1,4 @@
-"""SEAL-style cognitive controller: learned policy over pass2 structural actions.
+"""SEAL-style cognitive controller with PARL staged reward shaping.
 
 Instead of hardcoded heuristics deciding when to allocate, merge, prune, or
 connect beliefs, a small learned controller makes these decisions using the
@@ -16,8 +16,16 @@ Actions are sampled from Beta(α, β) ∈ [0, 1] and scaled to their valid range
 REINFORCE uses the actual log-probability of the sampled action under the Beta
 distribution, which provides an unbiased policy gradient estimator.
 
+PARL staged reward: r_perf + r_parallel + r_finish. The r_parallel component
+rewards diverse goal pursuit (prevents serial collapse), r_finish penalizes
+abandoned goals (prevents spurious parallelism). Both auxiliary rewards are
+annealed to zero over training so the final policy optimizes purely for r_perf.
+
 Reference: SEAL (MIT, NeurIPS 2025, arXiv:2506.10943)
 Reference: SEC — Self-Evolving Curriculum (arXiv:2505.14970)
+Reference: PARL (Kimi K2.5, arXiv:2602.02276) — staged reward, serial collapse
+Reference: D3PO (arXiv:2602.07764) — diversity regularization
+Reference: GCR-PPO (arXiv:2509.14816) — per-objective gradient decomposition
 """
 
 import torch
@@ -85,7 +93,9 @@ class CognitiveController(nn.Module):
         # - mean surprise (1)
         # - active goal count / max (1)
         # - belief advantage EMA (1)
-        self.state_dim = 8
+        # - goal hypothesis diversity (normalized entropy over per-goal hyp counts) (1)
+        # - goal completion rate (completed / (completed + failed + active)) (1)
+        self.state_dim = 10
 
         # Policy network: outputs 2 * NUM_ACTIONS values (α_raw, β_raw per action)
         # softplus(x) + 1.0 gives Beta params ≥ 1.0 (unimodal distributions)
@@ -137,6 +147,11 @@ class CognitiveController(nn.Module):
         self._prev_mean_radius: float = 0.0
         self._prev_edge_count: float = 0.0
 
+        # PARL staged reward tracking
+        # Tracks per-goal hypothesis counts and completion for diversity/finish rewards
+        self._prev_goal_diversity: float = 0.0
+        self._prev_goal_completion_rate: float = 0.0
+
     def _get_beta_dist(self, features: Tensor) -> tuple[Beta, Tensor, Tensor]:
         """Compute Beta distribution parameters from state features.
 
@@ -179,7 +194,46 @@ class CognitiveController(nn.Module):
             features[6] = state.num_active_goals() / max(state.config.max_goals, 1)
             features[7] = self.belief_advantage_ema.item()
 
+            # PARL: goal hypothesis diversity — normalized entropy over per-goal hyp counts
+            # High diversity = multiple goals being actively explored
+            # Low diversity = serial collapse (one goal dominating)
+            features[8] = self._compute_goal_diversity(state)
+
+            # PARL: goal completion rate — fraction of goals reaching completed status
+            features[9] = self._compute_goal_completion_rate(state)
+
         return features
+
+    def _compute_goal_diversity(self, state) -> float:
+        """Normalized entropy over per-goal hypothesis counts.
+
+        Returns 0.0 when all hypotheses belong to one goal (serial collapse),
+        1.0 when evenly distributed across all active goals (max diversity).
+        """
+        if not hasattr(state, 'hypothesis_tracker'):
+            return 0.0
+        tracker = state.hypothesis_tracker
+        goal_indices, _, _ = state.get_active_goals()
+        if len(goal_indices) <= 1:
+            return 1.0  # one or zero goals — diversity is trivially maximal
+        counts = tracker.hypothesis_count[goal_indices].float()
+        total = counts.sum()
+        if total < 1.0:
+            return 1.0  # no hypotheses yet — neutral
+        probs = counts / total
+        probs = probs.clamp(min=1e-8)  # avoid log(0)
+        entropy = -(probs * probs.log()).sum()
+        max_entropy = torch.tensor(float(len(goal_indices))).log()
+        return (entropy / max_entropy.clamp(min=1e-8)).item()
+
+    def _compute_goal_completion_rate(self, state) -> float:
+        """Fraction of non-empty goals that reached completed status."""
+        statuses = state.goal_status_logits.argmax(dim=-1)  # [max_goals]
+        non_empty = (statuses != 0)  # not empty
+        if not non_empty.any():
+            return 0.0
+        completed = (statuses == 4)  # completed status index
+        return completed.float().sum().item() / non_empty.float().sum().item()
 
     def get_actions(self, state) -> dict[str, float]:
         """Sample actions from the Beta policy.
@@ -200,6 +254,10 @@ class CognitiveController(nn.Module):
         actions = {}
         for i, (name, (lo, hi)) in enumerate(zip(ACTION_NAMES, self.action_ranges)):
             actions[name] = lo + (hi - lo) * raw_samples[i].item()
+
+        # PARL metrics: expose goal diversity and completion for wandb logging
+        actions['_goal_diversity'] = features[8].item()
+        actions['_goal_completion_rate'] = features[9].item()
 
         # Save actual log-probability and entropy for REINFORCE + entropy bonus
         log_prob = dist.log_prob(raw_samples).sum()  # sum over independent actions
@@ -293,13 +351,28 @@ class CognitiveController(nn.Module):
 
         return total_loss
 
-    def compute_dense_reward(self, state, belief_advantage: float) -> float:
-        """Combine sparse belief_advantage with dense state-delta signals.
+    def compute_dense_reward(
+        self, state, belief_advantage: float,
+        training_progress: float = 0.0,
+    ) -> float:
+        """Combine sparse belief_advantage with PARL staged reward signals.
 
-        Uses cognitive state feature deltas as auxiliary rewards to densify
-        the sparse belief_advantage signal.
+        Three reward components (PARL, arXiv:2602.02276):
+        - r_perf: belief_advantage + state deltas (always active)
+        - r_parallel: rewards diverse goal pursuit (prevents serial collapse)
+        - r_finish: penalizes abandoned goals (prevents spurious parallelism)
 
-        Reference: SASR (ICLR 2025, arXiv:2408.03029)
+        r_parallel and r_finish are annealed to zero by (1 - training_progress)
+        so the final policy optimizes purely for r_perf. Weights are learned
+        MetaParams, not hardcoded constants.
+
+        Args:
+            state: CognitiveState
+            belief_advantage: scalar advantage from forward pass
+            training_progress: float in [0, 1], 0=start, 1=end of training
+
+        Reference: SASR (ICLR 2025, arXiv:2408.03029) — dense auxiliary rewards
+        Reference: PARL (arXiv:2602.02276) — staged reward shaping
         """
         with torch.no_grad():
             fill_ratio = state.get_active_mask().float().mean().item()
@@ -316,4 +389,30 @@ class CognitiveController(nn.Module):
         self._prev_mean_radius = mean_radius
         self._prev_edge_count = edge_count
 
-        return belief_advantage + 0.1 * d_fill + 0.1 * d_radius + 0.05 * d_edges
+        # r_perf: performance reward (always active, never annealed)
+        r_perf = belief_advantage + 0.1 * d_fill + 0.1 * d_radius + 0.05 * d_edges
+
+        # ── PARL auxiliary rewards (annealed to zero) ──
+        anneal = max(0.0, 1.0 - training_progress)  # 1.0 → 0.0 over training
+
+        # r_parallel: reward for diverse goal pursuit
+        # Positive when goal diversity increases (multiple goals being explored),
+        # negative when diversity drops (serial collapse beginning).
+        goal_diversity = self._compute_goal_diversity(state)
+        d_diversity = goal_diversity - self._prev_goal_diversity
+        self._prev_goal_diversity = goal_diversity
+
+        w_parallel = state.meta_params.parl_parallel_reward_weight.item()
+        r_parallel = w_parallel * d_diversity * anneal
+
+        # r_finish: penalty for abandoned goals (spawned but never completed)
+        # Positive when completion rate improves, negative when goals are abandoned.
+        # Prevents the controller from gaming r_parallel by spawning dummy goals.
+        completion_rate = self._compute_goal_completion_rate(state)
+        d_completion = completion_rate - self._prev_goal_completion_rate
+        self._prev_goal_completion_rate = completion_rate
+
+        w_finish = state.meta_params.parl_finish_reward_weight.item()
+        r_finish = w_finish * d_completion * anneal
+
+        return r_perf + r_parallel + r_finish

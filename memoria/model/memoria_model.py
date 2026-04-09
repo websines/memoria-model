@@ -335,6 +335,7 @@ class MemoriaModel(nn.Module):
                 layer_idx=i,
                 n_interfaces=n_interfaces,
                 read_gate_init_bias=config.transformer.read_gate_init_bias,
+                parallel_goals=getattr(config.transformer, 'parallel_goals', True),
             )
             for i in range(n_interfaces)
         ])

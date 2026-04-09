@@ -96,6 +96,18 @@ class TransformerConfig:
     # Reference: Two-Scale Latent Dynamics (NeurIPS 2025, arXiv:2509.23314)
     predictive_refinement: bool = True  # enable per-position adaptive refinement
 
+    # PARL-style internal parallel goal pursuit
+    # Multi-head goal-modulated attention: different read heads pursue different
+    # active goals simultaneously. Batched autoresearch generates hypotheses for
+    # multiple goals in parallel with fair round-robin allocation. Staged reward
+    # shaping in the cognitive controller prevents serial collapse (defaulting to
+    # one goal at a time). All weights are learned MetaParams — no hardcoded numbers.
+    # Reference: PARL (Kimi K2.5, arXiv:2602.02276) — staged reward, serial collapse
+    # Reference: MoH (arXiv:2410.11842) — mixture-of-head attention routing
+    # Reference: MOORE (arXiv:2311.11385) — orthogonal expert specialization
+    # Reference: GCR-PPO (arXiv:2509.14816) — per-objective gradient decomposition
+    parallel_goals: bool = True  # enable PARL-style parallel goal pursuit
+
     # Read gate initial bias (sigmoid(x) ≈ opening fraction)
     read_gate_init_bias: float = 2.0        # sigmoid(2.0) ≈ 0.88 — starts mostly open
 

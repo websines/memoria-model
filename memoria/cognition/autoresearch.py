@@ -301,25 +301,73 @@ def run_autoresearch_step(
         stats['hypotheses_gated_out'] = len(goal_indices)
         return stats
 
-    # Allocate hypotheses as provisional beliefs
+    # ── PARL-style fair round-robin allocation ──
+    # Instead of sequential first-come-first-served (which starves later goals),
+    # distribute available slots proportionally across goals weighted by
+    # hypothesis success history (priority boost from tracker).
+    # Reference: PARL (arXiv:2602.02276) — prevents serial collapse in allocation
     tracker._ensure_belief_buffer(state.config.max_beliefs, state.beliefs.device)
-    with torch.no_grad():
-        for i in range(hypotheses.shape[0]):
-            goal_local_idx = selected_local[i].item()
-            goal_global_idx = viable_global_indices[goal_local_idx].item()
 
-            slot = state.allocate_belief(
-                hypotheses[i],
-                source_type=0,  # observation (from internal generation)
-                step=current_step,
-                provisional=True,
-                current_fe=current_fe,
-            )
-            if slot >= 0:
-                tracker.record_hypothesis(slot, goal_global_idx)
-                stats['hypotheses_generated'] += 1
-            else:
-                break  # state is full
+    # Group hypotheses by source goal
+    K = hypotheses.shape[0]
+    goal_to_hyp: dict[int, list[int]] = {}  # goal_global_idx → [hypothesis indices]
+    for i in range(K):
+        goal_local_idx = selected_local[i].item()
+        goal_global_idx = viable_global_indices[goal_local_idx].item()
+        goal_to_hyp.setdefault(goal_global_idx, []).append(i)
+
+    # Compute per-goal slot budgets using success-weighted fair allocation
+    n_goals_with_hyps = len(goal_to_hyp)
+    if n_goals_with_hyps == 0:
+        stats['hypotheses_gated_out'] = len(goal_indices)
+        return stats
+
+    available_slots = state.config.max_beliefs - state.num_active_beliefs()
+    if available_slots <= 0:
+        stats['hypotheses_gated_out'] = len(goal_indices)
+        return stats
+
+    # Fair base: each goal gets at least floor(available / n_goals) slots
+    # Remainder distributed by priority boost (success EMA)
+    base_per_goal = max(1, available_slots // n_goals_with_hyps)
+    remainder = available_slots - base_per_goal * n_goals_with_hyps
+
+    # Sort goals by success EMA descending — higher success gets remainder first
+    goal_order = sorted(
+        goal_to_hyp.keys(),
+        key=lambda g: tracker.goal_success_ema[g].item() if g < tracker.max_goals else 0.0,
+        reverse=True,
+    )
+
+    goal_budgets: dict[int, int] = {}
+    for rank, g in enumerate(goal_order):
+        budget = min(base_per_goal + (1 if rank < remainder else 0), len(goal_to_hyp[g]))
+        goal_budgets[g] = budget
+
+    # Allocate in round-robin order across goals
+    stats['per_goal_allocated'] = {}
+    with torch.no_grad():
+        for goal_idx in goal_order:
+            budget = goal_budgets[goal_idx]
+            allocated_for_goal = 0
+            for hyp_i in goal_to_hyp[goal_idx][:budget]:
+                slot = state.allocate_belief(
+                    hypotheses[hyp_i],
+                    source_type=0,  # observation (from internal generation)
+                    step=current_step,
+                    provisional=True,
+                    current_fe=current_fe,
+                )
+                if slot >= 0:
+                    tracker.record_hypothesis(slot, goal_idx)
+                    stats['hypotheses_generated'] += 1
+                    allocated_for_goal += 1
+                else:
+                    break  # state is full — stop all allocation
+            stats['per_goal_allocated'][goal_idx] = allocated_for_goal
+            if slot < 0:
+                break  # propagate state-full signal
 
     stats['hypotheses_gated_out'] = len(goal_indices) - len(viable_idx)
+    stats['goals_with_hypotheses'] = n_goals_with_hyps
     return stats
