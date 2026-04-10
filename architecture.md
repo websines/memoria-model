@@ -620,7 +620,7 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 17 | Hypothesis generator | 0.01 | Autoresearch loop |
 | 18a | BLT byte encoder | 0.01 | Byte embedding + N-gram conv + LocalDeltaProduct + strided pool |
 | 18b | BLT byte decoder | 0.01 | Down projection + LocalDeltaProduct + 4 multi-byte heads |
-| 19 | DFlash draft head (+ KV injection) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block. Injection projections 3-bit RotorQuant. |
+| 19 | DFlash draft head (+ KV injection + OPUT) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block, OPUT self-correction. Attention 4-bit, MLP 3-bit, injection 3-bit RotorQuant. |
 | 20 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
 | — | GoalRouter (PARL per-head routing) | 0.01 | Included in group 5 (interface params) |
 | M | 2D matrix params (attention, MLP) | 0.04 | **Muon optimizer** (separate from AdamW) |
@@ -870,6 +870,7 @@ Loop 1+: delta = blocks(x) - x_pre
 | `dflash_streak_decay` | sigmoid | 0.85 | Position weight decay λ for streak distillation |
 | `dflash_streak_weight` | softplus | 0.1 | Weight on expected streak length bonus |
 | `dflash_entropy_threshold` | softplus | 2.0 | Entropy cutoff (nats) for adaptive block sizing |
+| `oput_self_correct_weight` | softplus | 0.5 | Weight on OPUT on-policy self-correction loss |
 
 **References**:
 - MoR: Mixture-of-Recursions (NeurIPS 2025, arXiv:2507.10524) — per-token adaptive recursion depth
@@ -1062,11 +1063,16 @@ Reference: LM head gradient bottleneck (arXiv:2603.10145) — 95-99% gradient lo
 
 ## DFlash Speculative Decoding
 
-Native block diffusion draft head for inference acceleration. Especially valuable because refinement loops multiply per-token cost by ~4×. Three improvements over baseline:
+Native block diffusion draft head for inference acceleration. Especially valuable because refinement loops multiply per-token cost by ~4×. Four improvements over baseline:
 
 1. **KV injection**: Per-layer K/V projections for tapped target features (not concatenated as context tokens). Each draft layer independently interprets target representations. Injection projections are 3-bit RotorQuant eligible.
 2. **Streak distillation**: Position-weighted CE (w_i = λ^i, λ learned) + expected streak length bonus. Optimizes consecutive acceptance, not per-token accuracy.
 3. **Adaptive block size**: Draft up to `max_block_size` (32) tokens, but verify only the confident prefix. Entropy-based cutoff via learned MetaParam threshold.
+4. **OPUT on-policy self-correction** (DMax arXiv:2604.08302): During training, the draft head samples from its own predictions, constructs SPD hybrid embeddings (confidence-weighted interpolation between predicted token embedding and mask embedding), and runs a second forward pass. Trains the draft head to recover from its own errors within a block. Training-only — zero inference cost. The OPUT noise-robustness also enables RotorQuant on all draft head weights (previously excluded as "sensitive").
+
+**Gradient flow into backbone**: Tapped target features are NOT detached — L_draft gradient flows through tapped hidden states at layers [0, 5, 11] into the backbone. This provides an implicit multi-token prediction (MTP) signal: the backbone learns to produce hidden states that help the draft head predict k tokens ahead consecutively. Unlike dedicated MTP heads, this signal is streak-optimized, multi-layer, and belief-conditioned.
+
+**Draft head RotorQuant**: OPUT noise-robustness training makes the draft head tolerant to quantization noise. All draft layer weights are now quantized: attention projections at 4-bit (IsoQuantMSE), MLP at 3-bit (PlanarQuantMSE), KV injection at 3-bit, feature_proj at 4-bit. Reduces draft head bandwidth from ~32 MB to ~6 MB per round.
 
 ### Architecture
 
@@ -1143,6 +1149,7 @@ Reference: DFlash (arXiv:2602.06036) — KV injection, block diffusion
 Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
 Reference: FailFast (arXiv:2512.20573) — adaptive speculation length
 Reference: DEER (arXiv:2512.15176) — single-step diffusion drafting
+Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT on-policy training + SPD hybrid embeddings
 
 ## In-Place Test-Time Training (TTT)
 
@@ -1220,7 +1227,8 @@ NOT quantized (kept bf16/fp32):
 - Token embeddings, LM head (lookup tables, need precision for rare tokens)
 - State interface layers (bridge cognitive state and hidden stream)
 - Cognitive state (beliefs, edges, goals — knowledge store)
-- DFlash draft head, Telos, SleepGate, EdgeProposer, Controller (small, sensitive)
+- Telos, SleepGate, EdgeProposer, Controller (small, sensitive)
+- DFlash mask/pos embeddings (tiny, anchor for SPD interpolation — draft layer weights ARE quantized via OPUT robustness)
 - Short convolutions in DeltaProduct (tiny, affect recurrent state quality)
 
 ### CAGE Schedule (Phase-Aligned)

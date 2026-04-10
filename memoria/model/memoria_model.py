@@ -602,9 +602,12 @@ class MemoriaModel(nn.Module):
                     beliefs=dsa_beliefs,
                 )
 
-            # DFlash: save hidden states at tapped layers (detached — no extra grad cost)
+            # DFlash: save hidden states at tapped layers
+            # NOT detached — gradient from L_draft flows into backbone, providing
+            # implicit multi-token prediction signal (the draft head predicts k
+            # tokens ahead, and that gradient reaches these tapped layers).
             if i in dflash_tap_set:
-                dflash_tapped[i] = x[:, :T, :].detach() if M > 0 else x.detach()
+                dflash_tapped[i] = x[:, :T, :] if M > 0 else x
 
             # Insert state interface after designated blocks
             # Interface layers process ONLY real token positions (not working memory suffix)
@@ -1033,7 +1036,8 @@ class MemoriaModel(nn.Module):
                 halt_targets = torch.zeros(n_loops, device=idx.device)
                 halt_targets[-1] = 1.0  # halt at the oracle loop count
                 halt_preds = torch.tensor(halt_probs, device=idx.device)
-                loss_halt = F.binary_cross_entropy(halt_preds, halt_targets)
+                # Cast to float32 — binary_cross_entropy is unsafe under bf16 autocast
+                loss_halt = F.binary_cross_entropy(halt_preds.float(), halt_targets.float())
             result['loss_halt'] = loss_halt
             result['refinement_loops'] = n_refinement_loops
 
@@ -1072,12 +1076,13 @@ class MemoriaModel(nn.Module):
                 if hasattr(self.state, 'message_passing') else 0
             )
 
-            # ── DFlash draft loss (arXiv:2602.06036) ──
+            # ── DFlash draft loss (arXiv:2602.06036 + DMax arXiv:2604.08302) ──
             # Train the draft head to predict next-block tokens conditioned on
-            # tapped hidden states + beliefs. Only runs when draft head is enabled
-            # and we have collected tap features. NOT alpha-gated — the draft head
-            # should learn during phase 1 alongside the main model.
+            # tapped hidden states + beliefs. Includes OPUT on-policy self-correction:
+            # the draft head trains on its own (possibly wrong) predictions via SPD
+            # hybrid embeddings. NOT alpha-gated — trains during phase 1.
             loss_draft = torch.tensor(0.0, device=idx.device)
+            loss_self_correct = torch.tensor(0.0, device=idx.device)
             if self.dflash_enabled and dflash_tapped and self.training:
                 block_size = self.config.transformer.dflash_block_size
                 # Pick a random starting position that has block_size tokens ahead
@@ -1106,19 +1111,29 @@ class MemoriaModel(nn.Module):
                         # position weighting and expected streak bonus
                         streak_decay = self.state.meta_params.dflash_streak_decay
                         streak_weight = self.state.meta_params.dflash_streak_weight
+                        oput_weight = self.state.meta_params.oput_self_correct_weight
                         # BLT: DFlash predicts at patch level using byte decoder head
                         dflash_head_fn = self.transformer.head
+                        dflash_embed_fn = self.transformer.wte
                         if self.blt_enabled:
                             dflash_head_fn = lambda h: self.byte_decoder.byte_heads[0](
                                 F.rms_norm(h, (h.size(-1),))
                             )
-                        loss_draft = self.dflash_head.compute_draft_loss(
+                            # Compose byte_embed (→local_dim) + up_proj (→n_embd)
+                            # so OPUT hybrid embeddings match the draft head dimension
+                            _be = self.byte_encoder.byte_embed
+                            _up = self.byte_encoder.up_proj
+                            dflash_embed_fn = lambda ids: _up(_be(ids))
+                        loss_draft, loss_self_correct = self.dflash_head.compute_draft_loss(
                             context, injection, draft_targets,
                             lm_head_fn=dflash_head_fn,
+                            embed_fn=dflash_embed_fn,
                             streak_decay=streak_decay,
                             streak_weight=streak_weight,
+                            oput_weight=oput_weight,
                         )
             result['loss_draft'] = loss_draft
+            result['loss_self_correct'] = loss_self_correct
             # Store tap hiddens for spec_generate reuse (avoids redundant _collect_tap_hiddens)
             if self.dflash_enabled and dflash_tapped:
                 result['dflash_tapped'] = dflash_tapped

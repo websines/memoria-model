@@ -295,7 +295,7 @@ class MetaParams(nn.Module):
         # Reference: D3PO (arXiv:2602.07764) — diversity regularization
         self._parl_goal_diversity_threshold = nn.Parameter(torch.tensor(-0.847298))
 
-        # ── F3: DFlash — Streak Distillation + Adaptive Block Size ──
+        # ── F3: DFlash — Streak Distillation + Adaptive Block Size + OPUT ──
         # Streak decay: per-position weight decay λ in streak distillation.
         # Position i gets weight λ^i — earlier positions weighted higher.
         # sigmoid(1.735) ≈ 0.85 → position 7 weight = 0.85^7 ≈ 0.32
@@ -311,6 +311,13 @@ class MetaParams(nn.Module):
         # uniform over 151936 vocab ≈ 11.9 nats)
         # Reference: FailFast (arXiv:2512.20573) — adaptive speculation length
         self._dflash_entropy_threshold = nn.Parameter(torch.tensor(1.694596))
+        # OPUT self-correction weight: scales L_self_correct (on-policy second pass).
+        # Draft head samples from its own predictions, constructs SPD hybrid
+        # embeddings, and trains to still produce correct output. Teaches
+        # error recovery within a block → higher streak length.
+        # softplus(-0.693) ≈ 0.5 → equal weight to teacher and self-correct
+        # Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT + SPD
+        self._oput_self_correct_weight = nn.Parameter(torch.tensor(-0.693147))
 
         # ── F1: Predictive Refinement (MoR + SCORE) ──
         # Contraction rate: SCORE-style step-size decay per loop iteration.
@@ -732,6 +739,17 @@ class MetaParams(nn.Module):
         Confident predictions ≈ 0.5-1.5 nats; uniform ≈ 11.9 nats.
         """
         return F.softplus(self._dflash_entropy_threshold)
+
+    @property
+    def oput_self_correct_weight(self) -> torch.Tensor:
+        """Weight on OPUT self-correction loss (on-policy second pass). Range: (0, inf).
+
+        Scales L_self_correct: draft head trained on its own (possibly wrong)
+        predictions via SPD hybrid embeddings. Higher = more emphasis on error
+        recovery, lower = more emphasis on teacher-forced accuracy.
+        Reference: DMax (arXiv:2604.08302)
+        """
+        return F.softplus(self._oput_self_correct_weight)
 
     # ── F1: Predictive Refinement ──
 

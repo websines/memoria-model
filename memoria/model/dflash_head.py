@@ -9,19 +9,23 @@ Why this helps MemoriaModel specifically:
 - Speculative decoding amortizes that cost across accepted blocks
 - Cognitive state as additional cross-attention context improves drafts
 
-Three improvements over baseline block diffusion:
+Four improvements over baseline block diffusion:
 1. KV injection (DFlash arXiv:2602.06036): per-layer K/V projections for
    tapped target features → tighter alignment with verifier than concat
 2. Streak distillation (SpecDiff-2 arXiv:2511.00606): position-weighted CE
    + expected streak bonus → optimizes consecutive acceptance, not per-token
 3. Adaptive block size (FailFast arXiv:2512.20573): entropy-based cutoff
    → draft max_block_size, verify only confident prefix
+4. OPUT on-policy training (DMax arXiv:2604.08302): train draft head on its
+   own (possibly wrong) predictions via SPD hybrid embeddings. Teaches
+   self-correction within a block → higher streak length at zero inference cost.
 
 Architecture:
 - Mask token embeddings + positional encoding for draft positions
 - N cross-attention layers: Q=draft, KV=concat(beliefs, draft) + KV-injected target features
 - KV injection: per-layer K/V projections for tapped hidden states
 - Injection projections marked for 3-bit RotorQuant (draft accuracy < verifier)
+- Draft layer weights marked for 4-bit (attention) / 3-bit (MLP) RotorQuant
 - Shared LM head with main model (no extra 117M params)
 - Single-shot parallel prediction (no iterative diffusion at inference)
 
@@ -30,6 +34,7 @@ Reference: SpecDiff-2 (Sandler et al. — arXiv:2511.00606) — streak distillat
 Reference: FailFast (Pan, Chen, Netravali — arXiv:2512.20573) — adaptive block size
 Reference: DEER (Cheng et al. — arXiv:2512.15176) — single-step diffusion drafting
 Reference: Speculative Decoding (Leviathan et al., ICML 2023)
+Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT + SPD self-correction
 """
 
 import torch
@@ -61,6 +66,12 @@ class DFlashCrossAttention(nn.Module):
         self.k_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.v_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        # Attention projections: 4-bit RotorQuant (same as backbone attention)
+        # OPUT noise-robustness training makes draft head safe to quantize
+        self.q_proj._qat_bits = 4
+        self.k_proj._qat_bits = 4
+        self.v_proj._qat_bits = 4
+        self.out_proj._qat_bits = 4
 
         # KV injection projections for target features
         # Zero-initialized: starts as no-op, learns target conditioning gradually
@@ -135,6 +146,9 @@ class DFlashDraftLayer(nn.Module):
         # Smaller MLP than main model (2x expansion instead of 4x)
         self.fc = nn.Linear(hidden_dim, 2 * hidden_dim, bias=False)
         self.proj = nn.Linear(2 * hidden_dim, hidden_dim, bias=False)
+        # MLP: 3-bit RotorQuant (same as backbone MLP — MLPs tolerate aggressive quantization)
+        self.fc._qat_bits = 3
+        self.proj._qat_bits = 3
 
     def forward(self, draft: Tensor, context: Tensor,
                 injection: Tensor | None = None) -> Tensor:
@@ -201,6 +215,8 @@ class DFlashDraftHead(nn.Module):
 
         # Initialize feature_proj to near-zero so draft starts as no-op
         nn.init.normal_(self.feature_proj.weight, std=0.01)
+        # 4-bit RotorQuant (projection, same as backbone attention)
+        self.feature_proj._qat_bits = 4
 
     @staticmethod
     def _build_tap_indices(n_target_layers: int, n_taps: int) -> list[int]:
@@ -293,46 +309,22 @@ class DFlashDraftHead(nn.Module):
             return lm_head_fn(draft)
         return draft
 
-    def compute_draft_loss(
+    def _streak_loss(
         self,
-        context: Tensor,
-        injection: Tensor,
+        logits: Tensor,
         target_tokens: Tensor,
-        lm_head_fn=None,
-        streak_decay: Tensor | None = None,
-        streak_weight: Tensor | None = None,
+        streak_decay: Tensor | None,
+        streak_weight: Tensor | None,
     ) -> Tensor:
-        """Compute streak-distilled training loss.
+        """Position-weighted CE + expected streak bonus.
 
-        Two components beyond standard CE:
-        1. Position-weighted CE: w_i = decay^i emphasizes early positions.
-           Earlier positions matter more because speculative decoding stops
-           at the first mismatch — high accuracy at position 5 is worthless
-           if position 2 is wrong.
-        2. Expected streak bonus: directly maximizes P(consecutive correct).
-           Complementary to weighted CE — CE shapes per-position logits,
-           streak bonus shapes the joint probability of consecutive matches.
-
-        Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
-
-        Args:
-            context: [B, T_ctx, D] belief context
-            injection: [B, T_inject, D] KV injection signal
-            target_tokens: [B, block_size] ground truth tokens
-            lm_head_fn: shared LM head function
-            streak_decay: per-position weight decay λ ∈ (0,1) — learned MetaParam
-            streak_weight: weight on expected streak bonus — learned MetaParam
-
-        Returns:
-            scalar loss (differentiable w.r.t. streak_decay and streak_weight)
+        Shared between teacher pass and OPUT self-correction pass.
         """
-        logits = self.forward(context, lm_head_fn, injection=injection)
         B, S, V = logits.shape
 
         if streak_decay is not None:
-            # Position-weighted CE (streak distillation core)
             positions = torch.arange(S, device=logits.device, dtype=logits.dtype)
-            weights = streak_decay ** positions  # [S] — early positions weighted higher
+            weights = streak_decay ** positions
 
             per_pos_loss = F.cross_entropy(
                 logits.reshape(-1, V), target_tokens.reshape(-1),
@@ -346,28 +338,127 @@ class DFlashDraftHead(nn.Module):
                 ignore_index=-1,
             )
 
-        # Expected streak length bonus
         if streak_weight is not None:
             sw_val = streak_weight.item() if isinstance(streak_weight, Tensor) else streak_weight
             if sw_val > 0:
-                probs = F.softmax(logits, dim=-1)  # [B, S, V]
+                probs = F.softmax(logits, dim=-1)
                 p_correct = probs.gather(
                     -1, target_tokens.clamp(min=0).unsqueeze(-1),
-                ).squeeze(-1)  # [B, S]
-                # Treat ignore_index positions as P=1 (don't break streak)
+                ).squeeze(-1)
                 valid = (target_tokens != -1).float()
                 p_correct = p_correct * valid + (1.0 - valid)
                 p_correct = p_correct.clamp(min=1e-8)
 
-                # Cumulative product = P(streak ≥ i+1)
-                cum_correct = p_correct.cumprod(dim=-1)  # [B, S]
-                # Expected streak = Σ P(streak ≥ i)
+                cum_correct = p_correct.cumprod(dim=-1)
                 expected_streak = (cum_correct * valid).sum(dim=-1).mean()
 
-                # Negative: maximize streak (minimize loss)
                 loss = loss - streak_weight * expected_streak / S
 
         return loss
+
+    def compute_draft_loss(
+        self,
+        context: Tensor,
+        injection: Tensor,
+        target_tokens: Tensor,
+        lm_head_fn=None,
+        embed_fn=None,
+        streak_decay: Tensor | None = None,
+        streak_weight: Tensor | None = None,
+        oput_weight: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute streak-distilled training loss with OPUT self-correction.
+
+        Three components:
+        1. Position-weighted CE: w_i = decay^i emphasizes early positions.
+           Earlier positions matter more because speculative decoding stops
+           at the first mismatch — high accuracy at position 5 is worthless
+           if position 2 is wrong.
+        2. Expected streak bonus: directly maximizes P(consecutive correct).
+           Complementary to weighted CE — CE shapes per-position logits,
+           streak bonus shapes the joint probability of consecutive matches.
+        3. OPUT self-correction (DMax arXiv:2604.08302): sample from the draft
+           head's own predictions, construct SPD hybrid embeddings (interpolation
+           between predicted token embedding and mask embedding weighted by
+           confidence), run a second forward pass, and train to still produce
+           the correct output. Teaches the draft head to recover from its own
+           errors within a block — directly addresses error accumulation in
+           parallel decoding. Training-only, zero inference cost.
+
+        Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
+        Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT + SPD
+
+        Args:
+            context: [B, T_ctx, D] belief context
+            injection: [B, T_inject, D] KV injection signal
+            target_tokens: [B, block_size] ground truth tokens
+            lm_head_fn: shared LM head function (hidden → logits)
+            embed_fn: embedding function (token_ids → embeddings) for OPUT
+            streak_decay: per-position weight decay λ ∈ (0,1) — learned MetaParam
+            streak_weight: weight on expected streak bonus — learned MetaParam
+            oput_weight: weight on self-correction loss — learned MetaParam
+
+        Returns:
+            (total_loss, loss_self_correct) — both scalar tensors
+        """
+        # ── Pass 1: teacher-forced (standard streak distillation) ──
+        logits = self.forward(context, lm_head_fn, injection=injection)
+        loss_teacher = self._streak_loss(logits, target_tokens, streak_decay, streak_weight)
+
+        # ── Pass 2: OPUT on-policy self-correction (DMax) ──
+        loss_self_correct = torch.tensor(0.0, device=logits.device)
+        oput_w = oput_weight.item() if isinstance(oput_weight, Tensor) else (oput_weight or 0.0)
+        if oput_w > 0 and embed_fn is not None:
+            with torch.no_grad():
+                # Sample from draft's own predictions (on-policy rollout)
+                sampled_ids = logits.argmax(dim=-1)  # [B, S] — greedy
+                sampled_embeds = embed_fn(sampled_ids)  # [B, S, hidden_dim]
+
+                # Per-position confidence from first pass
+                confidence = F.softmax(logits, dim=-1).max(dim=-1).values  # [B, S]
+
+                # SPD hybrid embedding (DMax Eq. 9-10): interpolate between
+                # predicted token embedding and mask embedding weighted by
+                # confidence. Low confidence → mostly mask → explicit uncertainty.
+                pi = confidence.unsqueeze(-1)  # [B, S, 1]
+                mask_expanded = self.mask_embed.expand_as(sampled_embeds)
+
+                # Unnormalized hybrid (DMax Eq. 9)
+                hybrid_raw = pi * sampled_embeds + (1.0 - pi) * mask_expanded
+
+                # Norm-preserving renormalization (DMax Eq. 10):
+                # scale to match weighted sum of component norms
+                target_norm = (
+                    pi * sampled_embeds.norm(dim=-1, keepdim=True)
+                    + (1.0 - pi) * mask_expanded.norm(dim=-1, keepdim=True)
+                )
+                hybrid_norm = hybrid_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                hybrid = hybrid_raw * (target_norm / hybrid_norm)
+
+                # Add positional encoding (same as standard forward)
+                pos_ids = torch.arange(hybrid.shape[1], device=hybrid.device)
+                hybrid = hybrid + self.pos_embed(pos_ids)
+
+            # Second forward pass through draft layers with hybrid input
+            # (gradients flow through draft layers, not through hybrid construction)
+            draft = hybrid
+            for layer in self.layers:
+                draft = layer(draft, context, injection=injection)
+            draft = self.out_norm(draft)
+            if lm_head_fn is not None:
+                refined_logits = lm_head_fn(draft)
+            else:
+                refined_logits = draft
+
+            loss_self_correct = self._streak_loss(
+                refined_logits, target_tokens, streak_decay, streak_weight,
+            )
+
+        if oput_weight is not None and oput_w > 0:
+            total_loss = loss_teacher + oput_weight * loss_self_correct
+        else:
+            total_loss = loss_teacher
+        return total_loss, loss_self_correct
 
     def compute_entropy(self, logits: Tensor) -> Tensor:
         """Per-position entropy for adaptive block sizing.
