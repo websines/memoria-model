@@ -115,12 +115,38 @@ CURATED_SOURCES: list[DataSource] = [
         split="cpp",
     ),
     # Nemotron SFT OpenCode: NVIDIA's curated code instruction data
+    # All splits: general code, bash tool use, agent skills, question+tool
     DataSource(
-        name="nemotron_opencode",
+        name="nemotron_opencode_general",
         hf_id="nvidia/Nemotron-SFT-OpenCode-v1",
-        weight=0.04,
+        weight=0.015,
         format_fn=fmt.format_nemotron_opencode,
         tier="code",
+        split="general",
+    ),
+    DataSource(
+        name="nemotron_opencode_agent",
+        hf_id="nvidia/Nemotron-SFT-OpenCode-v1",
+        weight=0.01,
+        format_fn=fmt.format_nemotron_opencode,
+        tier="code",
+        split="agent_skills",
+    ),
+    DataSource(
+        name="nemotron_opencode_bash",
+        hf_id="nvidia/Nemotron-SFT-OpenCode-v1",
+        weight=0.01,
+        format_fn=fmt.format_nemotron_opencode,
+        tier="code",
+        split="bash_only_tool",
+    ),
+    DataSource(
+        name="nemotron_opencode_question_tool",
+        hf_id="nvidia/Nemotron-SFT-OpenCode-v1",
+        weight=0.005,
+        format_fn=fmt.format_nemotron_opencode,
+        tier="code",
+        split="question_tool",
     ),
     # DeepCoder: competitive programming
     DataSource(
@@ -130,6 +156,7 @@ CURATED_SOURCES: list[DataSource] = [
         format_fn=fmt.format_deepcoder,
         tier="code",
         config="codeforces",
+        split="test",  # only split available
     ),
     # Open-R1 Codeforces: competitive programming
     DataSource(
@@ -164,21 +191,31 @@ CURATED_SOURCES: list[DataSource] = [
     # Nemotron Terminal Corpus (original NVIDIA): 366K terminal execution trajectories.
     # Data querying, model training, data processing, debugging, software engineering.
     # Dataset adapters (226K) + skill-based synthetic tasks (140K). CC-BY-4.0.
+    # Nemotron Terminal Corpus: terminal execution trajectories.
+    # dataset_adapters config has nested array issue with HF streaming — use skill splits.
     DataSource(
-        name="nemotron_terminal",
+        name="nemotron_terminal_medium",
         hf_id="nvidia/Nemotron-Terminal-Corpus",
-        weight=0.04,
+        weight=0.03,
         format_fn=fmt.format_nemotron_terminal,
         tier="code_agent",
-        config="dataset_adapters",
+        config="skill_based_medium",
     ),
     DataSource(
-        name="nemotron_terminal_skill",
+        name="nemotron_terminal_easy",
         hf_id="nvidia/Nemotron-Terminal-Corpus",
         weight=0.02,
         format_fn=fmt.format_nemotron_terminal,
         tier="code_agent",
-        config="skill_based_medium",
+        config="skill_based_easy",
+    ),
+    DataSource(
+        name="nemotron_terminal_mixed",
+        hf_id="nvidia/Nemotron-Terminal-Corpus",
+        weight=0.01,
+        format_fn=fmt.format_nemotron_terminal,
+        tier="code_agent",
+        config="skill_based_mixed",
     ),
     # SWE-agent trajectories: full software engineering agent runs
     DataSource(
@@ -197,6 +234,8 @@ CURATED_SOURCES: list[DataSource] = [
         tier="code_agent",
     ),
     # Nemotron-Agentic-v1: tool calling split
+    # Nemotron-Agentic-v1 tool_calling: nested struct schema breaks default HF streaming.
+    # Fix: load with trust_remote_code to bypass strict schema casting.
     DataSource(
         name="nemotron_agentic_tool",
         hf_id="nvidia/Nemotron-Agentic-v1",
@@ -419,7 +458,7 @@ def _load_hf_stream(source: DataSource) -> Iterator[dict]:
     if source.sub_sources:
         return _load_multi_stream(source)
 
-    kwargs = dict(split=source.split, streaming=True)
+    kwargs = dict(split=source.split, streaming=True, trust_remote_code=True)
     if source.config:
         # StarCoderData uses data_dir for language filtering, not name
         if 'starcoderdata' in source.hf_id:

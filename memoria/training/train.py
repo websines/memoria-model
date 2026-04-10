@@ -270,6 +270,12 @@ def train(
     # The cognitive state needs state-demanding data regardless of whether the
     # backbone is pretrained or trained from scratch.
     # BLT mode: encode as UTF-8 bytes (0-259) instead of BPE tokens.
+    #
+    # DDP: each rank creates its own stream (different random routing = data diversity).
+    # Stagger startup so ranks don't hammer HF API simultaneously during probe phase.
+    if rank > 0:
+        import time as _t
+        _t.sleep(rank * 30)  # rank 1 waits 30s for rank 0 to finish probing
     if is_main:
         mode_label = "byte-level" if blt_enabled else "token-level"
         print(f"Using curated dataset mix ({mode_label}, state-essential + reasoning + tool calling)")
