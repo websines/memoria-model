@@ -77,10 +77,10 @@ class DataPrefetcher:
             raise RuntimeError(f"Data prefetcher failed: {self._error}")
         # Short poll intervals (5s) so worker errors surface quickly instead of
         # blocking for the full 120s timeout before checking
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + 300  # 5 min timeout (HF downloads can be slow on DDP)
         while True:
             try:
-                input_ids, labels = self.queue.get(timeout=5)
+                input_ids, labels = self.queue.get(timeout=10)
                 break
             except queue.Empty:
                 if self._error is not None:
@@ -88,7 +88,7 @@ class DataPrefetcher:
                 if not self.thread.is_alive():
                     raise RuntimeError("Data prefetcher thread died unexpectedly")
                 if time.monotonic() > deadline:
-                    raise RuntimeError("Data prefetcher timed out after 120s — check data pipeline")
+                    raise RuntimeError("Data prefetcher timed out after 300s — check data pipeline")
         return input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
 
     def stop(self):
