@@ -563,7 +563,7 @@ L_total = L_token + α · L_fe + α · 0.1 · L_utility + α · 0.1 · L_surpris
 | **L_fe_bethe** | `compute_bethe_free_energy` | Beliefs, edges, relations | Proper Bethe free energy on the cognitive factor graph. Power Spherical entropy with (d_i−1) counting correction. |
 | **L_utility** | `chunked_cross_entropy` on utility logits | Interface utility heads | Measures whether retrieved beliefs improve token prediction. |
 | **L_surprise** | `TelosModule.surprise_loss` | RND networks, goal system | RND surprise (trains predictor to match target for seen beliefs) + goal status transitions (penalize stalled/failed, reward completed). |
-| **L_halt** | `F.binary_cross_entropy` | RefinementProbe | Teaches the halting probe when to stop refinement loops. Teacher forcing with random oracle loop count. |
+| **L_halt** | `F.binary_cross_entropy_with_logits` | RefinementProbe | Teaches the halting probe when to stop refinement loops. Teacher forcing with random oracle loop count. |
 | **L_ponder** | `ponder_cost × mean(gate)` | RefinementRouter | Per-position penalty for continuing refinement. Ponder cost is a learned MetaParam. Encourages router to halt positions early. Reference: PonderNet (arXiv:2107.05407). |
 | **L_jac** | DEQ Jacobian regularization | Message passing | Ensures the factor graph fixed-point map stays contractive. Periodic (every 10 steps). |
 | **L_draft** | `DFlashDraftHead.compute_draft_loss` | Draft head + KV injection | Streak-distilled draft quality: position-weighted CE (w_i = λ^i) + expected streak bonus. NOT alpha-gated — trains from step 0. λ and streak_weight are learned MetaParams. |

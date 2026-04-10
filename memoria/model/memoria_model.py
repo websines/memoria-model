@@ -217,6 +217,8 @@ class RefinementProbe(nn.Module):
     def __init__(self, hidden_dim: int):
         super().__init__()
         # +1 for loop position scalar (normalized to [0, 1])
+        # Outputs raw logits — sigmoid applied externally for inference,
+        # binary_cross_entropy_with_logits used for training (autocast-safe).
         self.net = nn.Sequential(
             nn.Linear(hidden_dim + 1, 256),
             nn.GELU(),
@@ -224,7 +226,6 @@ class RefinementProbe(nn.Module):
             nn.Linear(256, 64),
             nn.GELU(),
             nn.Linear(64, 1),
-            nn.Sigmoid(),
         )
 
     def forward(self, h_pooled: Tensor, loop_idx: int, max_loops: int) -> Tensor:
@@ -236,7 +237,7 @@ class RefinementProbe(nn.Module):
             max_loops: maximum number of loops
 
         Returns:
-            [B, 1] halt probability
+            [B, 1] halt logit (apply sigmoid for probability)
         """
         B = h_pooled.shape[0]
         pos = torch.full((B, 1), loop_idx / max(max_loops, 1),
@@ -657,7 +658,7 @@ class MemoriaModel(nn.Module):
         #
         # Reference: Mamba dark loops (phase14_inner_loop_bypass_trainer.py)
         # Reference: RecursiveMamba2_PrefixScratchpad._lifeline_inject_prompt_only
-        halt_probs = []
+        halt_logit_list = []
         ponder_costs = []  # per-loop mean gate values for ponder regularization
         n_refinement_loops = 0
         mean_gate_value = 1.0  # tracking for diagnostics
@@ -828,14 +829,14 @@ class MemoriaModel(nn.Module):
                 # Training: runs all oracle_loops (teacher forcing), records probs for loss.
                 # Inference: exits when probe says halt.
                 h_pooled = x[:, :T, :].mean(dim=1) if M > 0 else x.mean(dim=1)
-                p_halt = self.refinement_probe(
+                halt_logit = self.refinement_probe(
                     h_pooled, loop_i, self.max_refinement_loops,
                 )
-                halt_probs.append(p_halt.mean().item())
+                halt_logit_list.append(halt_logit.mean())  # keep tensor for gradient flow
 
                 # Inference only: respect the probe's halt decision
                 if not self.training:
-                    if p_halt.mean().item() > self.config.transformer.refinement_halt_threshold:
+                    if halt_logit.mean().sigmoid().item() > self.config.transformer.refinement_halt_threshold:
                         break
 
         # ── Slice off working memory suffix before LM head ──
@@ -1031,13 +1032,12 @@ class MemoriaModel(nn.Module):
             # This teaches the probe DIVERSE halt points, not just "always halt at max."
             # Reference: Mamba HaltingHead (phase14_inner_loop_bypass_trainer.py)
             loss_halt = torch.tensor(0.0, device=idx.device)
-            if halt_probs and self.max_refinement_loops > 0:
-                n_loops = len(halt_probs)
+            if halt_logit_list and self.max_refinement_loops > 0:
+                n_loops = len(halt_logit_list)
                 halt_targets = torch.zeros(n_loops, device=idx.device)
                 halt_targets[-1] = 1.0  # halt at the oracle loop count
-                halt_preds = torch.tensor(halt_probs, device=idx.device)
-                # Cast to float32 — binary_cross_entropy is unsafe under bf16 autocast
-                loss_halt = F.binary_cross_entropy(halt_preds.float(), halt_targets.float())
+                halt_logits = torch.stack(halt_logit_list)  # [n_loops] — tensors with grad
+                loss_halt = F.binary_cross_entropy_with_logits(halt_logits.float(), halt_targets.float())
             result['loss_halt'] = loss_halt
             result['refinement_loops'] = n_refinement_loops
 
