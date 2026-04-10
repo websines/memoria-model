@@ -23,7 +23,9 @@ echo "════════════════════════�
 
 # Load env
 if [ -f .env ]; then
-    export $(grep -v '^#' .env | xargs)
+    set -a
+    source .env
+    set +a
 fi
 
 # Step 1: Warm HF cache
