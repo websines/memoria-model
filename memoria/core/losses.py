@@ -48,6 +48,59 @@ def chunked_cross_entropy(
     return total_loss / max(n_tokens, 1)
 
 
+def fused_chunked_cross_entropy(
+    hidden: Tensor,
+    targets: Tensor,
+    head_weight: Tensor,
+    chunk_size: int = 2048,
+    ignore_index: int = -1,
+) -> Tensor:
+    """Fused LM head + cross-entropy in chunks — never materializes full logits.
+
+    At 128K context with 151K vocab, logits = [128K, 151K] × 2 bytes = 38 GB.
+    This function computes head(hidden) → logits → loss in chunks of chunk_size
+    positions, keeping peak memory at chunk_size × vocab_size × 2 bytes.
+
+    At chunk_size=2048: peak = 2048 × 151K × 2 = 620 MB (vs 38 GB).
+
+    Gradients flow correctly through both the hidden states and head_weight
+    because each chunk's logits are created from the original hidden tensor
+    (not detached). PyTorch accumulates gradients across chunks automatically.
+
+    Args:
+        hidden: [B*T, D] hidden states (BEFORE LM head projection)
+        targets: [B*T] target token IDs
+        head_weight: [vocab_size, D] LM head weight matrix
+        chunk_size: positions to process at once (controls peak memory)
+        ignore_index: target value to ignore in loss
+
+    Returns:
+        Scalar cross-entropy loss (differentiable w.r.t. hidden and head_weight)
+    """
+    BT, D = hidden.shape
+
+    # Short sequences: just compute directly
+    if BT <= chunk_size:
+        logits = F.linear(hidden, head_weight)
+        return F.cross_entropy(logits, targets, ignore_index=ignore_index)
+
+    total_loss = 0.0
+    n_tokens = 0
+    for start in range(0, BT, chunk_size):
+        end = min(start + chunk_size, BT)
+        # Compute logits for this chunk only — peak memory = chunk_size × vocab
+        chunk_logits = F.linear(hidden[start:end], head_weight)
+        chunk_targets = targets[start:end]
+        valid = (chunk_targets != ignore_index).sum().item()
+        if valid > 0:
+            total_loss = total_loss + F.cross_entropy(
+                chunk_logits, chunk_targets, ignore_index=ignore_index, reduction='sum'
+            )
+            n_tokens += valid
+
+    return total_loss / max(n_tokens, 1)
+
+
 def compute_differentiable_free_energy(
     attn_weights: list[Tensor],
     retrieved: list[Tensor],

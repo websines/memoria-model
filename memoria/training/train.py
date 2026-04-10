@@ -165,11 +165,19 @@ def train(
             print("WARNING: push_to_hub=True but HF_REPO or HF_TOKEN not set. Disabling hub push.")
         push_to_hub = False
 
-    # Tokenizer (in pretrained mode, use the backbone's own tokenizer)
-    tokenizer = get_tokenizer(
-        vocab_size=config.transformer.vocab_size,
-        pretrained_model=config.pretrained_model if config.backbone == "pretrained" else None,
-    )
+    # BLT byte mode: no tokenizer needed, data pipeline encodes as UTF-8 bytes
+    blt_enabled = getattr(config.transformer, 'blt_enabled', False)
+
+    # Tokenizer (skipped in BLT byte mode — model operates on raw bytes)
+    if blt_enabled:
+        tokenizer = None
+        if is_main:
+            print("BLT mode: byte-level encoding (no tokenizer)")
+    else:
+        tokenizer = get_tokenizer(
+            vocab_size=config.transformer.vocab_size,
+            pretrained_model=config.pretrained_model if config.backbone == "pretrained" else None,
+        )
 
     # Model
     if is_main:
@@ -261,14 +269,17 @@ def train(
     # Curated multi-tier mix for all modes: state-essential + reasoning + tool calling.
     # The cognitive state needs state-demanding data regardless of whether the
     # backbone is pretrained or trained from scratch.
+    # BLT mode: encode as UTF-8 bytes (0-259) instead of BPE tokens.
     if is_main:
-        print("Using curated dataset mix (state-essential + reasoning + tool calling)")
+        mode_label = "byte-level" if blt_enabled else "token-level"
+        print(f"Using curated dataset mix ({mode_label}, state-essential + reasoning + tool calling)")
     data_stream = curated_stream(
         tokenizer,
         seq_len=config.transformer.sequence_len,
         synthetic_data=synthetic_data if synthetic_data else None,
         code_languages=["python", "javascript", "rust", "go"],
         skip_documents=skip_docs,
+        byte_mode=blt_enabled,
     )
 
     # Checkpoint dir
@@ -282,14 +293,19 @@ def train(
     t_start = time.time()
     total_training_time = 0.0
 
-    # Gradient accumulation (correctly divides by world_size)
-    tokens_per_micro = tc.device_batch_size * config.transformer.sequence_len
-    grad_accum = max(1, tc.total_batch_size // (tokens_per_micro * world_size))
+    # Gradient accumulation (correctly divides by world_size).
+    # In BLT byte mode, sequence_len is in bytes. total_batch_size is always in
+    # the native unit (tokens or bytes) — no conversion needed. The backbone sees
+    # fewer positions (patches = bytes / patch_size), but the batch accounting is
+    # in input units so grad_accum stays correct.
+    units_per_micro = tc.device_batch_size * config.transformer.sequence_len
+    grad_accum = max(1, tc.total_batch_size // (units_per_micro * world_size))
 
     if is_main:
+        unit = "bytes" if blt_enabled else "tokens"
         print(f"Training: {max_steps} steps, grad_accum={grad_accum}, "
-              f"batch_size={tc.device_batch_size}, seq_len={config.transformer.sequence_len}")
-        print(f"Effective batch: {grad_accum * tokens_per_micro * world_size} tokens/step")
+              f"batch_size={tc.device_batch_size}, seq_len={config.transformer.sequence_len} {unit}")
+        print(f"Effective batch: {grad_accum * units_per_micro * world_size} {unit}/step")
         print(f"Phase 1 (α=0): steps 0-{tc.phase1_steps}")
         print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
         print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
@@ -333,7 +349,9 @@ def train(
     # separates eval data from early training data and ensures each eval call
     # gets fresh sequences instead of re-evaluating the same 20 every time.
     if is_main:
-        eval_data_stream = stream_fineweb_edu(tokenizer, config.transformer.sequence_len)
+        eval_data_stream = stream_fineweb_edu(
+            tokenizer, config.transformer.sequence_len, byte_mode=blt_enabled,
+        )
         for _ in range(1000):
             next(eval_data_stream)
     else:
@@ -449,9 +467,13 @@ def train(
         # Pass 2: cognitive update on rank 0 only
         base_model.detach_state()
 
-        # Detect actual sequence boundaries (EOS token present in last batch)
-        eos_id = tokenizer.eos_token_id
-        has_boundary = eos_id is not None and (input_ids == eos_id).any().item()
+        # Detect actual sequence boundaries (EOS token/byte present in last batch)
+        if blt_enabled:
+            from ..data.streaming import EOS_BYTE
+            has_boundary = (input_ids == EOS_BYTE).any().item()
+        else:
+            eos_id = tokenizer.eos_token_id
+            has_boundary = eos_id is not None and (input_ids == eos_id).any().item()
 
         if is_main:
             gathered_candidates = unpack_candidates(packed, belief_dim)

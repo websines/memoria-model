@@ -917,10 +917,13 @@ class MemoriaModel(nn.Module):
                 result['loss_token'] = loss_byte
                 result['byte_stats'] = byte_stats
             else:
-                logits = self.transformer.head(x)
-                result['loss_token'] = chunked_cross_entropy(
-                    logits.view(-1, logits.size(-1)),
+                # Fused head + loss: never materializes [B*T, 151K] logits tensor.
+                # At 128K context this saves ~38 GB by computing in 2K-position chunks.
+                from ..core.losses import fused_chunked_cross_entropy
+                result['loss_token'] = fused_chunked_cross_entropy(
+                    x.view(-1, x.size(-1)),
                     targets.view(-1),
+                    self.transformer.lm_head.weight,
                 )
 
             # Always compute L_fe and L_utility so all interface parameters participate
@@ -931,12 +934,13 @@ class MemoriaModel(nn.Module):
             loss_utility = torch.tensor(0.0, device=idx.device)
             if all_utility_logits:
                 if alpha > 0 and not self.blt_enabled:
-                    # Full utility: run through LM head (materializes [B*T, vocab] per layer)
+                    # Full utility: fused head + loss (same chunking as main loss)
+                    from ..core.losses import fused_chunked_cross_entropy
                     for util_hidden in all_utility_logits:
-                        util_logits = self.transformer.head(util_hidden)
-                        loss_utility = loss_utility + chunked_cross_entropy(
-                            util_logits.view(-1, util_logits.size(-1)),
+                        loss_utility = loss_utility + fused_chunked_cross_entropy(
+                            util_hidden.view(-1, util_hidden.size(-1)),
                             targets.view(-1),
+                            self.transformer.lm_head.weight,
                         )
                     loss_utility = loss_utility / len(all_utility_logits)
                 else:

@@ -439,3 +439,106 @@ def qwen_config() -> MemoriaConfig:
             fe_temperature=5.0,
         ),
     )
+
+
+def full_config() -> MemoriaConfig:
+    """Full-featured Memoria from scratch. 2x 3090 (48GB). All systems active.
+
+    BLT byte-level I/O eliminates the 233M-param embedding/LM head bottleneck.
+    ~122M active params. 128K byte context via SkyLadder exponential ramp.
+    Full curated data mix with 45% state-essential data.
+
+    All cognitive systems enabled:
+    - 12 Pass 2 operations (beliefs, edges, goals, autoresearch, sleep, planning...)
+    - Refinement loops with predictive refinement (MoR + SCORE)
+    - PARL parallel goal pursuit
+    - BLT byte-level I/O (tokenizer-free)
+    - DFlash speculative decoding
+    - DSA belief-conditioned sparse attention
+    - Weight QAT + CAGE
+    - SkyLadder progressive context (512 → 128K bytes)
+    - TTT in-place test-time training
+    - Engram static cache
+    - Kendall/Gal uncertainty weighting
+
+    VRAM estimate per GPU: ~12 GB at peak context (batch_size=1, 128K bytes).
+
+    Training profile (SkyLadder exponential):
+      0-10%:  512-1K bytes → blazing fast, high effective batch
+      10-30%: 1K-4K bytes → fast
+      30-50%: 4K-16K bytes → moderate
+      50-60%: 16K-128K bytes → slower, but H layers are O(T), DSA is O(T×K)
+      60-100%: 128K bytes → steady state, full context
+    """
+    return MemoriaConfig(
+        transformer=TransformerConfig(
+            n_layer=12, n_head=6, n_kv_head=6, n_embd=768,
+            window_pattern="HHHHL",
+            mla_latent_dim=192,
+
+            # State interface
+            interface_every=4,
+            interface_num_heads=4,
+            interface_top_k=32,
+
+            # Working memory + Engram
+            working_memory_size=8,
+            engram_table_size=50000,
+            engram_n_heads=4,
+
+            # Refinement loops (latent CoT)
+            max_refinement_loops=3,
+            predictive_refinement=True,
+
+            # PARL parallel goals
+            parallel_goals=True,
+
+            # BLT byte-level (eliminates 233M embedding bottleneck)
+            blt_enabled=True,
+            blt_local_dim=384,
+            blt_patch_size=6,
+            blt_local_layers=2,
+            blt_n_byte_heads=4,
+
+            # DFlash speculative decoding
+            dflash_enabled=True,
+            dflash_n_layers=3,
+            dflash_block_size=8,
+
+            # Weight QAT
+            weight_qat_bits=4,
+            weight_qat_mlp_bits=3,
+
+            # DSA sparse attention
+            dsa_enabled=True,
+            dsa_index_dim=32,
+            dsa_top_k=2048,
+
+            # 128K byte context (≈36K tokens equivalent)
+            sequence_len=131072,
+        ),
+        state=StateConfig(
+            belief_dim=256,
+            max_beliefs=8192,
+            max_edges=32768,
+            max_goals=128,
+            relation_dim=64,
+        ),
+        training=TrainingConfig(
+            total_batch_size=2**17,    # 128K bytes/step
+            device_batch_size=1,       # 1 seq/GPU at peak context
+
+            phase1_steps=2000,
+            phase2_steps=3000,
+            alpha_warmup_steps=1000,
+            alpha_max=0.1,
+
+            # SkyLadder: 512 → 128K bytes, exponential (more time at cheap short ctx)
+            skyladder_ratio=0.6,
+            skyladder_start=512,
+            skyladder_schedule="exponential",
+
+            # CAGE
+            cage_lambda_base=10.0,
+        ),
+    )
