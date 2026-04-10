@@ -449,59 +449,62 @@ CURATED_SOURCES: list[DataSource] = [
 
 # ── Stream Construction ──
 
+def _load_parquet_fallback(source: DataSource) -> Iterator[dict]:
+    """Load dataset by directly streaming parquet files — bypasses schema inference.
+
+    Used when load_dataset() fails with "Couldn't cast array of type struct"
+    errors on datasets with inconsistent nested schemas (e.g. Nemotron-Agentic
+    tool_calling split). Loading raw parquet avoids the strict type casting.
+    """
+    from huggingface_hub import HfApi
+    api = HfApi()
+    files = api.list_repo_files(source.hf_id, repo_type="dataset")
+    split = source.split or "train"
+    config_prefix = f"{source.config}/" if source.config else ""
+
+    # Find parquet files matching config + split
+    parquet_files = [
+        f"hf://datasets/{source.hf_id}/{f}"
+        for f in files
+        if f.endswith('.parquet') and split in f and (not config_prefix or config_prefix in f)
+    ]
+    if not parquet_files:
+        # Broader search — any parquet with split name
+        parquet_files = [
+            f"hf://datasets/{source.hf_id}/{f}"
+            for f in files
+            if f.endswith('.parquet') and split in f
+        ]
+    if not parquet_files:
+        raise RuntimeError(f"No parquet files found for {source.hf_id} split={split}")
+
+    ds = load_dataset("parquet", data_files=parquet_files, streaming=True, split="train")
+    return iter(ds)
+
+
 def _load_hf_stream(source: DataSource) -> Iterator[dict]:
     """Load a single HuggingFace dataset as a streaming iterator.
 
     For sources with sub_sources (e.g. BABILong with multiple tasks),
     round-robins across all sub-source streams.
 
-    Handles schema cast errors (nested structs in some NVIDIA datasets)
-    by falling back to parquet loading without strict schema inference.
+    Sources marked with _use_parquet_fallback (set during probe phase when
+    schema cast errors are detected) use direct parquet loading.
     """
     if source.sub_sources:
         return _load_multi_stream(source)
 
+    # If probe phase detected a schema issue, go straight to parquet
+    if getattr(source, '_use_parquet_fallback', False):
+        return _load_parquet_fallback(source)
+
     kwargs = dict(split=source.split, streaming=True)
     if source.config:
-        # StarCoderData uses data_dir for language filtering, not name
         if 'starcoderdata' in source.hf_id:
             kwargs['data_dir'] = source.config
         else:
             kwargs['name'] = source.config
-
-    try:
-        return iter(load_dataset(source.hf_id, **kwargs))
-    except (TypeError, ValueError) as e:
-        if "Couldn't cast" not in str(e) and "Nested data" not in str(e):
-            raise
-        # Schema cast error — fall back to loading parquet files directly
-        # without strict type inference. This handles datasets with
-        # inconsistent nested struct schemas (e.g. Nemotron-Agentic tool_calling).
-        try:
-            from huggingface_hub import HfApi
-            api = HfApi()
-            files = api.list_repo_files(source.hf_id, repo_type="dataset")
-            # Find parquet files matching the split
-            split = source.split or "train"
-            config_prefix = f"{source.config}/" if source.config else ""
-            parquet_files = [
-                f"hf://datasets/{source.hf_id}/{f}"
-                for f in files
-                if f.endswith('.parquet') and split in f and config_prefix in f
-            ]
-            if not parquet_files:
-                # Try without config prefix
-                parquet_files = [
-                    f"hf://datasets/{source.hf_id}/{f}"
-                    for f in files
-                    if f.endswith('.parquet') and split in f
-                ]
-            if parquet_files:
-                ds = load_dataset("parquet", data_files=parquet_files, streaming=True, split="train")
-                return iter(ds)
-        except Exception:
-            pass
-        raise
+    return iter(load_dataset(source.hf_id, **kwargs))
 
 
 def _load_multi_stream(source: DataSource) -> Iterator[dict]:
@@ -611,6 +614,22 @@ def curated_stream(
             del test_stream
             active_curated.append(_ActiveSource(source, source.weight))
             print(f"  ✓ {source.name} ({source.hf_id})")
+        except (TypeError, ValueError) as e:
+            if "Couldn't cast" in str(e) or "Nested data" in str(e):
+                # Schema cast error — retry with raw parquet fallback
+                try:
+                    test_stream = _load_parquet_fallback(source)
+                    next(test_stream)
+                    del test_stream
+                    source._use_parquet_fallback = True
+                    active_curated.append(_ActiveSource(source, source.weight))
+                    print(f"  ✓ {source.name} ({source.hf_id}) [parquet fallback]")
+                except Exception as e2:
+                    failed_names.append(source.name)
+                    print(f"  ✗ {source.name}: {e} (fallback also failed: {e2})")
+            else:
+                failed_names.append(source.name)
+                print(f"  ✗ {source.name}: {e}")
         except Exception as e:
             failed_names.append(source.name)
             print(f"  ✗ {source.name}: {e}")

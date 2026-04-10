@@ -267,26 +267,13 @@ def train(
             print("Starting data stream...")
 
     # Curated multi-tier mix for all modes: state-essential + reasoning + tool calling.
-    # The cognitive state needs state-demanding data regardless of whether the
-    # backbone is pretrained or trained from scratch.
     # BLT mode: encode as UTF-8 bytes (0-259) instead of BPE tokens.
     #
-    # DDP streaming fix: fsspec hangs in multiprocessing. Clear its thread refs
-    # before creating streams, and let rank 0 probe first so HF caches metadata.
-    # Reference: https://github.com/huggingface/datasets/issues/5123
-    try:
-        import fsspec
-        fsspec.asyn.iothread[0] = None
-        fsspec.asyn.loop[0] = None
-    except Exception:
-        pass
-
-    # Rank 0 probes datasets first (downloads metadata), then other ranks go.
-    # By that time HF has cached everything locally so rank 1+ probes are instant.
-    with accelerator.main_process_first():
-        if is_main:
-            mode_label = "byte-level" if blt_enabled else "token-level"
-            print(f"Using curated dataset mix ({mode_label}, state-essential + reasoning + tool calling)")
+    # With dispatch_batches=True, only rank 0 loads data and broadcasts batches.
+    # Non-main ranks skip data stream creation entirely — no duplicate HF downloads.
+    if is_main:
+        mode_label = "byte-level" if blt_enabled else "token-level"
+        print(f"Using curated dataset mix ({mode_label}, state-essential + reasoning + tool calling)")
         data_stream = curated_stream(
             tokenizer,
             seq_len=config.transformer.sequence_len,
@@ -295,6 +282,8 @@ def train(
             skip_documents=skip_docs,
             byte_mode=blt_enabled,
         )
+    else:
+        data_stream = None  # rank 1+ receives batches via dispatch_batches
 
     # Checkpoint dir
     ckpt_path = Path(checkpoint_dir)
@@ -324,12 +313,13 @@ def train(
         print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
         print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
 
-    # Background data prefetcher
+    # Background data prefetcher (rank 0 only — dispatch_batches handles distribution)
     if is_main:
         print("Starting data prefetcher (downloading initial data shard)...", flush=True)
-    prefetcher = DataPrefetcher(data_stream, tc.device_batch_size, device, prefetch_count=3)
-    if is_main:
+        prefetcher = DataPrefetcher(data_stream, tc.device_batch_size, device, prefetch_count=3)
         print(f"Prefetcher ready. Batch size: {tc.device_batch_size}")
+    else:
+        prefetcher = None
 
     # torch.compile
     should_compile = (
@@ -399,12 +389,23 @@ def train(
             if step == 0 and is_main:
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
-            input_ids, labels = prefetcher.next_batch()
+            # Rank 0 loads data and broadcasts to other ranks.
+            # Only rank 0 has a prefetcher — avoids duplicate HF downloads.
+            if is_main:
+                input_ids, labels = prefetcher.next_batch()
+                # SkyLadder: truncate to current context length
+                if ctx_len < input_ids.shape[1]:
+                    input_ids = input_ids[:, :ctx_len]
+                    labels = labels[:, :ctx_len]
+            else:
+                # Receive shape first, then data
+                input_ids = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
+                labels = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
 
-            # SkyLadder: truncate to current context length
-            if ctx_len < input_ids.shape[1]:
-                input_ids = input_ids[:, :ctx_len]
-                labels = labels[:, :ctx_len]
+            # Broadcast data from rank 0 to all ranks
+            if world_size > 1:
+                torch.distributed.broadcast(input_ids, src=0)
+                torch.distributed.broadcast(labels, src=0)
 
             # DDP no_sync for all but last micro-step
             is_last_micro = (micro_step == grad_accum - 1)
@@ -765,7 +766,8 @@ def train(
             gc.collect()
 
     # Cleanup
-    prefetcher.stop()
+    if prefetcher is not None:
+        prefetcher.stop()
     gc.enable()
 
     if is_main:
