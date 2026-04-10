@@ -454,18 +454,54 @@ def _load_hf_stream(source: DataSource) -> Iterator[dict]:
 
     For sources with sub_sources (e.g. BABILong with multiple tasks),
     round-robins across all sub-source streams.
+
+    Handles schema cast errors (nested structs in some NVIDIA datasets)
+    by falling back to parquet loading without strict schema inference.
     """
     if source.sub_sources:
         return _load_multi_stream(source)
 
-    kwargs = dict(split=source.split, streaming=True, trust_remote_code=True)
+    kwargs = dict(split=source.split, streaming=True)
     if source.config:
         # StarCoderData uses data_dir for language filtering, not name
         if 'starcoderdata' in source.hf_id:
             kwargs['data_dir'] = source.config
         else:
             kwargs['name'] = source.config
-    return iter(load_dataset(source.hf_id, **kwargs))
+
+    try:
+        return iter(load_dataset(source.hf_id, **kwargs))
+    except (TypeError, ValueError) as e:
+        if "Couldn't cast" not in str(e) and "Nested data" not in str(e):
+            raise
+        # Schema cast error — fall back to loading parquet files directly
+        # without strict type inference. This handles datasets with
+        # inconsistent nested struct schemas (e.g. Nemotron-Agentic tool_calling).
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            files = api.list_repo_files(source.hf_id, repo_type="dataset")
+            # Find parquet files matching the split
+            split = source.split or "train"
+            config_prefix = f"{source.config}/" if source.config else ""
+            parquet_files = [
+                f"hf://datasets/{source.hf_id}/{f}"
+                for f in files
+                if f.endswith('.parquet') and split in f and config_prefix in f
+            ]
+            if not parquet_files:
+                # Try without config prefix
+                parquet_files = [
+                    f"hf://datasets/{source.hf_id}/{f}"
+                    for f in files
+                    if f.endswith('.parquet') and split in f
+                ]
+            if parquet_files:
+                ds = load_dataset("parquet", data_files=parquet_files, streaming=True, split="train")
+                return iter(ds)
+        except Exception:
+            pass
+        raise
 
 
 def _load_multi_stream(source: DataSource) -> Iterator[dict]:

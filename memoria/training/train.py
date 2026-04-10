@@ -271,22 +271,30 @@ def train(
     # backbone is pretrained or trained from scratch.
     # BLT mode: encode as UTF-8 bytes (0-259) instead of BPE tokens.
     #
-    # DDP: each rank creates its own stream (different random routing = data diversity).
-    # Stagger startup so ranks don't hammer HF API simultaneously during probe phase.
-    if rank > 0:
-        import time as _t
-        _t.sleep(rank * 30)  # rank 1 waits 30s for rank 0 to finish probing
-    if is_main:
-        mode_label = "byte-level" if blt_enabled else "token-level"
-        print(f"Using curated dataset mix ({mode_label}, state-essential + reasoning + tool calling)")
-    data_stream = curated_stream(
-        tokenizer,
-        seq_len=config.transformer.sequence_len,
-        synthetic_data=synthetic_data if synthetic_data else None,
-        code_languages=["python", "javascript", "rust", "go"],
-        skip_documents=skip_docs,
-        byte_mode=blt_enabled,
-    )
+    # DDP streaming fix: fsspec hangs in multiprocessing. Clear its thread refs
+    # before creating streams, and let rank 0 probe first so HF caches metadata.
+    # Reference: https://github.com/huggingface/datasets/issues/5123
+    try:
+        import fsspec
+        fsspec.asyn.iothread[0] = None
+        fsspec.asyn.loop[0] = None
+    except Exception:
+        pass
+
+    # Rank 0 probes datasets first (downloads metadata), then other ranks go.
+    # By that time HF has cached everything locally so rank 1+ probes are instant.
+    with accelerator.main_process_first():
+        if is_main:
+            mode_label = "byte-level" if blt_enabled else "token-level"
+            print(f"Using curated dataset mix ({mode_label}, state-essential + reasoning + tool calling)")
+        data_stream = curated_stream(
+            tokenizer,
+            seq_len=config.transformer.sequence_len,
+            synthetic_data=synthetic_data if synthetic_data else None,
+            code_languages=["python", "javascript", "rust", "go"],
+            skip_documents=skip_docs,
+            byte_mode=blt_enabled,
+        )
 
     # Checkpoint dir
     ckpt_path = Path(checkpoint_dir)
