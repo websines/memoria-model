@@ -326,13 +326,15 @@ def train(
         print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
         print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
 
-    # Background data prefetcher (rank 0 only — dispatch_batches handles distribution)
+    # Data loading: synchronous on rank 0, broadcast to other ranks.
+    # No background thread prefetcher — fsspec's async HTTP client crashes
+    # in background threads (known issue: event loop conflicts).
+    # The data stream iterator is called directly in the training loop.
+    # GPU idles ~50-100ms between steps for cached data — acceptable tradeoff
+    # vs crashing every run.
     if is_main:
-        print("Starting data prefetcher (downloading initial data shard)...", flush=True)
-        prefetcher = DataPrefetcher(data_stream, tc.device_batch_size, device, prefetch_count=3)
-        print(f"Prefetcher ready. Batch size: {tc.device_batch_size}")
-    else:
-        prefetcher = None
+        print("Data stream ready (synchronous loading, no prefetcher)")
+    prefetcher = None  # kept as None for cleanup code compatibility
 
     # torch.compile
     should_compile = (
@@ -402,16 +404,29 @@ def train(
             if step == 0 and is_main:
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
-            # Rank 0 loads data and broadcasts to other ranks.
-            # Only rank 0 has a prefetcher — avoids duplicate HF downloads.
+            # Rank 0 loads data synchronously and broadcasts to other ranks.
             if is_main:
-                input_ids, labels = prefetcher.next_batch()
+                seqs = []
+                for _ in range(tc.device_batch_size):
+                    while True:
+                        try:
+                            seq = next(data_stream)
+                            seqs.append(seq)
+                            break
+                        except StopIteration:
+                            raise RuntimeError("Data stream exhausted — should be infinite")
+                        except Exception as e:
+                            # Skip bad samples (network glitches, malformed data)
+                            if step == 0:
+                                print(f"  [data] Skipping bad sample: {str(e)[:60]}")
+                            continue
+                input_ids = torch.stack([s['input_ids'] for s in seqs]).to(device)
+                labels = torch.stack([s['labels'] for s in seqs]).to(device)
                 # SkyLadder: truncate to current context length
                 if ctx_len < input_ids.shape[1]:
                     input_ids = input_ids[:, :ctx_len]
                     labels = labels[:, :ctx_len]
             else:
-                # Receive shape first, then data
                 input_ids = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
                 labels = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
 
