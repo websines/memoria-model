@@ -358,7 +358,8 @@ CURATED_SOURCES: list[DataSource] = [
     # Genetics, pharmacogenomics, CRISPR, RNA-seq, synthetic biology.
     # Reasoning traces teach structured scientific thinking.
     DataSource(name="nemotron_science", hf_id="nvidia/Nemotron-Science-v1",
-               weight=0.03, format_fn=fmt.format_nemotron_science, tier="reasoning"),
+               weight=0.03, format_fn=fmt.format_nemotron_science, tier="reasoning",
+               split="MCQ"),  # available: MCQ, RQA
     # OpenR1-Math-220k: 220K math problems with multiple DeepSeek R1 reasoning traces.
     # 2-4 verified solutions per problem. Dual verification (Math Verify + Llama-3.3-70B).
     # 16K token budget per generation. Olympiad + K-12 + competition sources.
@@ -375,10 +376,10 @@ CURATED_SOURCES: list[DataSource] = [
                weight=0.02, format_fn=fmt.format_xlam_fc, tier="tool_calling"),
     DataSource(name="hermes_fc", hf_id="NousResearch/hermes-function-calling-v1",
                weight=0.015, format_fn=fmt.format_hermes_fc, tier="tool_calling"),
-    DataSource(name="toolbench", hf_id="tuandunghcmut/toolbench-v1",
-               weight=0.01, format_fn=fmt.format_toolbench, tier="tool_calling"),
+    # toolbench: tuandunghcmut/toolbench-v1 removed from Hub — dropped
     DataSource(name="when2call", hf_id="nvidia/When2Call",
-               weight=0.01, format_fn=fmt.format_when2call, tier="tool_calling", split="train_sft"),
+               weight=0.01, format_fn=fmt.format_when2call, tier="tool_calling",
+               split="mcq"),  # available: llm_judge, mcq
     DataSource(name="xlam_irrelevance", hf_id="MadeAgents/xlam-irrelevance-7.5k",
                weight=0.005, format_fn=fmt.format_xlam_irrelevance, tier="tool_calling"),
     DataSource(name="toolace", hf_id="Team-ACE/ToolACE",
