@@ -518,8 +518,7 @@ class MemoriaModel(nn.Module):
         if self.blt_enabled:
             patches, _blt_byte_hidden = self.byte_encoder(idx)
             T = patches.shape[1]  # global backbone sees P patches, not T bytes
-            x = patches
-            x = F.rms_norm(x, (x.size(-1),))
+            x = patches  # already RMS-normed by ByteEncoder.out_norm
         else:
             x = self.transformer.wte(idx)
             x = F.rms_norm(x, (x.size(-1),))
@@ -712,12 +711,18 @@ class MemoriaModel(nn.Module):
                 x = x + loop_signal.unsqueeze(0).unsqueeze(0)
 
                 # Step 2: Re-run upper transformer layers
+                # Gradient checkpointing is REQUIRED here: the halt_logit_list
+                # keeps tensors in the graph across loop iterations. Without
+                # checkpointing, compiled blocks' saved tensors from iteration N
+                # get version-clobbered by iteration N+1, causing RuntimeError
+                # during backward ("modified by an inplace operation").
                 for j, block in enumerate(upper_blocks):
                     layer_global = upper_start + j
-                    x = block(
-                        x, x0, cos, sin,
+                    x = torch.utils.checkpoint.checkpoint(
+                        block, x, x0, cos, sin,
                         self.transformer.resid_lambdas[layer_global],
                         self.transformer.x0_lambdas[layer_global],
+                        use_reentrant=False,
                         beliefs=dsa_beliefs,
                     )
 
@@ -1309,8 +1314,10 @@ class MemoriaModel(nn.Module):
             # BLT: DFlash predicts bytes (260 classes) instead of tokens (151K)
             spec_head_fn = self.transformer.head
             if self.blt_enabled:
-                spec_head_fn = lambda h: self.byte_decoder.byte_heads[0](
-                    F.rms_norm(h, (h.size(-1),))
+                _dp = self.byte_decoder.down_proj
+                _bh = self.byte_decoder.byte_heads[0]
+                spec_head_fn = lambda h: _bh(
+                    F.rms_norm(_dp(h), (_dp.out_features,))
                 )
             draft_logits = self.dflash_head(
                 context, lm_head_fn=spec_head_fn,
@@ -1445,6 +1452,7 @@ class MemoriaModel(nn.Module):
         self.state.edge_relations.detach_()
         self.state.goal_embeddings.detach_()
         self.state.goal_status_logits.detach_()
+        self.state.edge_direction.detach_()
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

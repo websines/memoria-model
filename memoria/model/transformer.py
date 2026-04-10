@@ -136,7 +136,7 @@ class SlidingWindowAttention(nn.Module):
             k = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
             v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
 
-        if _flash_attn_available and x.is_cuda and T <= self.window_size:
+        if _flash_attn_available and x.is_cuda:
             # FlashAttention-2: native sliding window for sequences within window
             y = flash_attn_func(
                 q, k, v,

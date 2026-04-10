@@ -248,14 +248,16 @@ class DFlashDraftHead(nn.Module):
         Returns:
             (context, injection) tuple
         """
-        # Collect tapped features
+        # Collect tapped features — all tap indices must be present
         tapped = []
+        missing = [idx for idx in self.tap_indices if idx not in layer_hiddens]
+        if missing:
+            raise ValueError(
+                f"Missing tapped layers {missing}. "
+                f"Available: {sorted(layer_hiddens.keys())}, expected: {self.tap_indices}"
+            )
         for idx in self.tap_indices:
-            if idx in layer_hiddens:
-                tapped.append(layer_hiddens[idx])
-
-        if not tapped:
-            raise ValueError("No target hidden states available at tap indices")
+            tapped.append(layer_hiddens[idx])
 
         # Concat along feature dim and project: [B, T, D*n_taps] → [B, T, D]
         combined = torch.cat(tapped, dim=-1)
@@ -331,7 +333,9 @@ class DFlashDraftHead(nn.Module):
                 ignore_index=-1, reduction='none',
             ).view(B, S)
 
-            loss = (per_pos_loss * weights).sum(dim=-1).mean() / weights.sum()
+            valid_mask = (target_tokens != -1).float()
+            loss = (per_pos_loss * weights).sum(dim=-1) / (weights * valid_mask).sum(dim=-1).clamp(min=1e-8)
+            loss = loss.mean()
         else:
             loss = F.cross_entropy(
                 logits.reshape(-1, V), target_tokens.reshape(-1),
@@ -341,7 +345,7 @@ class DFlashDraftHead(nn.Module):
         if streak_weight is not None:
             sw_val = streak_weight.item() if isinstance(streak_weight, Tensor) else streak_weight
             if sw_val > 0:
-                probs = F.softmax(logits, dim=-1)
+                probs = F.softmax(logits.float(), dim=-1)
                 p_correct = probs.gather(
                     -1, target_tokens.clamp(min=0).unsqueeze(-1),
                 ).squeeze(-1)
@@ -435,12 +439,12 @@ class DFlashDraftHead(nn.Module):
                 hybrid_norm = hybrid_raw.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                 hybrid = hybrid_raw * (target_norm / hybrid_norm)
 
-                # Add positional encoding (same as standard forward)
-                pos_ids = torch.arange(hybrid.shape[1], device=hybrid.device)
-                hybrid = hybrid + self.pos_embed(pos_ids)
+            # Positional encoding OUTSIDE no_grad so pos_embed gets OPUT gradients
+            pos_ids = torch.arange(hybrid.shape[1], device=hybrid.device)
+            hybrid = hybrid + self.pos_embed(pos_ids)
 
             # Second forward pass through draft layers with hybrid input
-            # (gradients flow through draft layers, not through hybrid construction)
+            # (gradients flow through draft layers + pos_embed, not through hybrid construction)
             draft = hybrid
             for layer in self.layers:
                 draft = layer(draft, context, injection=injection)

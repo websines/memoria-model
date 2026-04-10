@@ -257,7 +257,7 @@ class WritePath(nn.Module):
             flat_pos = m_idx[i].item()
             t = flat_pos % T  # position within sequence
             candidates.append(WriteCandidate(
-                belief_vector=obs_for_candidates[flat_pos],
+                belief_vector=obs_for_candidates[flat_pos].detach(),
                 matched_slot=m_slots[i].item(),
                 match_similarity=m_sims[i].item(),
                 source_position=t,

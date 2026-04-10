@@ -88,7 +88,7 @@ class LocalDeltaProduct(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self._use_fla:
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast(x.device.type, dtype=torch.bfloat16):
                 out, _, _ = self.dp(x)
             return out.to(x.dtype)
         else:
@@ -378,6 +378,7 @@ class ByteDecoder(nn.Module):
         stats['loss_byte_h0'] = loss.item()
 
         # Heads 1+: multi-byte ahead prediction (for DFlash multi-step)
+        n_active_heads = 1  # head 0 is always active
         for k in range(1, len(all_logits)):
             # Head k predicts byte k positions ahead
             if T > k:
@@ -389,10 +390,11 @@ class ByteDecoder(nn.Module):
                     ignore_index=-1,
                 )
                 loss = loss + head_loss
+                n_active_heads += 1
                 stats[f'loss_byte_h{k}'] = head_loss.item()
 
-        # Average over number of heads
-        loss = loss / len(all_logits)
+        # Average over active heads only (skip inactive for short sequences)
+        loss = loss / n_active_heads
         stats['loss_byte_total'] = loss.item()
 
         return loss, stats

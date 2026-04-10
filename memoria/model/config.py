@@ -133,8 +133,8 @@ class TransformerConfig:
     # training the model to produce weight distributions robust to low-bit compression.
     # CAGE post-step correction nudges weights toward the quantization grid.
     # Set weight_qat_bits=0 to disable.
-    weight_qat_bits: int = 4           # default bit-width for weight QAT (0 = disabled)
-    weight_qat_mlp_bits: int = 3       # MLP weights get more aggressive quantization (0 = use weight_qat_bits)
+    weight_qat_bits: int = 0           # default: disabled. Set to 4 for QAT training.
+    weight_qat_mlp_bits: int = 0       # MLP-specific bits (0 = use weight_qat_bits)
 
     # BLT (Byte Latent Transformer) — tokenizer-free byte-level I/O
     # Replaces token embedding/LM head with byte encoder/decoder.
@@ -147,7 +147,7 @@ class TransformerConfig:
     # Reference: EvaByte (2025) — linear attention + bytes
     blt_enabled: bool = False          # enable byte-level I/O (replaces token vocab)
     blt_local_dim: int = 384           # local encoder/decoder hidden dim (< n_embd)
-    blt_patch_size: int = 6            # bytes per patch (6 ≈ BPE token length)
+    blt_patch_size: int = 8            # bytes per patch (131072 / 8 = 16384 exact)
     blt_local_layers: int = 2          # DeltaProduct layers in encoder AND decoder
     blt_byte_vocab: int = 260          # 256 bytes + BOS + EOS + PAD + SEP
     blt_n_byte_heads: int = 4          # multi-byte prediction heads (for DFlash)
@@ -496,7 +496,7 @@ def full_config() -> MemoriaConfig:
             # BLT byte-level (eliminates 233M embedding bottleneck)
             blt_enabled=True,
             blt_local_dim=384,
-            blt_patch_size=6,
+            blt_patch_size=8,
             blt_local_layers=2,
             blt_n_byte_heads=4,
 

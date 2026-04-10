@@ -105,7 +105,7 @@ class StateInterfaceLayer(nn.Module):
             goal_priorities=goal_priorities,
             current_step=current_step,
             belief_cache=belief_cache,
-            depth_bias=self.depth_bias.item(),
+            depth_bias=self.depth_bias,
         )
         hidden = hidden + belief_info  # residual connection
 

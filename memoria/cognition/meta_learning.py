@@ -158,7 +158,7 @@ class SPSAController:
     def _apply_update(self, state: CognitiveState, fe_minus_mean: float):
         """Compute gradient from mean F(+Δ) vs mean F(-Δ), update and clamp."""
         with torch.no_grad():
-            gradient = (self._fe_plus_mean - fe_minus_mean) / (2.0 * self._delta + EPSILON)
+            gradient = (self._fe_plus_mean - fe_minus_mean) / (2.0 * self._delta)
             new_values = self._original_values - self.step_size * gradient
 
             # Clamp each parameter to its valid range

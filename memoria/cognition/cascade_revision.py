@@ -62,15 +62,10 @@ def cascade_revision(
     active_edges = active_edge_mask.nonzero(as_tuple=False).squeeze(-1)
     causal_mask = state.edge_causal_obs[active_edges] > 0
 
-    # Also include edges created by the learned EdgeProposer with positive weight
-    # (they represent learned causal relationships even without explicit obs count)
-    positive_weight = state.edge_weights.data[active_edges].abs() > EPSILON
-    causal_or_learned = causal_mask | positive_weight
-
-    if not causal_or_learned.any():
+    if not causal_mask.any():
         return stats
 
-    causal_edges = active_edges[causal_or_learned]
+    causal_edges = active_edges[causal_mask]
     srcs = state.edge_src[causal_edges]
     tgts = state.edge_tgt[causal_edges]
     weights = state.edge_weights.data[causal_edges].abs()

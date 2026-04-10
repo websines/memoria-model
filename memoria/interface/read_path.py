@@ -365,7 +365,7 @@ class ReadPath(nn.Module):
         # At inference: positions with gate < threshold skip the expensive
         # Hopfield attention entirely. At training: soft gate for gradient flow.
         gate_raw = self.read_gate(hidden)  # [B, T, 1]
-        gate_raw = gate_raw.abs().clamp_min(1e-6).sqrt() * gate_raw.sign()
+        gate_raw = gate_raw / (gate_raw.abs() + 1e-6).sqrt()
         gate = torch.sigmoid(gate_raw)     # [B, T, 1]
 
         # At inference, identify which positions need retrieval

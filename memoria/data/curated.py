@@ -680,7 +680,8 @@ def curated_stream(
         text = None
         source_name = "unknown"
 
-        # Check curated sources first
+        # Check curated sources first.
+        # If the selected source is dead, re-roll to avoid redirecting to FineWeb.
         for active, norm_weight in curated_weights:
             cumulative += norm_weight
             if r < cumulative:
@@ -688,8 +689,20 @@ def curated_stream(
                     text = active.next_text()
                     source_name = active.source.name
                     if text is None:
-                        # Source exhausted, skip to fallback
                         active.alive = False
+                if not active.alive:
+                    # Dead source — re-roll from alive curated sources
+                    alive_sources = [(a, w) for a, w in curated_weights if a.alive]
+                    if alive_sources:
+                        total_w = sum(w for _, w in alive_sources)
+                        r2 = random.random() * total_w
+                        c2 = 0.0
+                        for a2, w2 in alive_sources:
+                            c2 += w2
+                            if r2 < c2:
+                                text = a2.next_text()
+                                source_name = a2.source.name if text else source_name
+                                break
                 break
 
         # FineWeb
@@ -747,7 +760,7 @@ def curated_stream(
             yield {
                 "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
                 "labels": torch.tensor(chunk[1:], dtype=torch.long),
-                "source": source_name,
+                "source": "mixed" if len(buffer) > 0 else source_name,
             }
 
 

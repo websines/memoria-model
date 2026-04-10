@@ -407,7 +407,7 @@ Hash-based N-gram lookup inspired by DeepSeek Engram (arXiv:2601.07372):
 1. **Tokenizer compression**: NFKC + lowercase + accent strip ("Apple"/"apple"/"APPLE" → same ID, ~23% vocab reduction)
 2. **N-gram hashing**: multiplicative-XOR hash for 2-grams and 3-grams across `n_heads` hash tables
 3. **Retrieval**: `hash % table_size` → embedding lookup (O(1) per token)
-4. **Context-aware gating**: `gate = sigmoid(sqrt_sign(hidden · retrieved / √d))` — suppresses hash collisions
+4. **Context-aware gating**: `gate = sigmoid(x / (|x| + ε)^0.5)` where `x = hidden · retrieved / √d` — suppresses hash collisions while preserving gradient flow
 
 Injected once at layer 0, before any transformer block. Handles static patterns (function signatures, import idioms, common phrases) so beliefs can focus on dynamic/experiential memory.
 
@@ -437,6 +437,7 @@ The cognitive state is a persistent, slot-based world model with four regions:
 - `beliefs`: `[max_beliefs, D]` — nn.Parameter, trained by optimizer
 - **Polar representation**: radius = precision (confidence), angle = content direction
 - Empty slots: radius ≈ 0 (available for allocation)
+- Deallocation resets all metadata (access counts, provisional state, MESU variance, confirmed/contradicted counts) and cleans up dangling edges
 - Dot products between beliefs are naturally precision-weighted (large radius dominates)
 - Typical: 16K-65K slots, 256-dim
 
@@ -506,7 +507,7 @@ Hopfield-style content-addressable retrieval with goal modulation:
 
 1. **Query projection**: `hidden [B, T, H] → query [B, T, num_heads, D]`
 2. **Goal modulation**: PARL per-head routing (`GoalRouter`) assigns each head to a different active goal via Gumbel-Softmax. Legacy: unified `goal_gate` bias across all heads.
-3. **Depth-conditioned temperature**: early interfaces retrieve broadly, late interfaces focus
+3. **Depth-conditioned temperature**: `(log_temperature + depth_bias).exp()` — early interfaces retrieve broadly, late interfaces focus. `depth_bias` is a learned nn.Parameter (not detached)
 4. **Top-k sparse attention**: only k beliefs per position (32-64), avoids O(N_active) cost
 5. **Post-retrieval convolution**: depthwise 1D conv adds coherence between positions (Engram ShortConv)
 6. **Read gate**: per-position sigmoid — "does this position even need beliefs?"
@@ -547,8 +548,12 @@ All losses are computed inside `forward()` so the logits tensor `[B, T, vocab_si
 
 ```
 _uw(L, s) = L / (2·exp(2s)) + s
-L_total = _uw(L_token, σ_token) + α · _uw(L_fe, σ_fe) + α · _uw(L_aux, σ_aux) + w_draft · L_draft + w_dsa_kl · L_dsa_kl
+L_aux = w_util·L_utility + w_surp·L_surprise + w_halt·L_halt + L_ponder + 0.01·L_jac
+L_total = _uw(L_token, σ_token) + α·_uw(L_fe, σ_fe) + α·_uw(L_aux, σ_aux)
+        + w_draft·L_draft + w_draft·L_self_correct + w_dsa_kl·L_dsa_kl
 ```
+
+Draft and DSA KL losses are NOT alpha-gated — they train from step 0.
 
 **Pretrained mode** uses fixed weights:
 
@@ -622,6 +627,9 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 18b | BLT byte decoder | 0.01 | Down projection + LocalDeltaProduct + 4 multi-byte heads |
 | 19 | DFlash draft head (+ KV injection + OPUT) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block, OPUT self-correction. Attention 4-bit, MLP 3-bit, injection 3-bit RotorQuant. |
 | 20 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
+| 21 | Working memory prefix | 0.5 | Learnable scratchpad tokens (scalar LR) |
+| 22 | Refinement probe + gate | 0.01 / 0.5 | Halt decision (interface LR) + lifeline/loop encoding (scalar LR) |
+| 23 | Engram cache | 0.01 | N-gram hash tables, value projection, gate norms |
 | — | GoalRouter (PARL per-head routing) | 0.01 | Included in group 5 (interface params) |
 | M | 2D matrix params (attention, MLP) | 0.04 | **Muon optimizer** (separate from AdamW) |
 
@@ -797,7 +805,7 @@ For each downstream belief at depth d:
   precision_var += variance_boost × decay_factor^d  # rightfully uncertain
 ```
 
-Prevents orphaned high-precision children of corrected parents. Only causal edges participate (not associative). Immutable beliefs skip cascade.
+Prevents orphaned high-precision children of corrected parents. Only causally-observed edges participate (`edge_causal_obs > 0`); pure Hebbian/associative edges are excluded. Immutable beliefs skip cascade.
 
 #### Structural Plasticity
 
@@ -816,7 +824,9 @@ Unlike text-based CoT, refinement loops reason in latent space:
 ```
 For loop_i in range(max_loops):
   1. Loop-index encoding (additive signal, fraction of max loops)
-  2. Re-run upper transformer blocks on current hidden states
+  2. Re-run upper transformer blocks (gradient checkpointed — required
+     because halt_logit_list keeps tensors in graph across iterations,
+     and compiled blocks' saved tensors would version-conflict otherwise)
   3. Lifeline anchor: real tokens += gate × original_hidden (prevent drift)
      Working memory suffix: evolves freely (true scratchpad)
   3b. Predictive refinement (loop > 0): contractive scaling + per-position routing
@@ -825,7 +835,7 @@ For loop_i in range(max_loops):
   6. HaltingHead probe: P(halt) — stop early if confident enough
 ```
 
-- **Training**: teacher forcing with random oracle loop count; halt probe learns from random targets
+- **Training**: teacher forcing with deterministic oracle loop count (derived from input hash for DDP sync); halt probe learns from diverse targets via `binary_cross_entropy_with_logits`
 - **Inference**: halt when P(halt) > threshold or max loops reached
 - **Cost**: ~3-4× per token (amortized by DFlash speculative decoding ~7-8× + predictive refinement)
 - **Advantage over text CoT**: no output tokens wasted, vector representations richer than language, TTT adapts weights during reasoning, different beliefs retrieved each loop as understanding shifts
@@ -947,9 +957,9 @@ Design principle: **~45% of training data genuinely requires persistent cross-co
 3. **Causal chains**: A→B→C reasoning with intervention queries
 4. **Precision calibration**: Multiple sources stating facts with different confidence levels
 
-### DataPrefetcher
+### Data Loading
 
-Background thread that pre-loads batches into a queue (size 3). Handles error propagation and timeout (120s). Stream resumption on checkpoint reload uses HuggingFace `skip()` for O(1) seek past consumed data.
+Synchronous loading on rank 0, broadcast to other ranks. Background prefetcher was removed due to fsspec async HTTP client crashes in background threads. GPU idles ~50-100ms between steps for cached data. Stream resumption on checkpoint reload uses HuggingFace `skip()` for O(1) seek past consumed data. Dead curated sources re-roll from alive sources (not redirected to FineWeb).
 
 ## DDP (Multi-GPU) Strategy
 
@@ -958,7 +968,7 @@ Uses HuggingFace Accelerate with `find_unused_parameters=True` (cognitive state 
 | Component | Sync Mechanism |
 |-----------|---------------|
 | Transformer + interface params | DDP gradient averaging (automatic) |
-| Cognitive state (beliefs, edges, goals) | Manual broadcast from rank 0 before each forward, gather candidates after |
+| Cognitive state (beliefs, edges, goals, all buffers + params) | Programmatic broadcast of all `_buffers` and `_parameters` from rank 0 before each forward, gather candidates after |
 | TTT deltas (delta_A, delta_B) | NOT synchronized (requires_grad=False, modified via .data) — each rank adapts independently |
 | Pass 2 | Runs on rank 0 only, barrier after completion |
 
@@ -980,13 +990,13 @@ Raw bytes [B, T_bytes]
     byte_embed(260 → local_dim=384)
     + causal N-gram conv (8-byte receptive field, learned)
     + 2× LocalDeltaProduct (O(T), 1 Householder, head_dim=64)
-    + strided Conv1d pool (stride=patch_size=6) → patches
+    + strided Conv1d pool (stride=patch_size=8) → patches
     + Linear(local_dim → n_embd=768)
   → patches [B, P, 768]
   → byte_hidden [B, T_bytes, 384] (skip connection for decoder)
     + EngramCache injection (hash-table byte N-grams, O(1) lookup)
 
-      ↓ (P = T_bytes / 6, ~4-6× shorter than bytes)
+      ↓ (P = T_bytes / 8, ~8× shorter than bytes)
 
   Global DeltaProduct Backbone (unchanged, operates on patches)
     12-48 layers × HHHHL pattern
@@ -1024,7 +1034,7 @@ Raw bytes [B, T_bytes]
 Same GatedDeltaProduct kernel as global backbone but lighter:
 - 1 Householder reflection (vs 3 in global) — byte patterns are simpler
 - local_dim=384 (vs n_embd=768) — bytes need less capacity
-- O(T) on byte sequences — handles 4-6× longer sequences naturally
+- O(T) on byte sequences — handles ~8× longer sequences naturally
 - Falls back to causal conv + gated MLP on CPU (no FLA Triton)
 
 ### Multi-Byte Prediction Heads
@@ -1165,11 +1175,11 @@ TTT is the self-improvement mechanism. During BOTH training and inference:
 | Feature | Source | Description |
 |---------|--------|-------------|
 | Meta-learned initialization | TTT-E2E (arXiv:2512.23675) | Deltas start from learned warm point, not zero |
-| Titans-style decay gate | Titans (arXiv:2501.00663) | Learned adaptive forgetting (largest Titans performance contributor) |
-| Large-chunk accumulation | LaCT (arXiv:2505.23884) | Accumulate gradients over multiple chunks before stepping |
+| Titans-style decay gate | Titans (arXiv:2501.00663) | Per-layer learned adaptive forgetting. Decay applied only to the current layer's deltas (not all layers). |
+| Large-chunk accumulation | LaCT (arXiv:2505.23884) | Per-layer accumulation counters; accumulate gradients over multiple chunks before stepping |
 | Multi-step inner loop | DeltaProduct (arXiv:2502.10297) | N smaller steps per chunk for expressiveness |
 | Surprise gating | Titans-inspired | Adaptive thresholds (mean ± 2σ) filter OOD and boring inputs |
-| Loss rollback | Quality protection | Snapshot deltas before update; revert if loss increased |
+| Loss rollback | Quality protection | Snapshot deltas BEFORE decay; revert if loss increased (restores pre-decay state) |
 | Belief TTT | Memoria-specific | Update belief vectors using write path observation errors at inference |
 
 ## Cognitive Seed (Cross-Run Transfer)
@@ -1339,7 +1349,7 @@ At 1M tokens with W=128K, D=128: ~38 MB MLA KV vs ~3 GB uncompressed.
 - Belief store > 95% capacity
 - TTT delta norm > 10.0 (explosion)
 - Loss spike > 3× smoothed average
-- NaN/Inf in any loss component
+- NaN/Inf in any loss component (detected BEFORE optimizer step; step is skipped to prevent corrupting optimizer momentum/variance)
 
 ## Inference
 

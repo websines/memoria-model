@@ -142,6 +142,8 @@ class InPlaceTTT(nn.Module):
         # Short-term EMA tracks recent surprise.
         # Long-term momentum tracks the overall surprise level.
         # Variance enables adaptive thresholds instead of fixed 0.1/3.0 ratios.
+        # Cold-start at 0.0: all updates accepted for first ~100 steps
+        # (no OOD protection). Intentional for scratch training where all data is novel.
         self._surprise_ema: float = 0.0         # short-term EMA (fast)
         self._surprise_momentum: float = 0.0    # long-term momentum (slow)
         self._surprise_variance: float = 1.0    # variance of surprise deviation
@@ -153,7 +155,7 @@ class InPlaceTTT(nn.Module):
         # ── Large-chunk gradient accumulation buffers (LaCT) ──
         self._grad_accum_A: dict[str, Tensor] = {}
         self._grad_accum_B: dict[str, Tensor] = {}
-        self._accum_count: int = 0
+        self._accum_count: dict[str, int] = {}  # per-layer accumulation counters
 
     # ── Meta-learned init ──────────────────────────────────────────────────────
 
@@ -173,11 +175,16 @@ class InPlaceTTT(nn.Module):
                 self.delta_A[key].data = F.normalize(self.delta_A[key].data, dim=0)
                 self.delta_B[key].data = F.normalize(self.delta_B[key].data, dim=0)
 
-    def apply_decay(self, hidden: Tensor):
-        """Apply learned Titans-style decay to all deltas before TTT step.
+    def apply_decay(self, hidden: Tensor, layer_key: str | None = None):
+        """Apply learned Titans-style decay to deltas before TTT step.
 
         The decay gate learns when to forget vs retain delta adaptations.
         High alpha (near 1) = preserve deltas. Low alpha (near 0) = forget.
+
+        Args:
+            hidden: hidden states for computing decay gate
+            layer_key: if provided, only decay this layer's deltas.
+                If None, decay all layers (for backward compat).
 
         Reference: Titans (Google, arXiv:2501.00663) — learned decay is the
         single largest contributor to Titans performance.
@@ -185,9 +192,14 @@ class InPlaceTTT(nn.Module):
         with torch.no_grad():
             pooled = hidden.mean(dim=(0, 1))  # [D]
             alpha = torch.sigmoid(self.decay_gate(pooled))  # scalar in (0, 1)
-            for key in self.delta_A:
-                self.delta_A[key].data.mul_(alpha)
-                self.delta_B[key].data.mul_(alpha)
+            if layer_key is not None:
+                if layer_key in self.delta_A:
+                    self.delta_A[layer_key].data.mul_(alpha)
+                    self.delta_B[layer_key].data.mul_(alpha)
+            else:
+                for key in self.delta_A:
+                    self.delta_A[key].data.mul_(alpha)
+                    self.delta_B[key].data.mul_(alpha)
             self._last_decay_alpha = alpha.item()
         return alpha.item()
 
@@ -317,9 +329,6 @@ class InPlaceTTT(nn.Module):
         if key not in self.delta_A:
             return
 
-        # Apply learned decay before update (Titans-style, arXiv:2501.00663)
-        self.apply_decay(hidden_pre_delta)
-
         A = self.delta_A[key]  # [D, R]
         B = self.delta_B[key]  # [R, D]
         step_size = self.log_step_size[key].exp().item()
@@ -327,9 +336,12 @@ class InPlaceTTT(nn.Module):
         D = self.hidden_dim
         h = hidden_pre_delta  # [B, T, D]
 
-        # ── Snapshot deltas for rollback ──
+        # ── Snapshot deltas for rollback (BEFORE decay) ──
         A_snapshot = A.data.clone()
         B_snapshot = B.data.clone()
+
+        # Apply learned decay to THIS layer only (Titans-style, arXiv:2501.00663)
+        self.apply_decay(hidden_pre_delta, layer_key=key)
 
         # Current output with delta: h' = h + h @ B^T @ A^T
         h_delta = h + F.linear(F.linear(h, B), A)  # [B, T, D]
@@ -364,7 +376,6 @@ class InPlaceTTT(nn.Module):
         one_hot = torch.zeros_like(probs)
         one_hot.scatter_(2, t_sample.clamp(min=0).unsqueeze(-1), 1.0)
         mask = valid.unsqueeze(-1).float()
-        n = max(h_for_grad.reshape(-1, D).shape[0], 1)
 
         # ── Multi-step inner loop (DeltaProduct, arXiv:2502.10297) ──
         # Take ttt_inner_steps smaller gradient steps instead of one large step.
@@ -381,8 +392,8 @@ class InPlaceTTT(nn.Module):
             grad_flat = grad_h.reshape(-1, D)
 
             hB = h_flat @ B.T  # [N, R]
-            grad_A = grad_flat.T @ hB / n
-            grad_B = A.T @ (grad_flat.T @ h_flat) / n
+            grad_A = grad_flat.T @ hB
+            grad_B = A.T @ (grad_flat.T @ h_flat)
 
             # ── Large-chunk accumulation (LaCT, arXiv:2505.23884) ──
             # Accumulate gradients over ttt_accum_steps chunks; apply once.
@@ -393,11 +404,10 @@ class InPlaceTTT(nn.Module):
                     self._grad_accum_B[key] = torch.zeros_like(grad_B)
                 self._grad_accum_A[key] += grad_A
                 self._grad_accum_B[key] += grad_B
-                self._accum_count += 1
+                self._accum_count[key] = self._accum_count.get(key, 0) + 1
 
-                n_layers = len(self._ttt_layer_list)
-                if self._accum_count < self.ttt_accum_steps * n_layers:
-                    # Not enough chunks accumulated yet — defer the step
+                if self._accum_count[key] < self.ttt_accum_steps:
+                    # Not enough chunks accumulated for this layer — defer
                     return
 
                 # Average accumulated gradients and apply
@@ -405,15 +415,14 @@ class InPlaceTTT(nn.Module):
                 grad_B = self._grad_accum_B[key] / self.ttt_accum_steps
                 self._grad_accum_A[key].zero_()
                 self._grad_accum_B[key].zero_()
-                # Reset counter only after the last layer has been processed
-                if key == str(self._ttt_layer_list[-1]):
-                    self._accum_count = 0
+                self._accum_count[key] = 0
 
             A.data -= inner_step_size * grad_A
             B.data -= inner_step_size * grad_B
-            # LaCT-style L2 normalization constrains delta magnitude (arXiv:2505.23884)
-            A.data = F.normalize(A.data, dim=0)
-            B.data = F.normalize(B.data, dim=0)
+            # Clamp delta magnitude to prevent explosion (replaces LaCT L2 normalization
+            # which made log_step_size ineffective for magnitude control)
+            A.data.clamp_(-2.0, 2.0)
+            B.data.clamp_(-2.0, 2.0)
 
         else:
             # Multi-step path: recompute gradient at each updated position
@@ -428,8 +437,8 @@ class InPlaceTTT(nn.Module):
                 grad_flat_curr = grad_h_curr.reshape(-1, D)
 
                 hB_curr = h_flat_curr @ B.T           # [N, R]
-                grad_A_inner = grad_flat_curr.T @ hB_curr / n
-                grad_B_inner = A.T @ (grad_flat_curr.T @ h_flat_curr) / n
+                grad_A_inner = grad_flat_curr.T @ hB_curr
+                grad_B_inner = A.T @ (grad_flat_curr.T @ h_flat_curr)
 
                 A.data -= inner_step_size * grad_A_inner
                 B.data -= inner_step_size * grad_B_inner

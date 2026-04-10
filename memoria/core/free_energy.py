@@ -54,7 +54,7 @@ def power_spherical_entropy(kappa: Tensor, d: int) -> Tensor:
         - torch.lgamma(alpha + beta_val)
     )
     entropy = log_norm - kappa * (
-        math.log(2) + torch.digamma(alpha) - torch.digamma(alpha + torch.tensor(beta_val, device=kappa.device))
+        math.log(2) + torch.digamma(alpha) - torch.digamma(alpha + beta_val)
     )
     return entropy
 
@@ -332,12 +332,12 @@ def compute_energy(state: CognitiveState, temperature: float = 5.0) -> Tensor:
     tgt_beliefs = state.beliefs[tgt_idx]   # [N_edges, D]
 
     # Radii (precision) of endpoints
-    src_radii = src_beliefs.norm(dim=-1)   # [N_edges]
-    tgt_radii = tgt_beliefs.norm(dim=-1)   # [N_edges]
+    src_radii = src_beliefs.norm(dim=-1).clamp(min=EPSILON)   # [N_edges]
+    tgt_radii = tgt_beliefs.norm(dim=-1).clamp(min=EPSILON)   # [N_edges]
 
     # Angles (content direction) of endpoints
-    src_angles = src_beliefs / src_radii.unsqueeze(-1).clamp(min=EPSILON)
-    tgt_angles = tgt_beliefs / tgt_radii.unsqueeze(-1).clamp(min=EPSILON)
+    src_angles = src_beliefs / src_radii.unsqueeze(-1)
+    tgt_angles = tgt_beliefs / tgt_radii.unsqueeze(-1)
 
     # Transform target angle through relation representation.
     # Simple version: relation vector acts as a bias/rotation on what "agreement" means.
@@ -461,6 +461,10 @@ def compute_free_energy(state: CognitiveState, temperature: float = 5.0) -> dict
     H = compute_entropy(state)
 
     total_energy = E_relations + E_telos
+    # NOTE: This uses Helmholtz convention F = E - H (legacy).
+    # compute_bethe_free_energy uses Bethe convention F = E + (d-1)*H.
+    # The two produce different beta values — ensure downstream consumers
+    # know which function produced the value.
     free_energy = total_energy - H
 
     # β: exploration/exploitation balance

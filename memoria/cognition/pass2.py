@@ -149,7 +149,6 @@ def run_pass2(
     n_active = state.num_active_beliefs()
     n_max = state.config.max_beliefs
     fill_ratio = n_active / max(n_max, 1)
-    n_new_candidates = sum(1 for c in candidates if c.matched_slot == -1)
     edge_fill = state.num_active_edges() / max(state.config.max_edges, 1)
     consol_timer = state.meta.data[2].item()
 
@@ -359,8 +358,8 @@ def run_pass2(
                         slot = empty_mask.nonzero(as_tuple=False)[0].item()
                         state.goal_embeddings.data[slot] = goal_embeds[i]
                         init_logit = 1.0 / max(state.telos.gumbel_tau.item(), 0.1)
-                        state.goal_status_logits[slot] = torch.zeros(6, device=state.beliefs.device)
-                        state.goal_status_logits[slot, 1] = init_logit
+                        state.goal_status_logits.data[slot].zero_()
+                        state.goal_status_logits.data[slot, 1] = init_logit
                         state.goal_metadata.data[slot, 6] = float(current_step)
                         n_allocated += 1
                 stats['goals_generated'] = n_allocated

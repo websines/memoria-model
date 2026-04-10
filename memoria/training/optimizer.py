@@ -469,7 +469,14 @@ class _CombinedOptimizer:
         }
 
     def load_state_dict(self, state_dict: dict):
-        for o, sd in zip(self._optimizers, state_dict['optimizers']):
+        saved = state_dict['optimizers']
+        if len(saved) != len(self._optimizers):
+            raise ValueError(
+                f"Optimizer count mismatch: checkpoint has {len(saved)}, "
+                f"current model has {len(self._optimizers)}. "
+                f"Cannot resume across different optimizer configurations."
+            )
+        for o, sd in zip(self._optimizers, saved):
             o.load_state_dict(sd)
 
 

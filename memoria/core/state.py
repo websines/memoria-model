@@ -405,6 +405,16 @@ class CognitiveState(nn.Module):
             # A2: Reset MESU variance
             self.belief_precision_var[index] = 1.0
             self.belief_reinforcement_count[index] = 0
+            # E3: Reset confirmation tracking (prevent stale counts on slot reuse)
+            self.belief_confirmed_count[index] = 0
+            self.belief_contradicted_count[index] = 0
+            # Clean up dangling edges referencing this belief
+            dangling = self.edge_active & (
+                (self.edge_src == index) | (self.edge_tgt == index)
+            )
+            if dangling.any():
+                for eidx in dangling.nonzero(as_tuple=False).squeeze(-1).tolist():
+                    self.deallocate_edge(eidx)
 
     def promote_belief(self, index: int):
         """Promote a belief to the next abstraction level based on evidence.
@@ -440,6 +450,10 @@ class CognitiveState(nn.Module):
         if len(changed_indices) == 0:
             return
         with torch.no_grad():
+            # NOTE: new_radii is a snapshot. If changed_indices form chains
+            # (A→B where both changed), propagation from A may modify B's radius
+            # before B's own delta is processed. The inaccuracy is bounded by
+            # the influence factor and is acceptable for the typical case.
             new_radii = self.beliefs.data[changed_indices].norm(dim=-1)
             delta_radii = new_radii - old_radii  # positive = gained confidence
 
@@ -621,9 +635,7 @@ class CognitiveState(nn.Module):
 
             beliefs_data = {
                 'compressed': True,
-                'angle_codes': belief_compressed['angle_codes'],
-                'angle_scale': belief_compressed['angle_scale'],
-                'radii': belief_compressed['radii'],
+                **belief_compressed,  # includes 'backend' key for dispatch on load
             }
             relations_data = {
                 'compressed': True,

@@ -409,6 +409,7 @@ class PretrainedMemoriaModel(nn.Module):
         self.state.edge_relations.detach_()
         self.state.goal_embeddings.detach_()
         self.state.goal_status_logits.detach_()
+        self.state.edge_direction.detach_()
 
     def num_parameters(self) -> dict:
         """Count parameters by component."""

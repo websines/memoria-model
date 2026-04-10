@@ -23,22 +23,15 @@ def broadcast_state(state, rank: int, world_size: int):
     if world_size <= 1:
         return
 
-    # Broadcast all state tensors from rank 0
-    dist.broadcast(state.beliefs.data, src=0)
-    dist.broadcast(state.edge_src, src=0)
-    dist.broadcast(state.edge_tgt, src=0)
-    dist.broadcast(state.edge_relations.data, src=0)
-    dist.broadcast(state.edge_weights.data, src=0)
-    dist.broadcast(state.edge_active, src=0)
-    dist.broadcast(state.goal_embeddings.data, src=0)
-    dist.broadcast(state.goal_metadata.data, src=0)
-    dist.broadcast(state.meta.data, src=0)
-    dist.broadcast(state.belief_last_accessed, src=0)
-    dist.broadcast(state.belief_access_count, src=0)
-    dist.broadcast(state.belief_prev_surprise, src=0)
-    dist.broadcast(state.edge_causal_obs, src=0)
-    dist.broadcast(state.goal_status_logits, src=0)
-    dist.broadcast(state.immutable_beliefs, src=0)
+    # Broadcast all state tensors from rank 0.
+    # Uses programmatic iteration to avoid missing newly-added buffers.
+    # nn.Parameters use .data to bypass autograd versioning.
+    for name, buf in state._buffers.items():
+        if buf is not None:
+            dist.broadcast(buf, src=0)
+    for name, param in state._parameters.items():
+        if param is not None:
+            dist.broadcast(param.data, src=0)
 
 
 def sync_ranks(world_size: int):

@@ -264,6 +264,17 @@ class CognitiveController(nn.Module):
         entropy = dist.entropy().sum()  # Beta entropy (closed-form, cheap)
         value = self.value_head(features)
 
+        # Cap trajectory length to prevent OOM from unbounded graph retention.
+        # Each entry pins the full controller forward-pass graph in memory.
+        # compute_loss() may only be called every ~1000 steps, so without a cap
+        # the buffer would accumulate 1000+ graph snapshots.
+        MAX_TRAJECTORY = 128
+        if len(self._saved_log_probs) >= MAX_TRAJECTORY:
+            # Detach oldest entries to free their computation graphs
+            self._saved_log_probs[0] = self._saved_log_probs[0].detach()
+            self._saved_values[0] = self._saved_values[0].detach()
+            self._saved_entropies[0] = self._saved_entropies[0].detach()
+
         self._saved_log_probs.append(log_prob)
         self._saved_old_log_probs.append(log_prob.detach())  # PPO: detached copy
         self._saved_entropies.append(entropy)
