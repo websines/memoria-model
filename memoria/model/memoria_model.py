@@ -89,6 +89,7 @@ class EngramCache(nn.Module):
             torch.randint(1, max(vocab_size, 2), (3,)) * 2 + 1,
         )
         self.register_buffer('table_size_t', torch.tensor(table_size))
+        self.table_size_int = table_size  # Python int for torch.compile (avoids .item() graph break)
 
         # Value projection: all retrieved embeddings → hidden_dim
         total_embed = n_heads * 2 * embed_dim_per_head
@@ -182,7 +183,7 @@ class EngramCache(nn.Module):
         hash_2 = (ids * m[0]) ^ (shifted_1 * m[1])
         hash_3 = hash_2 ^ (shifted_2 * m[2])
 
-        ts = self.table_size_t.item()
+        ts = self.table_size_int
 
         # Retrieve from all heads
         embeds = []
@@ -688,9 +689,10 @@ class MemoriaModel(nn.Module):
             # never learns to halt early. Mamba samples from Uniform(min, max).
             # We sample the oracle loop count per step so the probe sees diverse
             # halt points: sometimes 1 loop is correct, sometimes 3.
+            # Derived from input hash so all DDP ranks get the same oracle_loops
+            # (ranks see the same data via broadcast).
             if self.training:
-                import random
-                oracle_loops = random.randint(1, self.max_refinement_loops)
+                oracle_loops = int(idx[0, 0].item() + idx[0, -1].item()) % self.max_refinement_loops + 1
             else:
                 oracle_loops = self.max_refinement_loops  # inference: probe decides
 
@@ -1085,10 +1087,9 @@ class MemoriaModel(nn.Module):
             loss_self_correct = torch.tensor(0.0, device=idx.device)
             if self.dflash_enabled and dflash_tapped and self.training:
                 block_size = self.config.transformer.dflash_block_size
-                # Pick a random starting position that has block_size tokens ahead
+                # Pick a starting position derived from input (DDP-safe: same data on all ranks)
                 if T > block_size + 1:
-                    import random
-                    t_start = random.randint(0, T - block_size - 1)
+                    t_start = int(idx[0, T // 2].item()) % (T - block_size)
                     # Target: the next block_size tokens after t_start
                     draft_targets = targets[:, t_start + 1: t_start + 1 + block_size]
                     if draft_targets.shape[1] == block_size:
@@ -1116,8 +1117,11 @@ class MemoriaModel(nn.Module):
                         dflash_head_fn = self.transformer.head
                         dflash_embed_fn = self.transformer.wte
                         if self.blt_enabled:
-                            dflash_head_fn = lambda h: self.byte_decoder.byte_heads[0](
-                                F.rms_norm(h, (h.size(-1),))
+                            # down_proj: n_embd→local_dim, then byte_head: local_dim→byte_vocab
+                            _dp = self.byte_decoder.down_proj
+                            _bh = self.byte_decoder.byte_heads[0]
+                            dflash_head_fn = lambda h: _bh(
+                                F.rms_norm(_dp(h), (_dp.out_features,))
                             )
                             # Compose byte_embed (→local_dim) + up_proj (→n_embd)
                             # so OPUT hybrid embeddings match the draft head dimension
@@ -1170,7 +1174,6 @@ class MemoriaModel(nn.Module):
                 + w_halt * loss_halt
                 + loss_ponder
                 + 0.01 * jac_loss
-                + w_draft * loss_draft
             )
             L_aux_w = _uw(L_aux, self.log_sigma['aux'])
 
@@ -1181,13 +1184,13 @@ class MemoriaModel(nn.Module):
                 tc = self.config.training
                 dsa_kl_w = tc.dsa_kl_weight if alpha == 0.0 else tc.dsa_kl_weight_after
 
-            # Alpha gating preserved: phase 1 = token only, phase 2-3 = all terms
-            # Draft loss is added to aux but is NOT alpha-gated itself (it's inside
-            # L_aux_w which IS alpha-gated). To let it train during phase 1, we add
-            # it directly to the total loss as well.
-            # DSA KL loss is NOT alpha-gated — trains from step 0 (like draft loss).
+            # Alpha gating: phase 1 = token only, phase 2-3 = all terms.
+            # Draft + DSA KL are NOT alpha-gated — they train from step 0.
+            # Self-correction loss is NOT alpha-gated — it trains from step 0.
             result['loss'] = (L_token_w + alpha * L_fe_w + alpha * L_aux_w
-                              + w_draft * loss_draft + dsa_kl_w * loss_dsa_kl)
+                              + w_draft * loss_draft
+                              + w_draft * loss_self_correct
+                              + dsa_kl_w * loss_dsa_kl)
 
             result['log_sigma_token'] = self.log_sigma['token'].item()
             result['log_sigma_fe'] = self.log_sigma['fe'].item()

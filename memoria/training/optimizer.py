@@ -379,6 +379,48 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
+    # 21. Working memory prefix (Mamba-inspired learnable scratchpad)
+    if hasattr(model, 'working_memory') and model.working_memory_size > 0:
+        param_groups.append({
+            'params': [model.working_memory],
+            'lr': tc.scalar_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # 22. Refinement probe + gate (halt decision + lifeline/loop encoding)
+    if hasattr(model, 'refinement_probe'):
+        probe_params = [p for p in model.refinement_probe.parameters() if p.requires_grad]
+        if probe_params:
+            param_groups.append({
+                'params': probe_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+    if hasattr(model, 'refinement_gate'):
+        param_groups.append({
+            'params': [model.refinement_gate],
+            'lr': tc.scalar_lr,
+            'betas': betas,
+            'eps': 1e-8,
+            'weight_decay': 0.0,
+        })
+
+    # 23. Engram cache (N-gram hash tables, value projection, gate norms)
+    if hasattr(model, 'engram_cache'):
+        engram_params = [p for p in model.engram_cache.parameters() if p.requires_grad]
+        if engram_params:
+            param_groups.append({
+                'params': engram_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 

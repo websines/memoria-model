@@ -455,28 +455,8 @@ def train(
         if step == 0 and is_main:
             print(f"\r  Step 0 complete.{' ' * 30}", flush=True)
 
-        # Gradient clipping (skip Muon params — Newton-Schulz orthogonalization
-        # produces unit-spectral-norm updates, making pre-clip counterproductive)
-        if tc.grad_clip_norm > 0:
-            adamw = getattr(optimizer, 'adamw', optimizer)  # _CombinedOptimizer or plain AdamW
-            clip_params = [p for g in adamw.param_groups for p in g['params'] if p.grad is not None]
-            if clip_params:
-                torch.nn.utils.clip_grad_norm_(clip_params, tc.grad_clip_norm)
-        optimizer.step()
-
-        # CAGE post-step correction: nudge weights toward quantization grid
-        cage_lam = 0.0
-        if config.transformer.weight_qat_bits > 0:
-            from ..core.quantize import cage_step, get_cage_lambda
-            cage_lam = get_cage_lambda(step, config)
-            if cage_lam > 0:
-                # Use matrix_lr as the reference LR (most quantized params are Muon)
-                current_lr = tc.matrix_lr * lr_mult
-                cage_step(base_model, lr=current_lr, cage_lambda=cage_lam)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        # Per-component NaN/Inf detection (zeroes out bad components to prevent cascade)
+        # NaN/Inf detection BEFORE optimizer step — skip step to avoid
+        # contaminating optimizer momentum/variance with NaN gradients
         nan_components = []
         for lname in ['loss_token', 'loss_fe', 'loss_fe_proxy', 'loss_fe_bethe',
                       'loss_surprise', 'loss_halt', 'loss_jac']:
@@ -485,8 +465,9 @@ def train(
                 if torch.isnan(val).any() or torch.isinf(val).any():
                     nan_components.append(lname)
                     result[lname] = torch.tensor(0.0, device=val.device)
+        skip_step = len(nan_components) > 0 or math.isnan(total_loss)
         if nan_components and is_main:
-            print(f"\n  WARNING: NaN/Inf in {nan_components} at step {step}, zeroed out")
+            print(f"\n  WARNING: NaN/Inf in {nan_components} at step {step}, skipping optimizer step")
             if log_to_wandb:
                 import wandb
                 wandb.alert(
@@ -496,8 +477,32 @@ def train(
                     wait_duration=300,
                 )
 
+        if not skip_step:
+            # Gradient clipping (skip Muon params — Newton-Schulz orthogonalization
+            # produces unit-spectral-norm updates, making pre-clip counterproductive)
+            if tc.grad_clip_norm > 0:
+                adamw = getattr(optimizer, 'adamw', optimizer)  # _CombinedOptimizer or plain AdamW
+                clip_params = [p for g in adamw.param_groups for p in g['params'] if p.grad is not None]
+                if clip_params:
+                    torch.nn.utils.clip_grad_norm_(clip_params, tc.grad_clip_norm)
+            optimizer.step()
+
+            # CAGE post-step correction: nudge weights toward quantization grid
+            cage_lam = 0.0
+            if config.transformer.weight_qat_bits > 0:
+                from ..core.quantize import cage_step, get_cage_lambda
+                cage_lam = get_cage_lambda(step, config)
+                if cage_lam > 0:
+                    # Use matrix_lr as the reference LR (most quantized params are Muon)
+                    current_lr = tc.matrix_lr * lr_mult
+                    cage_step(base_model, lr=current_lr, cage_lambda=cage_lam)
+        else:
+            cage_lam = 0.0
+
+        optimizer.zero_grad(set_to_none=True)
+
         # Fast fail
-        if math.isnan(total_loss) or total_loss > 100:
+        if total_loss > 100:
             if is_main:
                 print(f"\nFAIL: loss exploded at step {step}: {total_loss}")
             break
