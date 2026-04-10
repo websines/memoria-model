@@ -421,14 +421,9 @@ CURATED_SOURCES: list[DataSource] = [
         tier="reasoning",
         config="Nemotron-Pretraining-Formal-Logic",
     ),
-    DataSource(
-        name="nemotron_pt_mcq",
-        hf_id="nvidia/Nemotron-Pretraining-Specialized-v1.1",
-        weight=0.01,
-        format_fn=fmt.format_nemotron_pretraining,
-        tier="general",
-        config="Nemotron-Pretraining-Multiple-Choice",
-    ),
+    # nemotron_pt_mcq: Nemotron-Pretraining-Multiple-Choice parquet files cause
+    # fsspec "Bad file descriptor" in background threads — kills DDP training.
+    # Dropped. 1% weight redistributed to other general sources.
 
     # ══════════════════════════════════════════════════════════
     # SFT-QUALITY REASONING (Phase 3a data, low weight in PT mix)

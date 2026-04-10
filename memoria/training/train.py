@@ -63,7 +63,20 @@ class DataPrefetcher:
     def _worker(self):
         try:
             while not self.stop_event.is_set():
-                seqs = [next(self.stream) for _ in range(self.batch_size)]
+                seqs = []
+                for _ in range(self.batch_size):
+                    while True:
+                        try:
+                            seq = next(self.stream)
+                            seqs.append(seq)
+                            break
+                        except StopIteration:
+                            raise
+                        except Exception as e:
+                            # Skip bad samples (fsspec errors, malformed data)
+                            # but don't kill the worker
+                            print(f"  [prefetcher] Skipping bad sample: {str(e)[:80]}")
+                            continue
                 input_ids = torch.stack([s['input_ids'] for s in seqs])
                 labels = torch.stack([s['labels'] for s in seqs])
                 self.queue.put((input_ids, labels))
