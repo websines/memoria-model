@@ -455,6 +455,12 @@ class MemoriaModel(nn.Module):
                 block_size=tc.dflash_block_size,
                 max_block_size=getattr(tc, 'dflash_max_block_size', tc.dflash_block_size),
                 n_target_layers=tc.n_layer,
+                # belief_dim is needed so DFlashDraftHead can project beliefs
+                # from belief_dim → hidden_dim before using them as draft
+                # cross-attention context. Without this, the draft layers'
+                # norm_ctx (RMSNorm(hidden_dim)) crashes on belief-shaped
+                # inputs.
+                belief_dim=config.state.belief_dim,
             )
 
     @torch.no_grad()

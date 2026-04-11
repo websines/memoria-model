@@ -219,9 +219,17 @@ def format_openmath(sample: dict) -> str:
 
 
 def format_crossthink(sample: dict) -> str:
-    """Nemotron-CrossThink: cross-domain reasoning."""
+    """Nemotron-CrossThink: cross-domain reasoning.
+
+    The `prompt` field in this dataset is actually a list of strings
+    (multi-turn exchange), not a single string — empirically observed via
+    `'list' object has no attribute 'encode'` crashes from the encode step.
+    Join on newlines when we get a list, pass through when we get a string.
+    """
     prompt = sample.get('prompt', '')
-    return prompt if prompt else ''
+    if isinstance(prompt, list):
+        prompt = '\n'.join(str(p) for p in prompt if p)
+    return prompt if isinstance(prompt, str) and prompt else ''
 
 
 def format_nemotron_mind(sample: dict) -> str:

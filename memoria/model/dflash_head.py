@@ -184,7 +184,8 @@ class DFlashDraftHead(nn.Module):
     """
 
     def __init__(self, hidden_dim: int, n_heads: int, n_layers: int,
-                 block_size: int, max_block_size: int, n_target_layers: int):
+                 block_size: int, max_block_size: int, n_target_layers: int,
+                 belief_dim: int | None = None):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.block_size = block_size          # training window
@@ -203,6 +204,25 @@ class DFlashDraftHead(nn.Module):
         # Feature projection: concat of tapped target hidden states → hidden_dim
         # Output is the KV injection signal (not concatenated as context tokens)
         self.feature_proj = nn.Linear(hidden_dim * n_layers, hidden_dim, bias=False)
+
+        # Belief → hidden projection. Active belief vectors live in
+        # `belief_dim` space (typically 256), but the draft layers'
+        # cross-attention context norm (`DFlashDraftLayer.norm_ctx`) expects
+        # `hidden_dim` (typically 768). This Linear brings beliefs into the
+        # draft head's residual space before they're used as attention
+        # context tokens. Created only when belief_dim differs from
+        # hidden_dim — if they happen to match, we use beliefs directly.
+        # Near-zero init (std=0.01) means on a fresh model the belief
+        # context starts as ~zero vectors, so the draft head trains
+        # belief-free first and gradually learns to use them — matches
+        # the pattern of `feature_proj` init above.
+        if belief_dim is not None and belief_dim != hidden_dim:
+            self.belief_to_hidden = nn.Linear(belief_dim, hidden_dim, bias=False)
+            nn.init.normal_(self.belief_to_hidden.weight, std=0.01)
+            # 4-bit RotorQuant to match the rest of the draft head
+            self.belief_to_hidden._qat_bits = 4
+        else:
+            self.belief_to_hidden = None
 
         # Draft layers (with per-layer KV injection)
         self.layers = nn.ModuleList([
@@ -264,9 +284,19 @@ class DFlashDraftHead(nn.Module):
         injection = self.feature_proj(combined)  # KV injection signal
 
         # Belief embeddings as standard context tokens (beliefs have variable
-        # count and semantic content — better as attention tokens than injection)
+        # count and semantic content — better as attention tokens than
+        # injection). Beliefs live in `belief_dim` space; if that differs from
+        # the draft head's `hidden_dim`, project them through
+        # `self.belief_to_hidden` first. Without this projection we'd feed
+        # [N_active, belief_dim] into a norm expecting [*, hidden_dim] and
+        # crash — which is exactly what happened when the previous
+        # `.active_beliefs` typo was fixed without also introducing this
+        # projection, because the typo had silently disabled this code path
+        # by turning the attribute access into an AttributeError.
         B = injection.shape[0]
         if belief_embeddings is not None and belief_embeddings.shape[0] > 0:
+            if self.belief_to_hidden is not None:
+                belief_embeddings = self.belief_to_hidden(belief_embeddings)
             context = belief_embeddings.unsqueeze(0).expand(B, -1, -1)
         else:
             context = injection.new_zeros(B, 0, self.hidden_dim)
