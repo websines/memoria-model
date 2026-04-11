@@ -1133,10 +1133,14 @@ class MemoriaModel(nn.Module):
                             k: v[:, ctx_start:t_start + 1, :]
                             for k, v in dflash_tapped.items()
                         }
-                        # Get active beliefs for extra context
+                        # Get active beliefs for extra context. BeliefCache
+                        # stores the already-filtered active belief cartesians
+                        # under `.beliefs` (see read_path.BeliefCache.__slots__);
+                        # there is no `.active_beliefs` attribute — other call
+                        # sites use `.beliefs` directly (line 607, read_path.py:315).
                         active_beliefs = None
                         if belief_cache.n_active > 0:
-                            active_beliefs = belief_cache.active_beliefs
+                            active_beliefs = belief_cache.beliefs
 
                         context, injection = self.dflash_head.extract_features(
                             ctx_hiddens, active_beliefs,

@@ -484,8 +484,13 @@ def _load_hf_stream(source: DataSource) -> Iterator[dict]:
     For sources with sub_sources (e.g. BABILong with multiple tasks),
     round-robins across all sub-source streams.
 
-    Sources marked with _use_parquet_fallback (set during probe phase when
-    schema cast errors are detected) use direct parquet loading.
+    Sources marked with `_use_parquet_fallback` use direct parquet loading.
+    This flag is set lazily by `_text_stream_from_source` when a schema-cast
+    error fires during iteration; we then restart through this function and
+    take the parquet path. Previously it was set during an eager probe loop
+    at curated_stream() startup, but that cost 5-15 minutes per training
+    start and has been removed — see curated_stream() for the architectural
+    note.
     """
     if source.sub_sources:
         return _load_multi_stream(source)
@@ -533,23 +538,51 @@ def _load_multi_stream(source: DataSource) -> Iterator[dict]:
 
 
 def _text_stream_from_source(source: DataSource) -> Iterator[str]:
-    """Yield formatted text strings from a single data source. Auto-restarts."""
+    """Yield formatted text strings from a single data source. Auto-restarts.
+
+    On a schema cast error during iteration (HF "Couldn't cast" / "Nested data"
+    errors from a dataset with inconsistent nested schemas), flips the source to
+    parquet fallback mode via `source._use_parquet_fallback = True` and
+    restarts. This replicates what the eager probe loop used to do at startup,
+    but lazily — we only pay the probe cost if a source actually hits the
+    error. See curated_stream() for the architectural note on why eager
+    probing was removed.
+    """
     while True:
         try:
             hf_stream = _load_hf_stream(source)
         except Exception as e:
-            print(f"WARNING: {source.name} stream restart failed: {e}")
+            print(f"WARNING: {source.name} stream load failed: {e}")
             return
 
         yielded_any = False
-        for sample in hf_stream:
-            try:
-                text = source.format_fn(sample)
-                if text:
-                    yielded_any = True
-                    yield text
-            except Exception:
-                continue
+        # The outer try/except here handles errors raised by `hf_stream`'s
+        # __next__ during iteration (cast errors, JSONDecodeError, network
+        # errors etc.). Errors raised by `source.format_fn(sample)` are caught
+        # by the inner try below and just skip the bad sample.
+        try:
+            for sample in hf_stream:
+                try:
+                    text = source.format_fn(sample)
+                    if text:
+                        yielded_any = True
+                        yield text
+                except Exception:
+                    continue
+        except (TypeError, ValueError) as e:
+            msg = str(e)
+            is_cast_error = "Couldn't cast" in msg or "Nested data" in msg
+            already_parquet = getattr(source, '_use_parquet_fallback', False)
+            if is_cast_error and not already_parquet:
+                print(
+                    f"  [data] {source.name}: schema cast error during iteration, "
+                    f"switching to parquet fallback"
+                )
+                source._use_parquet_fallback = True
+                continue  # outer while: reload via parquet
+            # Unknown error or already tried parquet — re-raise so the
+            # caller (_ActiveSource.next_text) can mark the source dead.
+            raise
 
         if not yielded_any:
             return  # dataset is empty or all samples malformed
@@ -607,41 +640,38 @@ def curated_stream(
     """
     from .streaming import text_to_bytes, EOS_BYTE
 
-    # Initialize curated sources
-    active_curated: list[_ActiveSource] = []
-    failed_names = []
-
-    for source in CURATED_SOURCES:
-        try:
-            # Probe: can we load at least one sample?
-            test_stream = _load_hf_stream(source)
-            next(test_stream)
-            del test_stream
-            active_curated.append(_ActiveSource(source, source.weight))
-            print(f"  ✓ {source.name} ({source.hf_id})")
-        except (TypeError, ValueError) as e:
-            if "Couldn't cast" in str(e) or "Nested data" in str(e):
-                # Schema cast error — retry with raw parquet fallback
-                try:
-                    test_stream = _load_parquet_fallback(source)
-                    next(test_stream)
-                    del test_stream
-                    source._use_parquet_fallback = True
-                    active_curated.append(_ActiveSource(source, source.weight))
-                    print(f"  ✓ {source.name} ({source.hf_id}) [parquet fallback]")
-                except Exception as e2:
-                    failed_names.append(source.name)
-                    print(f"  ✗ {source.name}: {e} (fallback also failed: {e2})")
-            else:
-                failed_names.append(source.name)
-                print(f"  ✗ {source.name}: {e}")
-        except Exception as e:
-            failed_names.append(source.name)
-            print(f"  ✗ {source.name}: {e}")
-
-    if failed_names:
-        print(f"  {len(failed_names)} sources unavailable: {', '.join(failed_names)}")
-        print(f"  Weight redistributed to {len(active_curated)} active sources")
+    # ── Lazy source registration ─────────────────────────────────────────────
+    # Previously we eagerly probed each curated source here: call
+    # `_load_hf_stream(source)` + `next(test_stream)` to force one network
+    # fetch per source so we could detect broken datasets upfront and flip
+    # schema-cast-failing sources to the parquet fallback path. With ~50
+    # sources that cost 5-15 minutes of serialized network I/O on every
+    # training start, during which rank 1 had nothing to do.
+    #
+    # Now that `_ActiveSource.next_text` catches iteration-time exceptions
+    # and `_text_stream_from_source` auto-flips to parquet fallback on cast
+    # errors, both pieces of the probe's value are preserved lazily:
+    #
+    #   1. A broken source is detected on its first actual use (usually
+    #      within the first few training steps), marked dead, and the
+    #      weight-rebalance logic in curated_stream routes around it
+    #      exactly as it would have if the eager probe had detected it.
+    #
+    #   2. A schema-cast source automatically switches to parquet fallback
+    #      inside `_text_stream_from_source` and the outer while loop
+    #      restarts cleanly — same end state as eager probing, just
+    #      deferred.
+    #
+    # Net: identical steady-state behavior, ~13 minutes of startup latency
+    # removed. The "[data] sourcename raised ..." log lines from the
+    # exception path replace the "✗ sourcename" probe lines.
+    #
+    # If you ever need the old eager-probe behavior for CI smoke tests or
+    # fail-fast validation, it can be reintroduced as an opt-in flag without
+    # changing the runtime code path.
+    active_curated: list[_ActiveSource] = [
+        _ActiveSource(source, source.weight) for source in CURATED_SOURCES
+    ]
 
     # General language streams (Tier 3)
     fineweb_weight = TIER_WEIGHTS["general"] * 0.67   # 10% of total
@@ -681,7 +711,11 @@ def curated_stream(
     buffer: list[int] = []
 
     mode_label = "byte" if byte_mode else "token"
-    print(f"  Curated stream ({mode_label}): {len(active_curated)} datasets + FineWeb + code + synthetic")
+    print(
+        f"  Curated stream ({mode_label}): {len(active_curated)} datasets "
+        f"registered (lazy probe — broken sources are marked dead on first "
+        f"use) + FineWeb + code + synthetic"
+    )
 
     while True:
         r = random.random()
