@@ -376,6 +376,44 @@ def train(
     else:
         eval_data_stream = None
 
+    # ── Compile / DDP warmup ─────────────────────────────────────────────────
+    # Run one dummy forward+backward BEFORE the real training loop so that:
+    #   1. torch.compile traces and compiles on every rank in lockstep,
+    #      instead of one rank racing ahead while another is still compiling
+    #      (first-compile skew is a classic NCCL-timeout cause).
+    #   2. DDP initializes its gradient reducer / bucket layout synchronously
+    #      across ranks — the first real training step gets a warm reducer.
+    #   3. broadcast_state emits its first fingerprint check on a clean state,
+    #      giving a good baseline for the post-broadcast content fingerprint.
+    # Surrounded by barriers so any hang here fails fast and clearly.
+    if world_size > 1:
+        if is_main:
+            print("DDP warmup: compiling forward+backward on all ranks...")
+        torch.distributed.barrier()
+        try:
+            warmup_ctx = min(64, config.transformer.sequence_len)
+            dummy_ids = torch.zeros(
+                tc.device_batch_size, warmup_ctx, dtype=torch.long, device=device,
+            )
+            dummy_labels = torch.zeros_like(dummy_ids)
+            # update_state=False keeps the warmup read-only (no TTT / belief
+            # mutation), so we don't need the allow_mutation context manager
+            # and we don't contaminate the initial cognitive state.
+            with torch.autograd.graph.allow_mutation_on_saved_tensors():
+                warmup_result = model(
+                    dummy_ids, targets=dummy_labels, alpha=0.0, update_state=False,
+                )
+                warmup_loss = warmup_result['loss']
+                accelerator.backward(warmup_loss)
+            optimizer.zero_grad(set_to_none=True)
+            del warmup_result, warmup_loss, dummy_ids, dummy_labels
+            if is_main:
+                print("DDP warmup: complete")
+        except Exception as e:
+            if is_main:
+                print(f"DDP warmup: skipped ({e})")
+        torch.distributed.barrier()
+
     for step in range(start_step, max_steps):
         t0 = time.time()
 
@@ -439,7 +477,18 @@ def train(
             is_last_micro = (micro_step == grad_accum - 1)
             sync_ctx = nullcontext() if (is_last_micro or not has_no_sync) else model.no_sync()
 
-            with sync_ctx:
+            # allow_mutation_on_saved_tensors: lets the TTT path mutate
+            # delta_A/delta_B and state.beliefs inside forward() even though
+            # those tensors are saved for backward. PyTorch clones them at
+            # mutation time so backward computes gradients w.r.t. the values
+            # that were actually used in forward, while the mutated values
+            # persist as the new "current" state for the next iteration.
+            # This is the exact semantic we want — TTT improves the fast
+            # weights DURING training without corrupting gradient computation.
+            # Without this, in-place mutations inside forward trigger
+            # "one of the variables needed for gradient computation has been
+            # modified by an inplace operation" in backward().
+            with sync_ctx, torch.autograd.graph.allow_mutation_on_saved_tensors():
                 result = model(input_ids, targets=labels, alpha=alpha)
                 loss = result['loss'] / grad_accum
                 accelerator.backward(loss)
@@ -743,9 +792,17 @@ def train(
                     eval_batch = next(eval_data_stream)
                     eval_ids = eval_batch['input_ids'].unsqueeze(0).to(device)
                     eval_labels = eval_batch['labels'].unsqueeze(0).to(device)
-                    result_with = base_model(eval_ids, targets=eval_labels, alpha=alpha)
+                    # update_state=False makes both passes truly read-only so
+                    # the "without" baseline isn't measured on state that the
+                    # "with" pass just mutated. Without this gate, the
+                    # belief-advantage signal is definitionally invalid.
+                    result_with = base_model(
+                        eval_ids, targets=eval_labels, alpha=alpha, update_state=False,
+                    )
                     total_with += result_with['loss_token'].item()
-                    result_without = base_model(eval_ids, targets=eval_labels, alpha=0.0)
+                    result_without = base_model(
+                        eval_ids, targets=eval_labels, alpha=0.0, update_state=False,
+                    )
                     total_without += result_without['loss_token'].item()
                 loss_with = total_with / n_belief_eval_samples
                 loss_without = total_without / n_belief_eval_samples
@@ -827,6 +884,11 @@ def _run_eval(model, eval_stream, device, n_batches: int = 20) -> float:
 
     Uses a persistent eval stream so each call evaluates on fresh data
     instead of re-reading the same first N batches from a new stream.
+
+    update_state=False makes this a true read-only measurement — without it,
+    TTT/belief updates would contaminate the cognitive state every eval step
+    AND the reported perplexity would reflect the model's state mid-mutation
+    rather than its actual "current" state at this training step.
     """
     model.eval()
     total_loss = 0.0
@@ -835,7 +897,7 @@ def _run_eval(model, eval_stream, device, n_batches: int = 20) -> float:
             batch = next(eval_stream)
             input_ids = batch['input_ids'].unsqueeze(0).to(device)
             labels = batch['labels'].unsqueeze(0).to(device)
-            result = model(input_ids, targets=labels, alpha=0.0)
+            result = model(input_ids, targets=labels, alpha=0.0, update_state=False)
             total_loss += result['loss_token'].item()
     model.train()
     return math.exp(min(total_loss / n_batches, 20.0))  # cap to avoid overflow

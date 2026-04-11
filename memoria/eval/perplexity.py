@@ -51,7 +51,8 @@ def evaluate_perplexity(
         input_ids = torch.stack(batch_input).to(device)
         labels = torch.stack(batch_labels).to(device)
 
-        result = model.forward(input_ids, targets=labels)
+        # update_state=False: true read-only pass, no TTT/belief mutation.
+        result = model.forward(input_ids, targets=labels, update_state=False)
         loss = result.get('loss_token', result['logits'])
 
         if isinstance(loss, Tensor) and loss.dim() == 0:

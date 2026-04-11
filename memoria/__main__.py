@@ -11,7 +11,9 @@ def main():
     # Train
     train_parser = subparsers.add_parser("train", help="Train a Memoria model")
     train_parser.add_argument("--config", choices=["small", "medium", "large", "full", "qwen", "lfm2"], default="small")
-    train_parser.add_argument("--max-steps", type=int, default=5000)
+    # Sentinel default: None means "user didn't set it". We resolve to 5000 or a
+    # huge cap below depending on whether --time-budget was given.
+    train_parser.add_argument("--max-steps", type=int, default=None)
     train_parser.add_argument("--time-budget", type=float, default=None, help="Max training time in seconds")
     train_parser.add_argument("--checkpoint-dir", default="checkpoints")
     train_parser.add_argument("--no-wandb", action="store_true")
@@ -40,10 +42,19 @@ def main():
         configs = {"small": small_config, "medium": medium_config, "large": large_config, "full": full_config, "qwen": qwen_config, "lfm2": lfm2_config}
         config = configs[args.config]()
 
-        print(f"Training with {args.config} config, max_steps={args.max_steps}")
+        # Resolve max_steps default: if --time-budget is set and --max-steps is
+        # not explicitly set, use a huge cap so the time budget becomes the true
+        # stop condition. Otherwise, fall back to the historical 5000-step default.
+        if args.max_steps is None:
+            resolved_max_steps = 10**9 if args.time_budget is not None else 5000
+        else:
+            resolved_max_steps = args.max_steps
+
+        budget_note = f", time_budget={args.time_budget}s" if args.time_budget else ""
+        print(f"Training with {args.config} config, max_steps={resolved_max_steps}{budget_note}")
         train(
             config=config,
-            max_steps=args.max_steps,
+            max_steps=resolved_max_steps,
             time_budget=args.time_budget,
             checkpoint_dir=args.checkpoint_dir,
             log_to_wandb=not args.no_wandb,

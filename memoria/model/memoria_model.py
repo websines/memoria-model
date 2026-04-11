@@ -483,6 +483,7 @@ class MemoriaModel(nn.Module):
         idx: Tensor,
         targets: Tensor | None = None,
         alpha: float = 0.0,
+        update_state: bool = True,
     ) -> dict:
         """Forward pass through transformer + state interfaces + loss computation.
 
@@ -505,10 +506,28 @@ class MemoriaModel(nn.Module):
             idx: [B, T] token indices
             targets: [B, T] target indices (optional, for loss computation)
             alpha: weight for L_fe (0 during phase 1)
+            update_state: if False, skip all in-place TTT/belief mutations so
+                the forward is fully read-only. Default True preserves the
+                "live self-improvement at both training and inference" property.
+                Set to False for measurement passes (eval, belief-advantage
+                probe) where mutation would contaminate the comparison.
 
         Returns:
             dict with scalars + candidates (no large tensors to avoid DDP OOM)
         """
+        # Gate write-path state mutations on update_state. Touches every
+        # recursive write inside the read/write paths (e.g.,
+        # `state.touch_beliefs` called from read_path.py), not just the
+        # explicit TTT/belief-update block gated later in this method.
+        # Restored right before `return result`; we trust that `forward`
+        # does not early-return on happy paths (verified: one return at
+        # end). If forward raises, the flag is left at `update_state`
+        # until the next forward restores it — acceptable because a
+        # mid-forward crash already means state is in an undefined
+        # transitional shape.
+        _prev_updates_enabled = self.state._updates_enabled
+        self.state._updates_enabled = update_state
+
         B, T = idx.size()
         M = self.working_memory_size if self.working_memory_size > 0 else 0
 
@@ -803,8 +822,15 @@ class MemoriaModel(nn.Module):
                         all_candidates.extend(ref_cands)
                         all_read_indices.extend(ref_reads)
 
-                # Step 5: TTT gradient step during refinement (training only)
-                if targets is not None and self.ttt.should_update(0.0):
+                # Step 5: TTT gradient step during refinement (training only).
+                # Gated on update_state so measurement passes (eval perplexity,
+                # belief-advantage probe) stay read-only. Without this gate the
+                # refinement loop would keep mutating deltas during eval —
+                # note that should_update() returns True on cold start
+                # (ttt.py: `if mean < 1e-8: return True`), so untrained
+                # configs with refinement enabled had TTT firing on every
+                # eval step before this fix.
+                if targets is not None and update_state and self.ttt.should_update(0.0):
                     # BLT: use patch-level targets and composed projection
                     # (global_dim → local_dim → byte_vocab via down_proj @ byte_head)
                     if self.blt_enabled:
@@ -857,7 +883,9 @@ class MemoriaModel(nn.Module):
         # With BLT: hidden states are patch-level but targets are byte-level.
         # Create patch-level targets: last byte per patch (the byte the patch
         # hidden state has accumulated). TTT learns at patch granularity.
-        if targets is not None:
+        # Gated on update_state so measurement passes (eval, belief-advantage
+        # probe) stay read-only and don't contaminate the state being measured.
+        if targets is not None and update_state:
             # Compute RND surprise on active beliefs as quality signal
             active_mask = self.state.get_active_mask()
             if active_mask.any():
@@ -932,8 +960,8 @@ class MemoriaModel(nn.Module):
                 # At 128K context this saves ~38 GB by computing in 2K-position chunks.
                 from ..core.losses import fused_chunked_cross_entropy
                 result['loss_token'] = fused_chunked_cross_entropy(
-                    x.view(-1, x.size(-1)),
-                    targets.view(-1),
+                    x.reshape(-1, x.size(-1)),
+                    targets.reshape(-1),
                     self.transformer.lm_head.weight,
                 )
 
@@ -949,8 +977,8 @@ class MemoriaModel(nn.Module):
                     from ..core.losses import fused_chunked_cross_entropy
                     for util_hidden in all_utility_logits:
                         loss_utility = loss_utility + fused_chunked_cross_entropy(
-                            util_hidden.view(-1, util_hidden.size(-1)),
-                            targets.view(-1),
+                            util_hidden.reshape(-1, util_hidden.size(-1)),
+                            targets.reshape(-1),
                             self.transformer.lm_head.weight,
                         )
                     loss_utility = loss_utility / len(all_utility_logits)
@@ -1213,6 +1241,8 @@ class MemoriaModel(nn.Module):
             if self.dflash_enabled and dflash_tapped:
                 result['dflash_tapped'] = dflash_tapped
 
+        # Restore write gate (see docstring at top of forward).
+        self.state._updates_enabled = _prev_updates_enabled
         return result
 
     def compute_loss(
@@ -1220,12 +1250,27 @@ class MemoriaModel(nn.Module):
         idx: Tensor,
         targets: Tensor,
         alpha: float = 0.0,
+        update_state: bool = False,
     ) -> dict:
         """Compute combined loss: L_token + α * L_fe.
 
         Convenience wrapper around forward() for non-DDP usage and tests.
+
+        **Defaults to update_state=False** — safe for the typical
+        "result = model.compute_loss(...); result['loss'].backward()" pattern.
+        If you pass update_state=True, the forward pass will mutate TTT deltas
+        and state.beliefs in place, and you MUST wrap the call + backward in
+        `torch.autograd.graph.allow_mutation_on_saved_tensors()`, otherwise
+        backward will fail with "one of the variables needed for gradient
+        computation has been modified by an inplace operation".
+
+        The production training loop does NOT use compute_loss — it calls
+        model() directly inside the mutation context (see
+        training/train.py). This wrapper exists for tests and ad-hoc
+        non-DDP usage; keeping its default read-only prevents the subtle
+        autograd-version trap from reappearing in new test code.
         """
-        return self.forward(idx, targets, alpha=alpha)
+        return self.forward(idx, targets, alpha=alpha, update_state=update_state)
 
     @torch.no_grad()
     def spec_generate(

@@ -41,8 +41,10 @@ def get_lr_multiplier(step: int, total_steps: int, config: TrainingConfig) -> fl
         # Warmdown: cooldown_progress goes from 1.0 → 0.0
         cooldown_progress = (1.0 - progress) / config.warmdown_ratio
         if getattr(config, 'warmdown_type', None) == 'linear':
-            # Linear decay: 1.0 → 0.0
-            return cooldown_progress
+            # Linear decay: 1.0 → final_lr_frac (NOT 0.0 — respects the floor,
+            # matching the cosine branch below). cooldown_progress goes 1.0 → 0.0,
+            # so we interpolate between 1.0 and final_lr_frac.
+            return config.final_lr_frac + (1.0 - config.final_lr_frac) * cooldown_progress
         # Cosine warmdown: smooth decay from 1.0 → final_lr_frac
         return config.final_lr_frac + 0.5 * (1.0 - config.final_lr_frac) * (
             1.0 + math.cos(math.pi * (1.0 - cooldown_progress))

@@ -765,14 +765,33 @@ def curated_stream(
 
 
 def _try_code_stream(tokenizer, seq_len, languages, byte_mode=False):
-    """Try to start a code stream, return None on failure."""
+    """Try to start a code stream, return None on failure.
+
+    stream_code() is a generator function — calling it returns a generator
+    object WITHOUT running any body, so dataset-resolution errors inside
+    stream_code() would otherwise only surface on the first next() call at
+    the caller's site, bypassing this try/except entirely. We prime the
+    generator here (pull one batch) to force any startup errors to happen
+    synchronously inside this function, then chain the primed value back in
+    front of the remaining generator so the caller sees a complete stream.
+    """
     try:
-        return stream_code(
+        gen = stream_code(
             tokenizer, seq_len, languages=languages, byte_mode=byte_mode,
         )
+        first = next(gen)  # force dataset resolution / network / auth errors to fire NOW
+    except StopIteration:
+        print("  Code stream unavailable: generator exhausted before first batch")
+        return None
     except Exception as e:
         print(f"  Code stream unavailable: {e}")
         return None
+
+    def _primed_stream():
+        yield first
+        yield from gen
+
+    return _primed_stream()
 
 
 def _synthetic_text_stream(data: list[str]) -> Iterator[str]:

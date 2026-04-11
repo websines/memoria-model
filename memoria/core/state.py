@@ -291,6 +291,15 @@ class CognitiveState(nn.Module):
         self.skill_detector = SkillDetector(belief_dim=config.belief_dim)
         self.skill_composer = SkillComposer(belief_dim=config.belief_dim)
 
+        # ── Read-only gate for measurement passes ──
+        # When False, write-path state mutations (touch_beliefs, future
+        # recency/counter updates) early-return. Set/cleared by
+        # MemoriaModel.forward() based on its `update_state` parameter.
+        # Default True preserves normal training/inference behaviour.
+        # NOT registered as a buffer — it's transient per-forward and
+        # must not be snapshotted or broadcast.
+        self._updates_enabled: bool = True
+
     # ── Belief Region Accessors ──
 
     def get_belief_radii(self) -> Tensor:
@@ -370,10 +379,18 @@ class CognitiveState(nn.Module):
         This prevents tentative hypotheses from building reinforcement before
         they've been evaluated. Only committed beliefs accumulate access credit.
 
+        No-op when `self._updates_enabled` is False — this is how
+        `MemoriaModel.forward(update_state=False)` keeps eval/perplexity
+        passes truly read-only. Otherwise the read path would silently
+        bump `belief_access_count` on every measurement forward and bias
+        downstream rate limiters / consolidation logic.
+
         Args:
             indices: [N] long tensor of belief indices that were accessed
             step: current step number
         """
+        if not self._updates_enabled:
+            return
         if len(indices) == 0:
             return
         with torch.no_grad():

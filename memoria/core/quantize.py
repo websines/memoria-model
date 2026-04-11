@@ -398,25 +398,20 @@ def apply_weight_qat(model: nn.Module, bits: int = 4, mlp_bits: int = 0) -> list
     if mlp_bits == 0:
         mlp_bits = bits
 
-    # Quantize modules under transformer.blocks + LM head + annotated DFlash modules.
-    # Skips: wte (embedding lookup needs precision for rare tokens), interfaces,
-    # state, and other cognitive modules.
+    # Quantize modules under transformer.blocks only.
+    # Skips: wte (embedding lookup needs precision for rare tokens), lm_head
+    # (many call sites access `transformer.lm_head.weight` directly — see e.g.
+    # memoria_model.py's fused_chunked_cross_entropy path — and replacing it
+    # with WeightQuantLinear breaks those, plus the fused cross-entropy kernel
+    # expects a plain weight tensor), interfaces, state, and other cognitive
+    # modules. If you ever need LM-head QAT, introduce a dedicated wrapping
+    # path that preserves the `.weight` attribute access contract and update
+    # tests/test_weight_qat.py::test_skips_embeddings accordingly.
     patched = []
 
     transformer = getattr(model, 'transformer', None)
     if transformer is None:
         return []
-
-    # ── LM head: biggest per-token bandwidth bottleneck ──
-    # At 151K vocab × 768 dim, the LM head is 233 MB at FP16 (71% of per-token BW).
-    # Quantizing to 4-bit saves 175 MB per forward pass. QAT training teaches the
-    # model to produce representations robust to 4-bit head projection.
-    # Note: lm_head is a separate nn.Linear, NOT tied to wte (embedding).
-    lm_head = getattr(transformer, 'lm_head', None)
-    if lm_head is not None and isinstance(lm_head, nn.Linear):
-        wrapped = WeightQuantLinear(lm_head, bits=bits)
-        transformer.lm_head = wrapped
-        patched.append(f"lm_head ({bits}-bit)")
 
     blocks = getattr(transformer, 'blocks', None)
     if blocks is None:

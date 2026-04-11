@@ -171,6 +171,7 @@ class PretrainedMemoriaModel(nn.Module):
         idx: Tensor,
         targets: Tensor | None = None,
         alpha: float = 0.0,
+        update_state: bool = True,
     ) -> dict:
         """Forward pass: frozen backbone with interface layer injection.
 
@@ -181,10 +182,18 @@ class PretrainedMemoriaModel(nn.Module):
             idx: [B, T] token indices
             targets: [B, T] target indices (optional, for loss computation)
             alpha: weight for L_fe (0 during phase 1)
+            update_state: if False, skip TTT/belief mutations (read-only pass).
+                Default True preserves "live self-improvement" behaviour.
 
         Returns:
             dict with scalars + candidates
         """
+        # Gate write-path state mutations on update_state (see
+        # MemoriaModel.forward for the rationale). Restored before the
+        # single `return result` at the end of this method.
+        _prev_updates_enabled = self.state._updates_enabled
+        self.state._updates_enabled = update_state
+
         B, T = idx.size()
 
         # Access backbone model internals
@@ -270,7 +279,8 @@ class PretrainedMemoriaModel(nn.Module):
 
         # TTT gradient step with quality gating (RND surprise + loss rollback).
         # Runs at BOTH training and inference — the backbone improves with every input.
-        if targets is not None:
+        # Gated on update_state so measurement passes stay read-only.
+        if targets is not None and update_state:
             active_mask = self.state.get_active_mask()
             if active_mask.any():
                 with torch.no_grad():
@@ -302,8 +312,8 @@ class PretrainedMemoriaModel(nn.Module):
             # LM head (frozen, but we need grad through interface paths)
             logits = lm_head(hidden)
             result['loss_token'] = chunked_cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
             )
 
             # Always compute L_fe and L_utility so all interface parameters participate
@@ -394,6 +404,8 @@ class PretrainedMemoriaModel(nn.Module):
             logits = lm_head(hidden)
             result['logits'] = logits
 
+        # Restore write gate (see top of forward).
+        self.state._updates_enabled = _prev_updates_enabled
         return result
 
     @staticmethod

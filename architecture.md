@@ -968,8 +968,10 @@ Uses HuggingFace Accelerate with `find_unused_parameters=True` (cognitive state 
 | Component | Sync Mechanism |
 |-----------|---------------|
 | Transformer + interface params | DDP gradient averaging (automatic) |
-| Cognitive state (beliefs, edges, goals, all buffers + params) | Programmatic broadcast of all `_buffers` and `_parameters` from rank 0 before each forward, gather candidates after |
+| Cognitive state (beliefs, edges, goals, all buffers + params + all submodule state) | `broadcast_state()` in `training/distributed.py` — recursively walks ALL `state.named_buffers()` and `state.named_parameters()` in sorted order from rank 0 every step. Two fingerprint checks bracket the broadcast: (1) **structural** — `all_reduce(MAX/MIN)` over a SHA-256 hash of `(name, shape, dtype)` per tensor, runs BEFORE any broadcast so cross-rank structural drift raises a clear error instead of hanging mid-broadcast; (2) **content** — `all_reduce(MAX/MIN)` over a float64 sum of every tensor, runs AFTER the broadcast so any future code path that mutates state between syncs on only some ranks is caught at the next step instead of silently training rank-divergent behaviour. Bracketed by `dist.barrier()` on both sides. At small-config this syncs ~300 tensors per step (a prior top-level-only implementation missed ~270 tensors inside submodules like `state.telos`, `state.controller`, `state.safety_gate`, `state.srwm`, which drifted silently and contributed to NCCL BROADCAST watchdog timeouts). |
+| DDP compile warmup | Before the real training loop starts, `training/train.py` runs a single dummy forward+backward (with `update_state=False`) on every rank inside explicit `torch.distributed.barrier()` bookends. Purpose: force `torch.compile` to trace and compile on all ranks in lockstep so the first real training step has a warm reducer and no first-compile skew. First-compile skew is a classic NCCL-timeout cause: one rank hits the compile cache and races ahead while another is still compiling, and their subsequent collective sequences desync. |
 | TTT deltas (delta_A, delta_B) | NOT synchronized (requires_grad=False, mutated in-place under `torch.no_grad()` via `copy_` / `sub_` / `mul_` / `clamp_`) — each rank adapts independently. `ttt_step` is wrapped with `@torch.compiler.disable` so these mutations don't collide with AOT autograd functionalization. |
+| TTT / belief in-place updates during `forward()` | The training forward performs TTT delta updates and belief updates in-place (live self-improvement). The training loop wraps forward + backward in `torch.autograd.graph.allow_mutation_on_saved_tensors()` so PyTorch clones saved tensors on mutation — backward computes gradients w.r.t. the values actually used in forward while the mutated values persist as the new state for the next iteration. Without this, in-place mutation of `state.beliefs` during forward triggers *"one of the variables needed for gradient computation has been modified by an inplace operation"* in backward. |
 | Pass 2 | Runs on rank 0 only, barrier after completion |
 
 ## BLT — Byte Latent Transformer (Tokenizer-Free I/O)
@@ -1181,6 +1183,26 @@ TTT is the self-improvement mechanism. During BOTH training and inference:
 | Surprise gating | Titans-inspired | Adaptive thresholds (mean ± 2σ) filter OOD and boring inputs |
 | Loss rollback | Quality protection | Snapshot deltas BEFORE decay; revert if loss increased (restores pre-decay state) |
 | Belief TTT | Memoria-specific | Update belief vectors using write path observation errors at inference |
+
+### Read-Only Forward Passes (`update_state=False`)
+
+`MemoriaModel.forward()` and `PretrainedMemoriaModel.forward()` accept an `update_state: bool = True` parameter. When `True` (the default), the forward runs TTT delta updates and belief updates in-place — this is the "live self-improvement at both training and inference" property. When `False`, all in-place mutations to `delta_A`/`delta_B` and `state.beliefs` are skipped and the forward is fully read-only.
+
+**The `update_state` flag gates THREE mutation sites inside forward:**
+
+1. The main TTT/belief-update block after the transformer stack (`memoria_model.py` / `pretrained_model.py`).
+2. The refinement-loop TTT step inside the dark-loop refinement path (`memoria_model.py`). This one is especially important because `ttt.should_update(0.0)` returns `True` on cold start (untrained surprise EMA is ~0), so without this gate every eval step on a fresh model would mutate deltas during the refinement loop.
+3. The `ttt_step_beliefs` call at the end of the update block.
+
+**Use `update_state=False` for any measurement pass** — eval perplexity, the belief-advantage probe, CLI eval suites. Without it, each measurement mutates the cognitive state you're trying to measure, and the reported numbers reflect the model mid-mutation rather than its actual state at that training step. The belief-advantage probe is especially broken without this gate because the "without-state" baseline runs *after* the "with-state" pass has already mutated the system, making the comparison definitionally invalid.
+
+The training loop passes `update_state=True` (the default). `training/train.py::_run_eval` and the belief-advantage probe pass `update_state=False`. `eval/perplexity.py` passes `update_state=False`.
+
+**`compute_loss()` default is `update_state=False`** — deliberately safer than `forward()`'s default, because `compute_loss` is the "I just want to compute a loss and call backward" convenience wrapper used by tests and ad-hoc non-DDP code. That pattern is incompatible with in-place mutation unless the caller also wraps in `torch.autograd.graph.allow_mutation_on_saved_tensors()`, which is easy to forget. Defaulting to read-only makes the common case work correctly; callers who deliberately want TTT mutations during `compute_loss` can pass `update_state=True` AND the mutation context manager (see `tests/test_model.py::test_backward`).
+
+**How the gate actually propagates.** The gate threads through the model via a transient attribute `CognitiveState._updates_enabled`. `MemoriaModel.forward()` / `PretrainedMemoriaModel.forward()` set it to `update_state` at entry and restore at exit. Write-path mutations deep in the call graph (`state.touch_beliefs` called from `read_path.py`) check this flag and early-return when it's `False`. This avoids threading `update_state` through every interface / read_path / write_path signature while keeping the gate enforced at every mutation site — including sites several modules deep from the top-level forward.
+
+**The read-only contract is enforced by a property test.** `tests/test_model.py::test_update_state_false_is_strictly_read_only` snapshots every recursive buffer and parameter under `model.state` and `model.ttt`, runs several forward passes with `update_state=False` (alpha=0 and alpha=0.1, fresh seeds each call), then asserts bit-equality. Any new mutation path that forgets to check the gate will fail this test immediately — that's how the `belief_access_count` drift in `read_path.py` was caught (it wasn't in the original 6-finding audit; it surfaced on the first run of this property test). If you add a new write path to the cognitive state or TTT, either gate it on `state._updates_enabled` / `update_state` or this test will fail.
 
 ## Cognitive Seed (Cross-Run Transfer)
 
