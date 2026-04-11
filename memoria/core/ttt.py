@@ -99,7 +99,11 @@ class InPlaceTTT(nn.Module):
         # ── Per-layer persistent low-rank deltas ──
         # These are NOT nn.Parameters in the sense that the main optimizer
         # trains them. They ARE registered as parameters so they're saved/
-        # loaded with the model. The TTT inner loop updates them via .data.
+        # loaded with the model. The TTT inner loop updates them in-place
+        # under torch.no_grad() — see ttt_step below. requires_grad=False so
+        # in-place ops (copy_/sub_/mul_/clamp_) bypass autograd's version
+        # counter entirely, and DDP never syncs them (each rank adapts
+        # independently — see architecture.md § Multi-GPU Training).
         self.delta_A = nn.ParameterDict()
         self.delta_B = nn.ParameterDict()
         for layer_idx in ttt_layers:
@@ -169,11 +173,15 @@ class InPlaceTTT(nn.Module):
         """
         with torch.no_grad():
             for key in self.delta_A:
-                self.delta_A[key].data.copy_(self.init_A[key].data)
-                self.delta_B[key].data.copy_(self.init_B[key].data)
-                # LaCT-style L2 normalization on reset (arXiv:2505.23884)
-                self.delta_A[key].data = F.normalize(self.delta_A[key].data, dim=0)
-                self.delta_B[key].data = F.normalize(self.delta_B[key].data, dim=0)
+                self.delta_A[key].copy_(self.init_A[key])
+                self.delta_B[key].copy_(self.init_B[key])
+                # LaCT-style L2 normalization on reset (arXiv:2505.23884).
+                # copy_ into the existing storage (NOT `.data = F.normalize(...)`
+                # which would rebind the Parameter's storage and silently
+                # break any stale reference held by DDP buckets or optimizer
+                # state).
+                self.delta_A[key].copy_(F.normalize(self.delta_A[key], dim=0))
+                self.delta_B[key].copy_(F.normalize(self.delta_B[key], dim=0))
 
     def apply_decay(self, hidden: Tensor, layer_key: str | None = None):
         """Apply learned Titans-style decay to deltas before TTT step.
@@ -194,12 +202,12 @@ class InPlaceTTT(nn.Module):
             alpha = torch.sigmoid(self.decay_gate(pooled))  # scalar in (0, 1)
             if layer_key is not None:
                 if layer_key in self.delta_A:
-                    self.delta_A[layer_key].data.mul_(alpha)
-                    self.delta_B[layer_key].data.mul_(alpha)
+                    self.delta_A[layer_key].mul_(alpha)
+                    self.delta_B[layer_key].mul_(alpha)
             else:
                 for key in self.delta_A:
-                    self.delta_A[key].data.mul_(alpha)
-                    self.delta_B[key].data.mul_(alpha)
+                    self.delta_A[key].mul_(alpha)
+                    self.delta_B[key].mul_(alpha)
             self._last_decay_alpha = alpha.item()
         return alpha.item()
 
@@ -291,6 +299,19 @@ class InPlaceTTT(nn.Module):
 
     # ── TTT gradient step ─────────────────────────────────────────────────────
 
+    # NOTE: @torch.compiler.disable MUST be the outermost decorator. This function
+    # does manual gradient math, mutates delta_A/delta_B in-place, calls `.item()`
+    # for rollback decisions, and holds Python-side accumulator dicts — none of
+    # which Dynamo can trace cleanly. `@torch.no_grad()` alone is insufficient:
+    # it suppresses autograd but does NOT stop Dynamo from tracing, which means
+    # `.item()` calls cause graph breaks and in-place parameter mutations get
+    # captured in the AOT graph where functionalization refuses them. Disabling
+    # Dynamo entirely on this method is both correct and faster (no graph break
+    # recompiles). Historical note: previously these in-place updates went
+    # through `A.data.clamp_/.copy_(...)`, which caused "cannot mutate tensors
+    # with frozen storage" under torch.compile. Both the decorator and the
+    # `.data`-free idioms below are required for robustness.
+    @torch.compiler.disable
     @torch.no_grad()
     def ttt_step(
         self,
@@ -337,8 +358,8 @@ class InPlaceTTT(nn.Module):
         h = hidden_pre_delta  # [B, T, D]
 
         # ── Snapshot deltas for rollback (BEFORE decay) ──
-        A_snapshot = A.data.clone()
-        B_snapshot = B.data.clone()
+        A_snapshot = A.detach().clone()
+        B_snapshot = B.detach().clone()
 
         # Apply learned decay to THIS layer only (Titans-style, arXiv:2501.00663)
         self.apply_decay(hidden_pre_delta, layer_key=key)
@@ -417,12 +438,12 @@ class InPlaceTTT(nn.Module):
                 self._grad_accum_B[key].zero_()
                 self._accum_count[key] = 0
 
-            A.data -= inner_step_size * grad_A
-            B.data -= inner_step_size * grad_B
+            A.sub_(inner_step_size * grad_A)
+            B.sub_(inner_step_size * grad_B)
             # Clamp delta magnitude to prevent explosion (replaces LaCT L2 normalization
             # which made log_step_size ineffective for magnitude control)
-            A.data.clamp_(-2.0, 2.0)
-            B.data.clamp_(-2.0, 2.0)
+            A.clamp_(-2.0, 2.0)
+            B.clamp_(-2.0, 2.0)
 
         else:
             # Multi-step path: recompute gradient at each updated position
@@ -440,11 +461,12 @@ class InPlaceTTT(nn.Module):
                 grad_A_inner = grad_flat_curr.T @ hB_curr
                 grad_B_inner = A.T @ (grad_flat_curr.T @ h_flat_curr)
 
-                A.data -= inner_step_size * grad_A_inner
-                B.data -= inner_step_size * grad_B_inner
-                # LaCT-style L2 normalization (arXiv:2505.23884)
-                A.data = F.normalize(A.data, dim=0)
-                B.data = F.normalize(B.data, dim=0)
+                A.sub_(inner_step_size * grad_A_inner)
+                B.sub_(inner_step_size * grad_B_inner)
+                # LaCT-style L2 normalization (arXiv:2505.23884).
+                # copy_ preserves Parameter storage (see reset_deltas note).
+                A.copy_(F.normalize(A, dim=0))
+                B.copy_(F.normalize(B, dim=0))
 
         # ── Rollback check: did the update help? ──
         h_delta_new = h_for_grad + F.linear(F.linear(h_for_grad, B), A)
@@ -458,14 +480,19 @@ class InPlaceTTT(nn.Module):
 
         # If loss increased, this input made things worse — roll back
         if loss_after > loss_before:
-            A.data.copy_(A_snapshot)
-            B.data.copy_(B_snapshot)
+            A.copy_(A_snapshot)
+            B.copy_(B_snapshot)
             self._last_ttt_accepted = False
         else:
             self._last_ttt_accepted = True
 
     # ── Belief updates ────────────────────────────────────────────────────────
 
+    # Same reasoning as ttt_step: iterates a Python list of custom objects,
+    # calls .item() on belief_lr_scale, and mutates beliefs[slot] in place
+    # under torch.no_grad(). All three are fatal to Dynamo / AOT autograd
+    # functionalization, so we opt out of compile entirely.
+    @torch.compiler.disable
     def ttt_step_beliefs(
         self,
         beliefs: Tensor,
@@ -503,7 +530,7 @@ class InPlaceTTT(nn.Module):
                     continue
 
                 obs = candidate.belief_vector
-                current = beliefs.data[slot]
+                current = beliefs[slot]
 
                 # Pull the belief toward the observation, weighted by observation precision
                 obs_radius = obs.norm().clamp(min=1e-10)
@@ -519,7 +546,7 @@ class InPlaceTTT(nn.Module):
                     lr_scale = belief_lr_scale[slot].item()
 
                 # Update: move belief toward observation
-                beliefs.data[slot] = current + belief_lr * lr_scale * gain * (obs - current)
+                beliefs[slot] = current + belief_lr * lr_scale * gain * (obs - current)
 
 
 class TTTContext:

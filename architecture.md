@@ -969,7 +969,7 @@ Uses HuggingFace Accelerate with `find_unused_parameters=True` (cognitive state 
 |-----------|---------------|
 | Transformer + interface params | DDP gradient averaging (automatic) |
 | Cognitive state (beliefs, edges, goals, all buffers + params) | Programmatic broadcast of all `_buffers` and `_parameters` from rank 0 before each forward, gather candidates after |
-| TTT deltas (delta_A, delta_B) | NOT synchronized (requires_grad=False, modified via .data) — each rank adapts independently |
+| TTT deltas (delta_A, delta_B) | NOT synchronized (requires_grad=False, mutated in-place under `torch.no_grad()` via `copy_` / `sub_` / `mul_` / `clamp_`) — each rank adapts independently. `ttt_step` is wrapped with `@torch.compiler.disable` so these mutations don't collide with AOT autograd functionalization. |
 | Pass 2 | Runs on rank 0 only, barrier after completion |
 
 ## BLT — Byte Latent Transformer (Tokenizer-Free I/O)
