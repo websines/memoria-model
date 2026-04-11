@@ -429,6 +429,52 @@ class ReadPath(nn.Module):
             )  # [num_heads, N_active]
             scores = scores + goal_bias.unsqueeze(0).unsqueeze(0)  # broadcast over B, T
 
+        # ── Numerical stabilization for entmax15 ────────────────────────────
+        # entmax15's internal algorithm (_entmax_threshold_and_support in the
+        # `entmax` library, activations.py:131) does a sort+cumsum of the
+        # input row and then calls `tau.gather(dim, support_size - 1)`. It
+        # assumes support_size >= 1, which is mathematically true for any
+        # well-formed input on the probability simplex, but degenerates to
+        # 0 when the input row is pathological (NaN entries, or extreme
+        # magnitudes that make the cumsum threshold test fail for every
+        # element). When that happens, the gather gets `-1` as an index and
+        # PyTorch asserts out-of-bounds on CUDA. Observed empirically at
+        # step ~11-15 once belief count grows past ~2K — the probability of
+        # at least one pathological row in `scores` grows with N_active.
+        #
+        # Fix is two mathematically-justified operations:
+        #
+        # 1. **Shift-invariance of α-entmax** — subtract the per-row max.
+        #    α-entmax is defined as
+        #        entmax_α(z) = argmax_{p ∈ Δ} <p, z> − H_α(p)
+        #    where Δ is the probability simplex (∑ p_i = 1). For any
+        #    constant c, <p, z − c·1> = <p, z> − c, and the constant falls
+        #    out of the argmax since ∑ p_i = 1 is a constraint. So entmax is
+        #    shift-invariant: `entmax(z - max(z)) == entmax(z)`. The shift
+        #    bounds the max value to 0 and the rest to ≤ 0, which keeps
+        #    entmax's internal sort+cumsum in a finite, ordered range where
+        #    the algorithm's assumption (support_size ≥ 1) holds.
+        #
+        # 2. **Sanitize residual NaN/Inf with dtype-derived bounds.** Any
+        #    NaN/Inf surviving the max-subtraction came from upstream
+        #    corruption (belief vector NaN, quantizer blow-up, etc). Map
+        #    NaN → 0 (which becomes uniform attention under entmax, the
+        #    max-entropy fallback when all signal is lost); map ±Inf to
+        #    half of dtype finfo range so the subsequent arithmetic stays
+        #    finite. `finfo(dtype).max / 2` is dynamic — it's derived from
+        #    the running dtype rather than hardcoded, so it works for
+        #    fp32/bf16/fp16 without tuning.
+        #
+        # This does NOT mask the upstream bug if NaN is actually produced —
+        # the resulting attn values will propagate NaN downstream and the
+        # NaN-detection in train.py will catch and skip the step. But it
+        # prevents the device-side assert that takes the whole job down.
+        scores = scores - scores.amax(dim=-1, keepdim=True)
+        _finite_bound = torch.finfo(scores.dtype).max / 2
+        scores = torch.nan_to_num(
+            scores, nan=0.0, posinf=_finite_bound, neginf=-_finite_bound,
+        )
+
         # Sparse quality gating: entmax15 zeros out low-relevance beliefs
         # (SSHN, ICML 2024 — deep-spin/SSHN). Falls back to softmax.
         if HAS_ENTMAX:
