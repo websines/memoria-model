@@ -455,22 +455,46 @@ class ReadPath(nn.Module):
         #    entmax's internal sort+cumsum in a finite, ordered range where
         #    the algorithm's assumption (support_size ≥ 1) holds.
         #
-        # 2. **Sanitize residual NaN/Inf with dtype-derived bounds.** Any
+        # 2. **Sanitize residual NaN/Inf with a cumsum-safe bound.** Any
         #    NaN/Inf surviving the max-subtraction came from upstream
         #    corruption (belief vector NaN, quantizer blow-up, etc). Map
-        #    NaN → 0 (which becomes uniform attention under entmax, the
-        #    max-entropy fallback when all signal is lost); map ±Inf to
-        #    half of dtype finfo range so the subsequent arithmetic stays
-        #    finite. `finfo(dtype).max / 2` is dynamic — it's derived from
-        #    the running dtype rather than hardcoded, so it works for
-        #    fp32/bf16/fp16 without tuning.
+        #    NaN → 0 (uniform attention, the max-entropy fallback when all
+        #    signal is lost); map ±Inf to a finite bound that's large enough
+        #    to be treated as semantically ±Inf by entmax's argmax but small
+        #    enough that entmax's internal sort+cumsum doesn't overflow.
         #
-        # This does NOT mask the upstream bug if NaN is actually produced —
-        # the resulting attn values will propagate NaN downstream and the
-        # NaN-detection in train.py will catch and skip the step. But it
-        # prevents the device-side assert that takes the whole job down.
+        #    **Cumsum-safe derivation** (mathematically required, not
+        #    cosmetic): entmax15 internally sorts each row of length N and
+        #    computes the cumulative sum. For a row where every entry is
+        #    ±finite_bound, the final cumsum is ±finite_bound × N. We need
+        #    this to stay within finfo(dtype).max:
+        #        |finite_bound| × N ≤ finfo(dtype).max
+        #        ⟹ finite_bound ≤ finfo(dtype).max / N
+        #    We add a safety factor of 4 for other internal ops (squared
+        #    terms in tau_star's computation, intermediate accumulators):
+        #        finite_bound = finfo(dtype).max / (4 × N)
+        #    This is dynamic in both `dtype` (works for fp32/bf16/fp16) and
+        #    `N_active` (the reduction length `scores.shape[-1]`). For bf16
+        #    with N=3000 it evaluates to ~2.8e34, which is 33+ orders of
+        #    magnitude above any realistic score (scores are O(1)-O(10)
+        #    after 1/sqrt(D) scaling), so semantically -finite_bound still
+        #    acts as "effectively -Inf" for entmax's argmax, while the
+        #    cumsum -2.8e34 × 3000 ≈ -8.5e37 stays safely within bf16 range.
+        #
+        #    The previous version of this fix used `finfo.max / 2`, which is
+        #    pointwise-safe but OVERFLOWED the cumsum for N > ~1. The
+        #    resulting +Inf in the cumsum re-triggered the support_size=0
+        #    degeneracy that we were trying to prevent in the first place,
+        #    and the sanitize became self-defeating — crash persisted.
+        #
+        # This does NOT mask an upstream NaN-producing bug: if NaN is
+        # actually produced, the resulting `attn` values propagate NaN
+        # downstream and train.py:509 catches and skips the step. The
+        # sanitize only prevents the device-side assert that would
+        # otherwise take down both ranks.
         scores = scores - scores.amax(dim=-1, keepdim=True)
-        _finite_bound = torch.finfo(scores.dtype).max / 2
+        _N_active = scores.shape[-1]
+        _finite_bound = torch.finfo(scores.dtype).max / (4.0 * max(_N_active, 1))
         scores = torch.nan_to_num(
             scores, nan=0.0, posinf=_finite_bound, neginf=-_finite_bound,
         )
