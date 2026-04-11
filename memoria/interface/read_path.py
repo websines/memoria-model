@@ -274,14 +274,29 @@ class ReadPath(nn.Module):
             keys: [N, D] belief angle vectors (unit normalized)
             k: number of top results
         Returns:
-            [k] long tensor of indices into keys
+            [k'] long tensor of indices into keys (k' <= k, with FAISS -1
+            sentinels and any duplicate indices filtered out). Caller must
+            handle the case where k' < k.
+
+        FAISS can return -1 sentinels when the index has fewer valid vectors
+        than requested, when the query contains NaN/Inf, or in certain edge
+        cases with IndexFlatIP. Those -1s would silently wrap to the last
+        element via Python negative indexing when used as `tensor[-1]`,
+        which eventually feeds a wrong belief index into downstream CUDA
+        kernels and surfaces as a device-side assert elsewhere in the forward
+        pass. We filter them here, at the source, so callers can trust the
+        returned indices.
         """
         keys_np = keys.float().cpu().numpy()
         query_np = query.float().cpu().unsqueeze(0).numpy()
         index = faiss.IndexFlatIP(keys_np.shape[1])
         index.add(keys_np)
-        _, indices = index.search(query_np, min(k, len(keys_np)))
-        return torch.from_numpy(indices[0]).long().to(keys.device)
+        _, raw_indices = index.search(query_np, min(k, len(keys_np)))
+        # Filter FAISS -1 sentinels and out-of-range values (belt + braces).
+        N = keys_np.shape[0]
+        clean = raw_indices[0]
+        clean = clean[(clean >= 0) & (clean < N)]
+        return torch.from_numpy(clean).long().to(keys.device)
 
     def forward(
         self,
@@ -340,8 +355,14 @@ class ReadPath(nn.Module):
             rough_query = rough_query.mean(dim=0)
 
             if HAS_FAISS and N_active > self.top_k * 4:
-                # FAISS prefilter for large belief sets: O(log N) approximate top-k
+                # FAISS prefilter for large belief sets: O(log N) approximate top-k.
+                # Can return FEWER than top_k indices (it filters -1 sentinels
+                # internally — see _faiss_prefilter). Falls back to the manual
+                # path if FAISS gave us nothing usable.
                 topk_local = self._faiss_prefilter(rough_query, active_angles, self.top_k)
+                if topk_local.numel() == 0:
+                    rough_scores = active_angles @ rough_query
+                    _, topk_local = rough_scores.topk(self.top_k)
             else:
                 rough_scores = active_angles @ rough_query
                 _, topk_local = rough_scores.topk(self.top_k)
@@ -350,7 +371,16 @@ class ReadPath(nn.Module):
             active_beliefs = active_beliefs[topk_local]
             active_angles = active_angles[topk_local]
             active_radii = active_radii[topk_local]
-            N_active = self.top_k
+            # N_active must reflect the ACTUAL number of selected beliefs —
+            # not self.top_k. The FAISS path above can return fewer if it
+            # had to filter invalid sentinels, and downstream code uses
+            # N_active as the last-dim size of attention tensors. If we
+            # hardcoded N_active = self.top_k here, any downstream indexing
+            # or .view() based on it would silently mismatch the actual
+            # tensor shapes and crash in a CUDA kernel far from the bug
+            # site. This was a latent bug masked by the normal topk path
+            # always returning exactly k elements.
+            N_active = active_indices.shape[0]
 
         keys = active_angles       # [N_active, D] — unit vectors (content)
         values = active_beliefs    # [N_active, D] — full vectors (precision-weighted)

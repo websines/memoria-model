@@ -21,6 +21,18 @@ rewards diverse goal pursuit (prevents serial collapse), r_finish penalizes
 abandoned goals (prevents spurious parallelism). Both auxiliary rewards are
 annealed to zero over training so the final policy optimizes purely for r_perf.
 
+Meta-Harness rich-history encoding (arXiv:2603.28052, Table 3): in addition
+to the scalar state features, the controller ingests a rolling history of
+the last HISTORY_DEPTH (action, outcome) tuples through a small GRU. The
+GRU's output is projected and ADDED to the scalar features before the policy
+head — the projection is zero-initialized so the pre-#1 controller behavior
+is exactly preserved at t=0. As training progresses the projection learns
+to surface patterns like "the last three prune actions correlated with
+rising FE," letting the policy do the causal reasoning over its own history
+that the Meta-Harness ablation shows is worth ~15 accuracy points.
+
+Reference: Meta-Harness (Stanford, 2026, arXiv:2603.28052) — filesystem-based
+    access to prior diagnostic experience beats compressed scalar feedback
 Reference: SEAL (MIT, NeurIPS 2025, arXiv:2506.10943)
 Reference: SEC — Self-Evolving Curriculum (arXiv:2505.14970)
 Reference: PARL (Kimi K2.5, arXiv:2602.02276) — staged reward, serial collapse
@@ -46,6 +58,16 @@ ACT_GOAL_RATE = 4
 # Action names for dict output
 ACTION_NAMES = ['allocate_rate', 'merge_threshold', 'prune_threshold', 'connect_rate', 'goal_rate']
 
+# Per-step outcome vector dimensions:
+#   [belief_advantage, d_fill, d_mean_radius, d_edge_count,
+#    d_goal_diversity, d_goal_completion]
+# These are exactly the signals compute_dense_reward already derives each
+# step, minus r_perf/r_parallel/r_finish (which are linear combinations of
+# the same raw deltas). Keeping them un-fused preserves the signal and lets
+# the GRU learn its own weighting. This is structural — it matches the
+# number of raw delta signals the outcome vector carries — not a tunable.
+OUTCOME_DIM = 6
+
 
 class CognitiveController(nn.Module):
     """Learned controller over pass2 structural actions.
@@ -69,10 +91,12 @@ class CognitiveController(nn.Module):
         hidden_dim: int = 128,
         action_ranges: list[tuple[float, float]] | None = None,
         reward_ema_decay: float = 0.99,
+        history_depth: int = 32,
     ):
         super().__init__()
         self.belief_dim = belief_dim
         self.reward_ema_decay = reward_ema_decay
+        self.history_depth = history_depth
 
         # Action ranges: (min, max) for each action, configurable
         if action_ranges is None:
@@ -121,6 +145,47 @@ class CognitiveController(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+
+        # ── Meta-Harness rich history encoder (#1) ──
+        # GRU over the rolling (action, outcome) history. Hidden state is
+        # projected through a zero-initialized linear layer and ADDED to
+        # the scalar feature vector before the policy/value heads read it.
+        # Zero-init of `history_proj` means the history contribution starts
+        # at exactly zero, so at t=0 the controller behaves identically to
+        # the pre-#1 version. As `history_proj` learns non-zero columns,
+        # patterns in the action/outcome trajectory flow into the policy.
+        hist_input_dim = NUM_ACTIONS + OUTCOME_DIM
+        self.history_hidden = hidden_dim // 2
+        self.history_gru = nn.GRU(
+            input_size=hist_input_dim,
+            hidden_size=self.history_hidden,
+            batch_first=True,
+        )
+        self.history_proj = nn.Linear(self.history_hidden, self.state_dim)
+        with torch.no_grad():
+            self.history_proj.weight.zero_()
+            self.history_proj.bias.zero_()
+
+        # Ring buffer for history. We store NORMALIZED actions (the raw
+        # Beta samples in (0, 1)) so the GRU sees a bounded input regardless
+        # of the action_ranges configuration. Outcomes are the raw signed
+        # deltas that compute_dense_reward already derives.
+        self.register_buffer(
+            'history_actions', torch.zeros(history_depth, NUM_ACTIONS),
+        )
+        self.register_buffer(
+            'history_outcomes', torch.zeros(history_depth, OUTCOME_DIM),
+        )
+        # Total number of entries ever pushed. `history_total_writes % depth`
+        # is the next write slot; min(total, depth) is the valid prefix.
+        self.register_buffer(
+            'history_total_writes', torch.zeros(1, dtype=torch.long),
+        )
+        # Most recent sampled action (normalized, pre-scaling). Staged here
+        # by get_actions and consumed by compute_dense_reward when it commits
+        # the (action, outcome) pair to the ring buffer.
+        self.register_buffer('_pending_action', torch.zeros(NUM_ACTIONS))
+        self.register_buffer('_has_pending_action', torch.zeros(1, dtype=torch.bool))
 
         # Running stats for reward normalization
         self.register_buffer('reward_mean', torch.tensor(0.0))
@@ -171,6 +236,14 @@ class CognitiveController(nn.Module):
     def encode_state(self, state) -> Tensor:
         """Encode cognitive state into a fixed-size feature vector.
 
+        The scalar features below are the legacy 10-dim snapshot used by
+        prior versions of the controller. On top of those, the rolling
+        history of (action, outcome) tuples is passed through a GRU and
+        its projection is ADDED to the scalar features (Meta-Harness #1).
+        The projection is zero-initialized, so a freshly-built controller
+        behaves exactly like the pre-#1 version at t=0 and learns to use
+        the history signal as training progresses.
+
         Args:
             state: CognitiveState instance
 
@@ -202,7 +275,69 @@ class CognitiveController(nn.Module):
             # PARL: goal completion rate — fraction of goals reaching completed status
             features[9] = self._compute_goal_completion_rate(state)
 
-        return features
+        # Meta-Harness rich history (#1): add GRU-encoded trajectory signal.
+        # Zero-init of history_proj means this adds zeros at t=0, preserving
+        # the pre-#1 scalar-only behavior. The history_proj Linear is a real
+        # nn.Parameter, so this term participates in gradients from the
+        # policy/value heads.
+        history_feature = self._encode_history(device)
+        return features + history_feature
+
+    def _encode_history(self, device: torch.device) -> Tensor:
+        """Encode the rolling (action, outcome) history into state-dim features.
+
+        Reads the ring buffer, re-orders entries into chronological order
+        (oldest first), runs them through the GRU, and projects the final
+        hidden state to state-dim via the zero-initialized `history_proj`.
+        Returns a zero vector when no entries have been pushed yet.
+        """
+        total = int(self.history_total_writes.item())
+        if total == 0:
+            return torch.zeros(self.state_dim, device=device)
+
+        n_valid = min(total, self.history_depth)
+        if total < self.history_depth:
+            # Buffer has not wrapped — entries [0, total) are in order.
+            actions = self.history_actions[:n_valid]
+            outcomes = self.history_outcomes[:n_valid]
+        else:
+            # Buffer wrapped. The current write slot points at the oldest
+            # entry; roll so position 0 is the oldest.
+            write_slot = total % self.history_depth
+            actions = torch.cat(
+                [self.history_actions[write_slot:], self.history_actions[:write_slot]],
+                dim=0,
+            )
+            outcomes = torch.cat(
+                [self.history_outcomes[write_slot:], self.history_outcomes[:write_slot]],
+                dim=0,
+            )
+
+        # [1, T, NUM_ACTIONS + OUTCOME_DIM]
+        seq = torch.cat([actions, outcomes], dim=-1).unsqueeze(0).to(device)
+        _, h_n = self.history_gru(seq)
+        # h_n: [1, 1, history_hidden] → [history_hidden]
+        last_hidden = h_n.squeeze(0).squeeze(0)
+        return self.history_proj(last_hidden)
+
+    def _commit_history_entry(self, action_vec: Tensor, outcome_vec: Tensor):
+        """Push a (normalized action, outcome) pair into the ring buffer.
+
+        Called from compute_dense_reward once the outcome for the pending
+        action has been derived. Uses `.data` assignment because buffers
+        are not differentiable — they're summaries the GRU reads from, not
+        gradient carriers.
+        """
+        with torch.no_grad():
+            total = int(self.history_total_writes.item())
+            slot = total % self.history_depth
+            self.history_actions[slot] = action_vec.detach().to(
+                self.history_actions.device
+            )
+            self.history_outcomes[slot] = outcome_vec.detach().to(
+                self.history_outcomes.device
+            )
+            self.history_total_writes[0] = total + 1
 
     def _compute_goal_diversity(self, state) -> float:
         """Normalized entropy over per-goal hypothesis counts.
@@ -249,6 +384,13 @@ class CognitiveController(nn.Module):
         # Sample from Beta(α, β) ∈ (0, 1) — stochastic exploration
         # Clamp to avoid exact 0/1 (log_prob is -inf at boundaries)
         raw_samples = dist.rsample().clamp(1e-6, 1 - 1e-6)  # [NUM_ACTIONS]
+
+        # Stage the normalized action for the history buffer. compute_dense_reward
+        # will pair it with the derived outcome and commit the tuple to the
+        # ring buffer.
+        with torch.no_grad():
+            self._pending_action.copy_(raw_samples.detach())
+            self._has_pending_action[0] = True
 
         # Scale to action ranges
         actions = {}
@@ -425,5 +567,28 @@ class CognitiveController(nn.Module):
 
         w_finish = state.meta_params.parl_finish_reward_weight.item()
         r_finish = w_finish * d_completion * anneal
+
+        # ── Meta-Harness #1: commit (action, outcome) to rolling history ──
+        # The outcome vector preserves the RAW state deltas the GRU will
+        # learn over, not the scalar r_perf/r_parallel/r_finish reward.
+        # Layout matches OUTCOME_DIM: [belief_advantage, d_fill, d_radius,
+        # d_edges, d_diversity, d_completion]. If no action is pending
+        # (e.g. compute_dense_reward called without a preceding get_actions),
+        # skip the commit rather than push a stale action.
+        if bool(self._has_pending_action.item()):
+            outcome_vec = torch.tensor(
+                [
+                    belief_advantage,
+                    d_fill,
+                    d_radius,
+                    d_edges,
+                    d_diversity,
+                    d_completion,
+                ],
+                device=self._pending_action.device,
+            )
+            self._commit_history_entry(self._pending_action.clone(), outcome_vec)
+            with torch.no_grad():
+                self._has_pending_action[0] = False
 
         return r_perf + r_parallel + r_finish

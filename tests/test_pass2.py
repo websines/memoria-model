@@ -110,6 +110,14 @@ def test_pass2_hebbian(state):
 
 def test_pass2_intrinsic_goals(state):
     """TelosModule should generate goals from active beliefs."""
+    # Seed RNG so the cognitive controller samples a deterministic goal_rate.
+    # The controller's Beta-distributed goal_rate action can draw to 0 on
+    # some RNG states, which would cause pass2's goal generation branch to
+    # short-circuit. This test is specifically about the TelosModule path,
+    # not the stochastic controller, so pinning RNG isolates the thing under
+    # test.
+    torch.manual_seed(0)
+
     # Add beliefs so the goal generator has something to work with
     for i in range(5):
         state.allocate_belief(make_belief_vec([float(i + 1), 1, 0], 2.0, state.config.belief_dim))

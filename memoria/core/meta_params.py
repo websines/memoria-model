@@ -132,6 +132,15 @@ class MetaParams(nn.Module):
         # Precision retention: belief must retain this fraction of initial radius.
         # sigmoid(1.386) ≈ 0.8 → belief must keep 80% of its initial precision
         self._provisional_precision_retention = nn.Parameter(torch.tensor(1.386294))
+        # Search/eval split (Meta-Harness, arXiv:2603.28052): minimum
+        # post-allocation reads required for promotion. A hypothesis must be
+        # retrieved at least this many times *after* the step it was allocated
+        # on before it can be promoted. This implements the separation between
+        # the data that spawned the hypothesis and the data it is judged on —
+        # otherwise global-FE drift can promote beliefs that were never
+        # actually used.
+        # softplus(0.5413) ≈ 1.0 → default 1 post-allocation read minimum
+        self._provisional_min_reads = nn.Parameter(torch.tensor(0.541324))
 
         # ── A2: MESU Precision Variance ──
         # Min variance floor: prevents overconfidence.
@@ -466,6 +475,17 @@ class MetaParams(nn.Module):
     def provisional_precision_retention(self) -> torch.Tensor:
         """Min fraction of initial radius to retain for promotion. Range: (0, 1)."""
         return torch.sigmoid(self._provisional_precision_retention)
+
+    @property
+    def provisional_min_reads(self) -> torch.Tensor:
+        """Minimum post-allocation reads required for promotion. Range: (0, inf).
+
+        Implements the search/eval split from Meta-Harness (arXiv:2603.28052):
+        a hypothesis must be retrieved during its evaluation window on batches
+        that did not spawn it, otherwise we cannot attribute any FE improvement
+        to the hypothesis itself.
+        """
+        return F.softplus(self._provisional_min_reads)
 
     # ── A2: MESU Precision Variance ──
 

@@ -33,20 +33,34 @@ class HypothesisGenerator(nn.Module):
 
     For each active goal, synthesizes a belief vector that might help
     reduce free energy in the goal's direction. The hypothesis is a
-    blend of the goal embedding and the current belief state summary,
+    blend of the goal embedding, the current belief state summary, and
+    a summary of *recent failures for this goal* (Meta-Harness-style
+    conditioning on prior diagnostic experience, arXiv:2603.28052),
     transformed through a learned projection.
 
-    The generator learns what kinds of beliefs help for what kinds of goals.
+    The generator learns what kinds of beliefs help for what kinds of
+    goals AND what directions have already been ruled out. New failure-
+    conditioning weight columns are zero-initialized, so a freshly-built
+    generator behaves exactly like the pre-failure-log version until the
+    network learns to use them.
     """
+
+    # Feature dimensions for the shared input to net/precision/gate.
+    # Layout: [goal_embed, belief_summary, failure_summary, progress, beta, failure_count_norm]
+    # Old layout was [goal_embed, belief_summary, progress, beta].
+    # The failure_summary and failure_count_norm columns are new and are
+    # zero-initialized below so behavior at init matches the pre-#2 generator.
 
     def __init__(self, belief_dim: int):
         super().__init__()
         self.belief_dim = belief_dim
 
-        # Input: goal_embed (D) + belief_state_summary (D) + goal_progress (1) + beta (1)
+        # Extended input: +belief_dim (failure summary vector) +1 (failure count norm)
+        in_dim = belief_dim * 3 + 3
+
         # Output: hypothesis belief vector (D)
         self.hypothesis_net = nn.Sequential(
-            nn.Linear(belief_dim * 2 + 2, belief_dim),
+            nn.Linear(in_dim, belief_dim),
             nn.ReLU(),
             nn.Linear(belief_dim, belief_dim),
         )
@@ -54,7 +68,7 @@ class HypothesisGenerator(nn.Module):
         # Precision head: how confident should the hypothesis be?
         # Low initial precision = tentative. Learns to calibrate.
         self.precision_head = nn.Sequential(
-            nn.Linear(belief_dim * 2 + 2, belief_dim // 4),
+            nn.Linear(in_dim, belief_dim // 4),
             nn.ReLU(),
             nn.Linear(belief_dim // 4, 1),
             nn.Softplus(),
@@ -64,11 +78,28 @@ class HypothesisGenerator(nn.Module):
         # Starts mostly closed (bias=-1.0 → sigmoid ≈ 0.27).
         # Prevents flooding the state with bad hypotheses early in training.
         self.generate_gate = nn.Sequential(
-            nn.Linear(belief_dim * 2 + 2, belief_dim // 4),
+            nn.Linear(in_dim, belief_dim // 4),
             nn.ReLU(),
             nn.Linear(belief_dim // 4, 1),
         )
         nn.init.constant_(self.generate_gate[-1].bias, -1.0)
+
+        # Zero-init the failure-conditioning columns of the first linear in each
+        # head. Input layout is:
+        #   [0 : D]             goal_embed
+        #   [D : 2D]            belief_summary
+        #   [2D : 3D]            failure_summary      ← new (zero-init)
+        #   [3D]                 progress             (old column 2D)
+        #   [3D+1]               beta                 (old column 2D+1)
+        #   [3D+2]               failure_count_norm   ← new (zero-init)
+        # Zero-init means failure-conditioning signals have no effect at
+        # t=0; the network learns to use them as training progresses.
+        # (Same pattern as GoalRouter zero-init in the read path.)
+        with torch.no_grad():
+            for head in (self.hypothesis_net, self.precision_head, self.generate_gate):
+                first_linear = head[0]
+                first_linear.weight[:, belief_dim * 2 : belief_dim * 3].zero_()
+                first_linear.weight[:, belief_dim * 3 + 2].zero_()
 
     def forward(
         self,
@@ -77,6 +108,8 @@ class HypothesisGenerator(nn.Module):
         beliefs: Tensor,
         active_mask: Tensor,
         beta: float,
+        failure_summary: Tensor | None = None,
+        failure_count: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Generate hypothesis beliefs from active goals.
 
@@ -86,6 +119,13 @@ class HypothesisGenerator(nn.Module):
             beliefs: [max_beliefs, D] full belief tensor
             active_mask: [max_beliefs] boolean
             beta: exploration/exploitation parameter
+            failure_summary: optional [G, D] per-goal mean of recent failed
+                angles. None → treated as zero vector (same as no prior
+                failures). This is the Meta-Harness conditioning signal:
+                the generator sees directions that already failed for each
+                goal and can learn to push away from them.
+            failure_count: optional [G] number of records in the per-goal
+                failed buffer (capped at the buffer size). None → zeros.
 
         Returns:
             hypotheses: [K, D] candidate belief vectors (K <= G, gated)
@@ -106,6 +146,18 @@ class HypothesisGenerator(nn.Module):
         belief_summary = (active_beliefs * radii).sum(dim=0) / radii.sum()  # [D]
         belief_summary = belief_summary.unsqueeze(0).expand(G, -1)  # [G, D]
 
+        # Failure conditioning (Meta-Harness): per-goal summary of recent
+        # failed hypotheses. Zero when absent — network sees "no prior
+        # failures on this goal" as zero signal.
+        if failure_summary is None:
+            failure_summary = torch.zeros(G, self.belief_dim, device=device)
+        if failure_count is None:
+            failure_count = torch.zeros(G, device=device)
+        # Normalize failure count by buffer depth so the feature is bounded.
+        # Buffer depth lives on the tracker; we clamp to [0, 1] defensively
+        # in case callers pass raw counts.
+        failure_count_norm = failure_count.clamp(0.0, 1.0).unsqueeze(-1)  # [G, 1]
+
         # Build input features
         beta_t = torch.full((G, 1), beta, device=device)
         progress_t = goal_progress.unsqueeze(-1)  # [G, 1]
@@ -113,9 +165,11 @@ class HypothesisGenerator(nn.Module):
         features = torch.cat([
             goal_embeddings,     # [G, D]
             belief_summary,      # [G, D]
+            failure_summary,     # [G, D] — new
             progress_t,          # [G, 1]
             beta_t,              # [G, 1]
-        ], dim=-1)  # [G, 2D+2]
+            failure_count_norm,  # [G, 1] — new
+        ], dim=-1)  # [G, 3D+3]
 
         # Gate: should we generate for this goal?
         gate_logits = self.generate_gate(features).squeeze(-1)  # [G]
@@ -145,19 +199,26 @@ class HypothesisGenerator(nn.Module):
 
 
 class HypothesisTracker(nn.Module):
-    """Track which goals produce successful hypotheses.
+    """Track which goals produce successful hypotheses and log their failures.
 
-    Maintains per-goal success/failure counts. Goals with higher success
-    rates get priority boosts, biasing future hypothesis generation toward
-    productive research directions.
+    Maintains per-goal success/failure counts and a ring buffer of recent
+    failed hypothesis angles per goal. Goals with higher success rates get
+    priority boosts. Failed angles are surfaced back to HypothesisGenerator
+    so new proposals can learn to push away from recently-failed regions.
 
     This is the "log to results.tsv" step of the autoresearch loop,
-    internalized as running statistics.
+    internalized as running statistics — extended with the Meta-Harness
+    insight (arXiv:2603.28052 Table 3, Appendix A.2) that the richest
+    signal for a proposer is raw access to prior failures, not a
+    compressed success EMA.
     """
 
-    def __init__(self, max_goals: int):
+    def __init__(self, max_goals: int, belief_dim: int,
+                 failed_buffer_depth: int):
         super().__init__()
         self.max_goals = max_goals
+        self.belief_dim = belief_dim
+        self.failed_buffer_depth = failed_buffer_depth
 
         # Per-goal hypothesis tracking
         self.register_buffer('hypothesis_count', torch.zeros(max_goals))
@@ -171,6 +232,35 @@ class HypothesisTracker(nn.Module):
         # -1 = not a hypothesis belief
         self.register_buffer('belief_source_goal', torch.full((1,), -1, dtype=torch.long))
         self._belief_source_goal_size = 0
+
+        # ── Failed-hypothesis log (Meta-Harness, arXiv:2603.28052) ──
+        # Per-goal ring buffer of evicted belief angles. Newest write at
+        # position `failed_write_idx[goal] % depth`. When the buffer wraps,
+        # older entries are overwritten (LRU).
+        self.register_buffer(
+            'failed_angles',
+            torch.zeros(max_goals, failed_buffer_depth, belief_dim),
+        )
+        # Eviction reason code per entry (0 = empty slot, else EVICT_*).
+        self.register_buffer(
+            'failed_reasons',
+            torch.zeros(max_goals, failed_buffer_depth, dtype=torch.long),
+        )
+        # FE delta at eviction time (signed float).
+        self.register_buffer(
+            'failed_fe_deltas',
+            torch.zeros(max_goals, failed_buffer_depth),
+        )
+        # Ring-buffer write pointer per goal.
+        self.register_buffer(
+            'failed_write_idx',
+            torch.zeros(max_goals, dtype=torch.long),
+        )
+        # Number of valid entries per goal (caps at failed_buffer_depth).
+        self.register_buffer(
+            'failed_count',
+            torch.zeros(max_goals, dtype=torch.long),
+        )
 
     def _ensure_belief_buffer(self, max_beliefs: int, device: torch.device):
         """Lazily resize belief→goal buffer to match state size."""
@@ -190,8 +280,26 @@ class HypothesisTracker(nn.Module):
         if goal_idx < self.max_goals:
             self.hypothesis_count[goal_idx] += 1
 
-    def record_outcome(self, belief_slot: int, promoted: bool):
-        """Record whether a hypothesis was promoted or evicted."""
+    def record_outcome(
+        self,
+        belief_slot: int,
+        promoted: bool,
+        reason_code: int = 0,
+        fe_delta: float = 0.0,
+        failed_angle: Tensor | None = None,
+    ):
+        """Record whether a hypothesis was promoted or evicted.
+
+        Args:
+            belief_slot: the belief slot that was evaluated
+            promoted: True if promoted, False if evicted
+            reason_code: 0 for promotion, EVICT_* for eviction reason
+            fe_delta: FE(current) - FE(allocation), signed
+            failed_angle: belief direction at eviction time. When provided
+                and not promoted, pushed into the per-goal failed ring
+                buffer so future HypothesisGenerator calls can condition
+                on recent failures for the same goal.
+        """
         if belief_slot >= len(self.belief_source_goal):
             return
         goal_idx = self.belief_source_goal[belief_slot].item()
@@ -209,9 +317,71 @@ class HypothesisTracker(nn.Module):
             self.goal_success_ema[goal_idx] = (
                 decay * self.goal_success_ema[goal_idx] + (1 - decay) * 0.0
             )
+            # Push into the per-goal failed buffer if we have an angle.
+            if failed_angle is not None and failed_angle.numel() == self.belief_dim:
+                self._push_failure(goal_idx, failed_angle, reason_code, fe_delta)
 
         # Clear the mapping
         self.belief_source_goal[belief_slot] = -1
+
+    def _push_failure(
+        self,
+        goal_idx: int,
+        angle: Tensor,
+        reason_code: int,
+        fe_delta: float,
+    ):
+        """Write a failure record into the per-goal ring buffer."""
+        with torch.no_grad():
+            write_idx = int(self.failed_write_idx[goal_idx].item())
+            self.failed_angles[goal_idx, write_idx] = angle.to(
+                self.failed_angles.device
+            )
+            self.failed_reasons[goal_idx, write_idx] = int(reason_code)
+            self.failed_fe_deltas[goal_idx, write_idx] = float(fe_delta)
+            self.failed_write_idx[goal_idx] = (
+                (write_idx + 1) % self.failed_buffer_depth
+            )
+            self.failed_count[goal_idx] = min(
+                int(self.failed_count[goal_idx].item()) + 1,
+                self.failed_buffer_depth,
+            )
+
+    def get_failure_summary(self, goal_indices: Tensor) -> tuple[Tensor, Tensor]:
+        """Get per-goal failure conditioning for HypothesisGenerator.
+
+        Returns a (summary, count_norm) pair where:
+            summary: [G, D] — mean of stored failed angles per goal. A goal
+                with zero failures yields a zero vector.
+            count_norm: [G] — number of stored failures / buffer depth,
+                clamped to [0, 1]. Lets the generator distinguish "no
+                failures yet" from "failure buffer is saturated".
+
+        The mean is the simplest pooling that exposes a directional signal
+        without imposing structure. The generator has its own learned layer
+        on top and can do richer pooling if needed.
+        """
+        device = self.failed_angles.device
+        G = len(goal_indices)
+        summary = torch.zeros(G, self.belief_dim, device=device)
+        count_norm = torch.zeros(G, device=device)
+        if G == 0:
+            return summary, count_norm
+
+        valid = (goal_indices >= 0) & (goal_indices < self.max_goals)
+        for i in range(G):
+            if not valid[i]:
+                continue
+            g = int(goal_indices[i].item())
+            n = int(self.failed_count[g].item())
+            if n == 0:
+                continue
+            # Mean only over populated slots (up to n, but ring-buffer may
+            # have wrapped so take the full first `min(n, depth)` rows).
+            n_active = min(n, self.failed_buffer_depth)
+            summary[i] = self.failed_angles[g, :n_active].mean(dim=0)
+            count_norm[i] = n_active / self.failed_buffer_depth
+        return summary, count_norm
 
     def goal_priority_boost(self, goal_indices: Tensor) -> Tensor:
         """Get priority boost for goals based on hypothesis success rate.
@@ -291,10 +461,18 @@ def run_autoresearch_step(
     viable_progress = progress[viable_idx]
     viable_global_indices = goal_indices[viable_idx]
 
+    # Meta-Harness conditioning: pull per-goal failure summaries from the
+    # tracker so the generator can push away from recently-failed directions.
     with torch.no_grad():
+        failure_summary, failure_count_norm = tracker.get_failure_summary(
+            viable_global_indices
+        )
+
         hypotheses, _precisions, selected_local = hypothesis_gen(
             viable_embeds, viable_progress,
             state.beliefs.data, state.get_active_mask(), beta,
+            failure_summary=failure_summary,
+            failure_count=failure_count_norm,
         )
 
     if hypotheses.shape[0] == 0:

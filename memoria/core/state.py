@@ -34,6 +34,13 @@ class StateConfig:
     relation_dim: int = 64         # K: relation representation dimension
     goal_metadata_dim: int = 8     # G: priority, urgency, progress, status, depth, surprise, created, deadline
     meta_dim: int = 32             # M: meta parameters
+    # Controller rich-history encoding (Meta-Harness #1). Depth is structural
+    # (it's a tensor shape, not a learnable scalar), so it lives in StateConfig
+    # alongside the other *_dim and max_* sizes rather than in MetaParams.
+    controller_history_depth: int = 32
+    # Per-goal failed-hypothesis ring buffer depth (Meta-Harness #2). Same
+    # rationale as controller_history_depth — it's a tensor shape.
+    failed_buffer_depth: int = 8
 
 
 class CognitiveState(nn.Module):
@@ -158,6 +165,14 @@ class CognitiveState(nn.Module):
         self.register_buffer('belief_provisional_step', torch.zeros(config.max_beliefs))
         self.register_buffer('belief_provisional_fe', torch.zeros(config.max_beliefs))
         self.register_buffer('belief_provisional_radius', torch.zeros(config.max_beliefs))
+        # Search/eval split (Meta-Harness, arXiv:2603.28052): count reads that
+        # happen *after* allocation. A provisional belief is only promoted if
+        # it was actually retrieved during its evaluation window — i.e., useful
+        # on data that did not spawn it. Zero post-allocation reads means the
+        # hypothesis was never tested, so we evict rather than promote on
+        # unrelated global-FE drift. Separated from belief_access_count because
+        # that buffer is gated closed for provisional beliefs by design.
+        self.register_buffer('belief_provisional_reads', torch.zeros(config.max_beliefs))
 
         # ── MESU Precision Variance (A2: Bayesian Metaplasticity) ──
         # Per-belief uncertainty about its own precision. High variance → high
@@ -223,7 +238,10 @@ class CognitiveState(nn.Module):
         )
 
         # ── SEAL-style cognitive controller ──
-        self.controller = CognitiveController(belief_dim=config.belief_dim)
+        self.controller = CognitiveController(
+            belief_dim=config.belief_dim,
+            history_depth=config.controller_history_depth,
+        )
 
         # ── SleepGate (learned sleep cycle, arXiv:2603.14517) ──
         from ..cognition.sleep import SleepGate
@@ -240,7 +258,11 @@ class CognitiveState(nn.Module):
         # ── Internal Autoresearch Loop ──
         from ..cognition.autoresearch import HypothesisGenerator, HypothesisTracker
         self.hypothesis_gen = HypothesisGenerator(belief_dim=config.belief_dim)
-        self.hypothesis_tracker = HypothesisTracker(max_goals=config.max_goals)
+        self.hypothesis_tracker = HypothesisTracker(
+            max_goals=config.max_goals,
+            belief_dim=config.belief_dim,
+            failed_buffer_depth=config.failed_buffer_depth,
+        )
 
         # ── A4: SGM Safety Gate ──
         from ..cognition.safety_gate import SafetyGate
@@ -367,6 +389,8 @@ class CognitiveState(nn.Module):
                 self.belief_provisional_step[slot] = float(step)
                 self.belief_provisional_fe[slot] = current_fe
                 self.belief_provisional_radius[slot] = belief_vector.norm().item()
+                # Search/eval split: reset post-allocation read counter.
+                self.belief_provisional_reads[slot] = 0.0
             # A2: MESU — new beliefs start with high variance (uncertain)
             self.belief_precision_var[slot] = 1.0
             self.belief_reinforcement_count[slot] = 0
@@ -395,11 +419,27 @@ class CognitiveState(nn.Module):
             return
         with torch.no_grad():
             self.belief_last_accessed[indices] = float(step)
-            # Only increment access count for non-provisional beliefs
+            # Only increment access count for non-provisional beliefs.
+            # Provisional beliefs accumulate into belief_provisional_reads
+            # instead — their "useful-on-held-out-data" signal must not
+            # bleed into the lifetime reinforcement signal used for
+            # promotion, merging, and pruning.
             committed = ~self.belief_provisional[indices]
             if committed.any():
                 committed_indices = indices[committed]
                 self.belief_access_count[committed_indices] += 1
+            # Search/eval split: count reads of provisional beliefs that
+            # happen strictly after their allocation step. These reads come
+            # from forward passes on batches the hypothesis did not inform,
+            # so they're the held-out signal for promotion.
+            provisional = self.belief_provisional[indices]
+            if provisional.any():
+                prov_idx = indices[provisional]
+                post_alloc = (
+                    float(step) > self.belief_provisional_step[prov_idx]
+                )
+                if post_alloc.any():
+                    self.belief_provisional_reads[prov_idx[post_alloc]] += 1
 
     def deallocate_belief(self, index: int):
         """Free a belief slot (set to zero)."""
@@ -419,6 +459,7 @@ class CognitiveState(nn.Module):
             self.belief_provisional_step[index] = 0.0
             self.belief_provisional_fe[index] = 0.0
             self.belief_provisional_radius[index] = 0.0
+            self.belief_provisional_reads[index] = 0.0
             # A2: Reset MESU variance
             self.belief_precision_var[index] = 1.0
             self.belief_reinforcement_count[index] = 0

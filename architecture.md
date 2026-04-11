@@ -64,9 +64,9 @@ Memoria is a self-modifying architecture: the system changes its own compute gra
 | 0 | Belief allocation/eviction | Number of active nodes in factor graph | `belief_update.py`, `state.py` |
 | 1 | Edge proposal/pruning | Causal graph topology (which beliefs connect) | `edge_proposal.py`, `state.py` |
 | 2 | Structural plasticity | Belief splitting (polysemantic → children) and pruning | `structural_plasticity.py` |
-| 3 | Provisional beliefs + autoresearch | Hypothesis beliefs generated, tested, promoted or killed; PARL fair round-robin allocation | `autoresearch.py`, `provisional.py` |
+| 3 | Provisional beliefs + autoresearch | Hypothesis beliefs generated, tested, promoted or killed; search/eval split requires post-allocation reads before promotion (Meta-Harness); evicted hypotheses feed back into HypothesisGenerator as per-goal failed-angle conditioning; PARL fair round-robin allocation | `autoresearch.py`, `provisional.py` |
 | 4 | SRWM | Meta-parameters become state-dependent via fast-weight matrix | `srwm.py` |
-| 5 | Cognitive controller | PARL staged reward: r_perf + r_parallel + r_finish (annealed). Learned policy over rates of layers 0-4 | `cognitive_controller.py` |
+| 5 | Cognitive controller | PARL staged reward: r_perf + r_parallel + r_finish (annealed). Learned policy over rates of layers 0-4. State encoder: 10 scalar features PLUS a GRU over the rolling (action, outcome) history (Meta-Harness rich-history encoding), added via zero-initialized projection so initial behavior matches scalar-only baseline | `cognitive_controller.py` |
 | 6 | SGM safety gate | Statistical validation of modifications (e-value testing) | `safety_gate.py` |
 | 7 | Telos goal generation | Creates new goals from surprise → changes what the system optimizes for | `telos_module.py` |
 | 8 | Adaptive depth | Variable computation depth per belief (ACT halting) + per-position refinement routing (MoR) | `adaptive_depth.py`, `memoria_model.py:RefinementRouter` |
@@ -91,7 +91,21 @@ Telos generates goals from surprising beliefs
 
 This is genuine recursive self-modification: the system modifies how it modifies itself. The SRWM changes the thresholds used by structural plasticity, the cognitive controller changes the rates at which plasticity operates, the SGM safety gate validates everything with sequential hypothesis testing, and Telos creates the goals that drive the entire loop. Each pass through the loop operates at a different point in parameter space because the previous pass changed the SRWM state.
 
+**Inspectability of structured self-modification.** Code-space self-modification is *inspectable* in a way that weight-space overfitting is not. The cognitive state can be dumped and audited: every belief's source chain, access history, provisional status, and contradiction counts are structured data. Brittle patterns — if-chain-like belief clusters, hard-coded retrieval neighborhoods, runaway autoresearch loops — surface on inspection, not after hundreds of thousands of training steps of degraded validation loss. Meta-Harness (arXiv:2603.28052, §5) validates this empirically at the harness level: "Overfitting in code space is also more inspectable: brittle if-chains or hard-coded class mappings are visible on inspection in a way that weight-space overfitting is not." Memoria extends the same argument to the cognitive-state level.
+
 **Relationship to Godel machines.** The SGM safety gate implements the key requirement from Schmidhuber's Godel machine: modifications are only deployed when there is statistical evidence (e-values, Vovk & Wang) that they improve the system. The difference: Godel machines are theoretical (require proof search over all possible self-modifications). Memoria's loop is gradient-driven and empirically validated — the autoresearch loop is a learned, differentiable approximation of proof search over the belief space.
+
+**Empirical validation from Meta-Harness.** The Meta-Harness paper (Stanford, March 2026, arXiv:2603.28052) demonstrates at the *harness* level what Memoria proposes at the *model* level: that search over self-modifying code, given selective access to prior diagnostic experience, outperforms scalar-feedback optimizers by 10+ accuracy points on text classification with 4× fewer context tokens, and discovers compositional solutions (e.g. their math harness autonomously merges two prior search lineages covering disjoint failure modes). Meta-Harness's §5 names the natural next step explicitly: *"a natural next step for future work is to co-evolve the harness and the model weights, letting the strategy shape what the model learns and vice versa."* This is exactly what Memoria's Pass 1 + Pass 2 architecture does — Pass 1 is gradient-driven weight evolution, Pass 2 is structural search over cognitive state. Three Meta-Harness findings have been ported directly into Memoria's Pass 2 modules as of this document (see "Meta-Harness integration points" below).
+
+**Meta-Harness integration points.** Three of Meta-Harness's empirical findings correspond to concrete Pass 2 modules in Memoria:
+
+1. **Search/eval split for provisional beliefs** — Meta-Harness enforces a strict separation between the data used to spawn a hypothesis and the data used to judge it (their search set vs. held-out test set). Memoria's autoresearch loop (`provisional.py`) now requires that a provisional belief be retrieved at least `provisional_min_reads` times *strictly after* its allocation step before it can be promoted. Reads on the allocation step itself (which could happen inside the forward pass that spawned the hypothesis) do not count. A belief that sits unused through its eval window is evicted for `EVICT_NEVER_READ` regardless of whether global FE improved — this prevents the promotion system from riding ambient training drift. `belief_provisional_reads` is a dedicated per-belief buffer separate from `belief_access_count` (which is still gated closed for provisional beliefs so the held-out signal does not bleed into lifetime reinforcement).
+
+2. **Failed-hypothesis log conditioning** (`autoresearch.py:HypothesisTracker`) — evicted hypotheses now push their angle, eviction reason, and FE delta into a per-goal ring buffer of depth `failed_buffer_depth` (default 8). `HypothesisGenerator` reads a per-goal failure summary — the mean of stored failed angles plus a normalized count — and concatenates it into its input features. The new failure-conditioning weight columns are zero-initialized, so a freshly-built generator behaves identically to the pre-#2 version; as training progresses the network learns to push away from directions that recently failed for the same goal. This mirrors Meta-Harness's "proposer inspects 82 files per iteration, ~20 prior candidates" access pattern at a compressed, architectural scale.
+
+3. **Rich history encoding for the cognitive controller** (`cognitive_controller.py`) — the controller's policy previously conditioned on 10 scalar state features. It now ALSO conditions on a rolling GRU encoding of the last `controller_history_depth` (action, outcome) tuples — where outcome = [belief_advantage, d_fill, d_mean_radius, d_edge_count, d_goal_diversity, d_goal_completion]. The GRU output is projected through a zero-initialized Linear layer and ADDED to the scalar features, preserving the pre-#1 controller's behavior at t=0. Staging happens in `get_actions` (stores the normalized sample); commit happens in `compute_dense_reward` (pairs the staged action with the derived outcome deltas and pushes to the ring buffer). Meta-Harness Table 3 shows that the gap between scalar-only (34.6 median accuracy), scalar-plus-summary (34.9), and full-trace (50.0) proposers is roughly 15 points on text classification — Memoria's cognitive controller was previously in the "scalar-only" regime and this change moves it toward the trace regime at architectural scale.
+
+All three changes land in structural buffers sized by `StateConfig` fields (`controller_history_depth`, `failed_buffer_depth`) and learned thresholds that flow through `MetaParams` (`provisional_min_reads`), consistent with Memoria's existing "no magic numbers in code-path decisions" convention.
 
 ### Huber-Robust Belief Matching (MIRAS/YAAD)
 
@@ -121,8 +135,9 @@ Multiple active goals are pursued simultaneously through three coordinated mecha
 
 **Anti-serial-collapse mechanism.** Without PARL, the controller naturally collapses to serial goal pursuit because investing in one goal reduces reward variance. The staged reward breaks this equilibrium during early training (when r_parallel > 0), and by the time it anneals out, the policy has learned the structural advantages of parallel pursuit.
 
-State encoding extended to 10 features (was 8): +goal_diversity (normalized entropy), +goal_completion_rate.
+State encoding extended to 10 features (was 8): +goal_diversity (normalized entropy), +goal_completion_rate. Then further extended to 10 scalar features + a GRU over `controller_history_depth` (action, outcome) tuples (see §Cognitive Controller) — the history pathway is additive via a zero-initialized projection, so the scalar-only baseline is exactly preserved at init.
 
+Reference: Meta-Harness (Stanford, arXiv:2603.28052) — rich-history conditioning for self-modifying systems; search/eval split; autonomous composition across search lineages
 Reference: PARL (Kimi K2.5, arXiv:2602.02276) — staged reward, serial collapse prevention
 Reference: MoH (arXiv:2410.11842) — mixture-of-head attention routing
 Reference: MOORE (arXiv:2311.11385) — orthogonal expert specialization
@@ -733,19 +748,25 @@ Goal system driven by RND (Random Network Distillation) surprise:
 
 #### Autoresearch — Hypothesis Generation
 
-Internalized Karpathy autoresearch loop:
+Internalized Karpathy autoresearch loop, extended with Meta-Harness-style
+failure conditioning (arXiv:2603.28052):
 
-1. **HypothesisGenerator**: active goals → candidate beliefs (hypotheses) in goal direction
+1. **HypothesisGenerator**: active goals → candidate beliefs (hypotheses) in goal direction. Input features are `[goal_embed, belief_summary, failure_summary, progress, beta, failure_count_norm]`. `failure_summary` is the per-goal mean of recently-failed angles retrieved from `HypothesisTracker`. The failure-conditioning weight columns of the first linear in each head (hypothesis_net, precision_head, generate_gate) are zero-initialized — a freshly-built generator behaves identically to the pre-#2 version; as training progresses it learns to push away from directions that failed for the same goal.
 2. **Generate gate**: learned, biased closed (-1.0) — prevents flooding state with bad hypotheses
 3. **Provisional allocation**: hypotheses enter as L0 beliefs with `provisional=True`
-4. **Evaluation**: after learned window (MetaParam), check: did free energy improve? Did precision hold?
-5. **HypothesisTracker**: per-goal success EMA — skip goals that never produce useful hypotheses
+4. **Evaluation (search/eval split)**: after the learned window (`provisional_eval_window` MetaParam), check three criteria:
+   - Did global FE decrease by at least `provisional_fe_threshold` fraction?
+   - Did belief precision hold above `provisional_precision_retention` of the initial radius?
+   - Was the belief retrieved at least `provisional_min_reads` times **strictly after** its allocation step? This is the Meta-Harness held-out criterion: reads that happened on the allocation step itself (inside the spawning forward pass) do not count. A belief with zero post-allocation reads is evicted for `EVICT_NEVER_READ` regardless of FE — it was never tested on data that didn't shape it. Eviction reasons are surfaced through the outcome callback with precedence `NEVER_READ > FE_NOT_IMPROVED > PRECISION_COLLAPSED`.
+5. **HypothesisTracker**: per-goal success EMA + per-goal ring buffer of `failed_buffer_depth` failed angles (StateConfig field, default 8). On eviction, the evaluator captures the belief angle *before* deallocation and pushes `(angle, reason_code, fe_delta)` into the per-goal failed buffer. `get_failure_summary(goal_indices)` returns the per-goal mean of stored failed angles plus a normalized count — consumed by `HypothesisGenerator` on the next generation cycle.
 
-#### Cognitive Controller (SEAL-Style)
+#### Cognitive Controller (SEAL-Style, Meta-Harness rich history)
 
 Learned RL policy for structural decisions:
 
-- **State**: 8 features (mean/std radii, fill ratio, edge density, β, surprise, goal density, belief_advantage_ema)
+- **State**: 10 scalar features (mean/std radii, fill ratio, edge density, β, surprise, goal density, belief_advantage_ema, goal_diversity, goal_completion_rate) PLUS a GRU-encoded rolling history of the last `controller_history_depth` (action, outcome) tuples. The GRU output is projected through a zero-initialized `history_proj` Linear and ADDED to the scalar features before the policy/value heads read them. Zero-init preserves the pre-#1 scalar-only behavior exactly at t=0; as `history_proj` learns non-zero weights the policy gains access to causal patterns in its own trajectory — what Meta-Harness Table 3 shows is worth ~15 accuracy points over scalar-only feedback.
+- **Outcome vector** (OUTCOME_DIM = 6): `[belief_advantage, d_fill, d_mean_radius, d_edge_count, d_goal_diversity, d_goal_completion]`. These are the raw state deltas `compute_dense_reward` already derives — preserved un-fused so the GRU can learn its own weighting instead of consuming the pre-combined `r_perf + r_parallel + r_finish` scalar.
+- **Staging + commit**: `get_actions` saves the normalized Beta sample to `_pending_action` as a side buffer. `compute_dense_reward` computes the outcome deltas and, at the end, pairs the pending action with the outcome and pushes both into the ring buffer via `_commit_history_entry`. If no action is pending (e.g. `compute_dense_reward` called without a preceding `get_actions`), the commit is a no-op — no stale pushes.
 - **Actions**: 5 continuous via Beta distribution — allocate_rate, merge_threshold, prune_threshold, connect_rate, goal_rate
 - **Training**: PPO clipped surrogate + adaptive entropy (SAC-style) + value baseline
 - **Reward**: `belief_advantage` (does cognitive state improve token prediction?) + dense state-delta signals

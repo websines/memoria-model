@@ -93,11 +93,32 @@ class Pass2Probe(nn.Module):
 
 
 def _make_tracker_callback(state: CognitiveState):
-    """Create a callback that feeds provisional outcomes to the hypothesis tracker."""
+    """Create a callback that feeds provisional outcomes to the hypothesis tracker.
+
+    The provisional evaluator emits (belief_idx, outcome_code, metadata) where
+    outcome_code is PROMOTED (0) or EVICT_* (>0). Failed hypotheses carry the
+    angle snapshot and metadata through to the tracker so future generations
+    can condition on recent failures for the same goal.
+    """
+    from .provisional import PROMOTED
     tracker = state.hypothesis_tracker
 
-    def callback(belief_idx: int, promoted: bool):
-        tracker.record_outcome(belief_idx, promoted)
+    def callback(belief_idx: int, outcome_code: int, metadata: dict):
+        promoted = outcome_code == PROMOTED
+        # Capture belief angle *before* deallocation clears the slot so the
+        # tracker can store it in the per-goal failed buffer.
+        angle_snapshot = (
+            state.beliefs.data[belief_idx].detach().clone()
+            if not promoted
+            else None
+        )
+        tracker.record_outcome(
+            belief_idx,
+            promoted,
+            reason_code=outcome_code,
+            fe_delta=metadata.get('fe_delta', 0.0),
+            failed_angle=angle_snapshot,
+        )
 
     return callback
 
