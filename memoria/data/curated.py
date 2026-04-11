@@ -571,6 +571,15 @@ class _ActiveSource:
         except StopIteration:
             self.alive = False
             return None
+        except Exception as e:
+            # Transient errors from HF streaming (ChunkedEncodingError, schema
+            # casts, JSONDecodeError, etc.) must NOT escape this method — they
+            # would kill the outer curated_stream generator. Mark the source
+            # dead (the re-roll logic in curated_stream will route around it)
+            # and log so we know which source is unreliable.
+            print(f"  [data] {self.source.name} raised {type(e).__name__}: {str(e)[:120]}; marking dead")
+            self.alive = False
+            return None
 
 
 def curated_stream(
@@ -718,6 +727,15 @@ def curated_stream(
                     tokenizer, seq_len, byte_mode=byte_mode,
                 )
                 continue
+            except Exception as e:
+                # Transient HF streaming error — restart the iterator and
+                # continue. Must catch here because an exception escaping
+                # this generator permanently kills it (see _ActiveSource).
+                print(f"  [data] FineWeb raised {type(e).__name__}: {str(e)[:120]}; restarting")
+                fineweb_iter = stream_fineweb_edu(
+                    tokenizer, seq_len, byte_mode=byte_mode,
+                )
+                continue
 
         # Code
         if text is None and r < cumulative + w_fineweb + w_code:
@@ -732,6 +750,13 @@ def curated_stream(
                         tokenizer, seq_len, code_languages, byte_mode=byte_mode,
                     )
                     continue
+                except Exception as e:
+                    # Transient HF streaming error — restart and continue.
+                    print(f"  [data] Code stream raised {type(e).__name__}: {str(e)[:120]}; restarting")
+                    code_iter = _try_code_stream(
+                        tokenizer, seq_len, code_languages, byte_mode=byte_mode,
+                    )
+                    continue
 
         # Synthetic
         if text is None:
@@ -742,15 +767,29 @@ def curated_stream(
                 random.shuffle(synthetic_data)
                 synthetic_iter = _synthetic_text_stream(synthetic_data)
                 continue
+            except Exception as e:
+                # Synthetic is local so this is unusual, but still must not
+                # escape the generator.
+                print(f"  [data] Synthetic raised {type(e).__name__}: {str(e)[:120]}; restarting")
+                random.shuffle(synthetic_data)
+                synthetic_iter = _synthetic_text_stream(synthetic_data)
+                continue
 
         if text is None:
             continue
 
-        # Encode and pack into sequences
-        if byte_mode:
-            encoded = text_to_bytes(text)
-        else:
-            encoded = tokenizer.encode(text, add_special_tokens=False)
+        # Encode and pack into sequences. A bad sample (non-string, malformed
+        # UTF-8, tokenizer blowing up on weird input) MUST NOT escape — skip
+        # this text and continue. The encode/tokenize boundary is the most
+        # common escape point for unexpected sample payloads.
+        try:
+            if byte_mode:
+                encoded = text_to_bytes(text)
+            else:
+                encoded = tokenizer.encode(text, add_special_tokens=False)
+        except Exception as e:
+            print(f"  [data] encode failed for source {source_name}: {type(e).__name__}: {str(e)[:120]}")
+            continue
         encoded.append(eos_id)
         buffer.extend(encoded)
 

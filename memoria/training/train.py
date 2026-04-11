@@ -452,11 +452,33 @@ def train(
                             seqs.append(seq)
                             break
                         except StopIteration:
-                            raise RuntimeError("Data stream exhausted — should be infinite")
+                            # curated_stream() is supposed to be infinite. If
+                            # it raises StopIteration, the generator body
+                            # either returned normally (shouldn't be possible
+                            # — there's no `return` inside its while True) or,
+                            # far more likely, some previous `next()` call
+                            # let an exception escape the generator body, which
+                            # permanently kills the generator; all subsequent
+                            # calls raise StopIteration. If you see this,
+                            # check for an earlier "[data] ... raised ..." log
+                            # line — that's the real cause. The fix is to add
+                            # another `except Exception` branch inside
+                            # curated_stream at whichever site the exception
+                            # escaped from.
+                            raise RuntimeError(
+                                f"Data stream exhausted at step {step} — "
+                                f"should be infinite. An exception likely "
+                                f"escaped curated_stream; scroll up for "
+                                f"'[data] ... raised ...' log lines."
+                            )
                         except Exception as e:
-                            # Skip bad samples (network glitches, malformed data)
-                            if step == 0:
-                                print(f"  [data] Skipping bad sample: {str(e)[:60]}")
+                            # Print at every step, not just step 0. Hiding
+                            # these after step 0 is what turned this bug
+                            # into a mystery.
+                            print(
+                                f"  [data] Skipping bad sample at step {step}: "
+                                f"{type(e).__name__}: {str(e)[:120]}"
+                            )
                             continue
                 input_ids = torch.stack([s['input_ids'] for s in seqs]).to(device)
                 labels = torch.stack([s['labels'] for s in seqs]).to(device)
