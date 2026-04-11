@@ -143,12 +143,31 @@ def train(
 
     # ── Accelerate setup ──
     from accelerate import Accelerator, DistributedDataParallelKwargs
+    from accelerate.utils import InitProcessGroupKwargs
+    from datetime import timedelta
 
     # find_unused_parameters=True is required: cognitive state is dynamic (beliefs
     # appear/disappear, goals come and go), so the set of parameters that contribute
     # to loss changes between steps. static_graph won't work either.
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(mixed_precision='bf16', kwargs_handlers=[ddp_kwargs])
+
+    # NCCL collective timeout of 30 min. The default (10 min) is too aggressive
+    # for this workload because:
+    #   1. The first `next(data_stream)` call on rank 0 triggers lazy HF dataset
+    #      probing that can take 5-15 minutes, during which rank 1 is blocked on
+    #      the step-0 data broadcast. A 10-minute watchdog fires as a false
+    #      positive in that window.
+    #   2. broadcast_state() issues 300+ collectives per call and the content
+    #      fingerprint all_reduces add more — any transient slowdown can push a
+    #      single collective past 10 minutes even when nothing is actually wrong.
+    # We ALSO prime the data stream below to avoid the rank-0-only stall in the
+    # common case, but the bumped timeout is load-bearing as a safety net for
+    # network hiccups during HF streaming.
+    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=30))
+    accelerator = Accelerator(
+        mixed_precision='bf16',
+        kwargs_handlers=[ddp_kwargs, init_kwargs],
+    )
     device = accelerator.device
     is_main = accelerator.is_main_process
     rank = accelerator.process_index
@@ -375,6 +394,37 @@ def train(
             next(eval_data_stream)
     else:
         eval_data_stream = None
+
+    # ── Prime data_stream (rank 0 only) ─────────────────────────────────────
+    # The first `next(data_stream)` call is very expensive: it triggers lazy
+    # HF dataset probing for ~50 curated sources, FineWeb file resolution, and
+    # the initial fill of a 131072-byte packing buffer. 5-15 minutes of pure
+    # Python work on rank 0, with transient HF retries potentially extending
+    # it further.
+    #
+    # If this happens INSIDE the main training loop (as it did before this
+    # fix), rank 1 is already blocked at `torch.distributed.broadcast(
+    # input_ids, src=0)` waiting for rank 0. That broadcast is an NCCL
+    # collective, so rank 1's watchdog starts counting the moment the op is
+    # enqueued. At the default 10-minute watchdog deadline, rank 1 tears down
+    # with a BROADCAST timeout — a bogus diagnostic because the actual problem
+    # is a slow data load on the other rank, not a NCCL failure.
+    #
+    # Priming here instead means the slow load happens while rank 1 is idle
+    # in pure Python (stepping into the `else` branch of this same `if
+    # is_main` block, then reaching the DDP-warmup barrier). Rank 1 enqueues
+    # its first NCCL op only at the DDP warmup barrier; the bumped 30-minute
+    # InitProcessGroupKwargs timeout above gives a safety margin in case
+    # priming ever legitimately takes longer than 10 minutes.
+    #
+    # We prepend the first sequence back via itertools.chain so no data is
+    # wasted and the caller's iteration contract is preserved.
+    if is_main:
+        import itertools
+        print("Priming data stream (first next() triggers HF probing — this takes several minutes)...")
+        _primed_first = next(data_stream)
+        data_stream = itertools.chain([_primed_first], data_stream)
+        print("Data stream primed.")
 
     # ── Compile / DDP warmup ─────────────────────────────────────────────────
     # Run one dummy forward+backward BEFORE the real training loop so that:
