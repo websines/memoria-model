@@ -328,6 +328,27 @@ class MetaParams(nn.Module):
         # Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT + SPD
         self._oput_self_correct_weight = nn.Parameter(torch.tensor(-0.693147))
 
+        # ── G1: LSR Strategy Bank ──
+        # Perturbation scale: magnitude of the strategy perturbation injected
+        # into the residual stream during refinement loops. Unit-norm strategies
+        # are multiplied by this value, so it directly controls perturbation L2.
+        # softplus(-0.693) ≈ 0.5 → moderate initial perturbation
+        # Reference: LSR (dl1683/Latent-Space-Reasoning) — soft prompt magnitude
+        self._strategy_perturbation_scale = nn.Parameter(torch.tensor(-0.693147))
+        # Fitness EMA decay: how fast per-strategy fitness tracks FE improvement.
+        # sigmoid(2.944) ≈ 0.95 → effective window of ~20 steps
+        self._strategy_fitness_ema_decay = nn.Parameter(torch.tensor(2.944439))
+        # Re-orthogonalization threshold: max pairwise cosine similarity before
+        # Gram-Schmidt re-orthogonalization triggers. Higher = more tolerance for
+        # strategy convergence, lower = more aggressive diversity enforcement.
+        # sigmoid(1.386) ≈ 0.8 → trigger when two strategies share >80% direction
+        self._strategy_orthog_min_similarity = nn.Parameter(torch.tensor(1.386294))
+        # Strategy promotion threshold: minimum fitness for a strategy to survive
+        # periodic culling. Strategies below this are replaced by new hypotheses.
+        # sigmoid(-2.197) ≈ 0.1 → very permissive at init (most strategies survive)
+        # Mapped to actual threshold: (value - 0.5) * 2 → range (-1, 1) centered at 0
+        self._strategy_promotion_threshold = nn.Parameter(torch.tensor(-2.197225))
+
         # ── F1: Predictive Refinement (MoR + SCORE) ──
         # Contraction rate: SCORE-style step-size decay per loop iteration.
         # dt(l) = (1 - contraction_rate)^l → later loops contribute smaller deltas.
@@ -770,6 +791,28 @@ class MetaParams(nn.Module):
         Reference: DMax (arXiv:2604.08302)
         """
         return F.softplus(self._oput_self_correct_weight)
+
+    # ── G1: LSR Strategy Bank ──
+
+    @property
+    def strategy_perturbation_scale(self) -> torch.Tensor:
+        """Magnitude of strategy perturbation in refinement loops. Range: (0, inf)."""
+        return F.softplus(self._strategy_perturbation_scale)
+
+    @property
+    def strategy_fitness_ema_decay(self) -> torch.Tensor:
+        """EMA decay for per-strategy fitness tracking. Range: (0, 1)."""
+        return torch.sigmoid(self._strategy_fitness_ema_decay)
+
+    @property
+    def strategy_orthog_min_similarity(self) -> torch.Tensor:
+        """Max cosine similarity before re-orthogonalization triggers. Range: (0, 1)."""
+        return torch.sigmoid(self._strategy_orthog_min_similarity)
+
+    @property
+    def strategy_promotion_threshold(self) -> torch.Tensor:
+        """Min fitness for strategy survival. Range: (-1, 1). Centered at 0."""
+        return (torch.sigmoid(self._strategy_promotion_threshold) - 0.5) * 2.0
 
     # ── F1: Predictive Refinement ──
 

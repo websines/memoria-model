@@ -42,6 +42,7 @@ from .two_factor_sleep import run_two_factor_sleep
 from .self_verification import run_self_verification
 from .precision_recalibration import run_precision_recalibration
 from .interleaved_replay import run_interleaved_replay
+from .strategy_bank import StrategyEvolver
 
 
 class Pass2Probe(nn.Module):
@@ -133,6 +134,7 @@ def run_pass2(
     belief_advantage: float = 0.0,
     current_fe: float = 0.0,
     training_progress: float = 0.0,
+    refinement_fe_delta: float = 0.0,
 ) -> dict:
     """Structural cleanup pass after gradient-based updates.
 
@@ -412,6 +414,18 @@ def run_pass2(
         stats['hypotheses_generated'] = 0
         stats['hypotheses_gated_out'] = 0
 
+    # ── 5c. LSR Strategy Bank evolution ──
+    # Update strategy fitness, re-orthogonalize when diversity drops, and
+    # optionally generate strategy hypotheses from active goals.
+    if (state._strategy_bank_initialized
+            and state.strategy_evolver is not None):
+        strat_stats = _run_strategy_evolution(
+            state, current_step, refinement_fe_delta, is_sequence_boundary,
+        )
+        stats.update({f'strategy_{k}': v for k, v in strat_stats.items()})
+    else:
+        stats['strategy_fitness_updated'] = False
+
     # ── 6. Beta computation + running stats ──
     beta = compute_beta(state, state.meta_params.fe_temperature.item())
     stats['beta'] = beta
@@ -555,6 +569,135 @@ def run_pass2(
             stats['level_distribution'] = {
                 f'L{i}': (levels == i).sum().item() for i in range(4)
             }
+
+    return stats
+
+
+def _run_strategy_evolution(
+    state: CognitiveState,
+    current_step: int,
+    refinement_fe_delta: float,
+    is_sequence_boundary: bool,
+) -> dict:
+    """Evolve the strategy bank using refinement loop FE signal.
+
+    Three operations per step:
+    1. Fitness update: EMA-track per-strategy FE improvement, attributed
+       proportionally to strategy selection weights from this step's
+       refinement loop.
+    2. Re-orthogonalization: when max pairwise cosine similarity exceeds
+       the threshold (learned MetaParam), run modified Gram-Schmidt to
+       restore directional diversity. Order by fitness so the best
+       strategy is preserved unchanged.
+    3. Strategy hypothesis generation (at sequence boundaries): the
+       StrategyEvolver generates candidate strategy vectors from active
+       goals, conditioned on the failed-strategy ring buffer. New
+       strategies replace the lowest-fitness slots.
+
+    Args:
+        state: cognitive state (modified in-place)
+        current_step: current training step
+        refinement_fe_delta: FE(after refinement) - FE(before refinement)
+        is_sequence_boundary: whether we're at a sequence boundary
+
+    Returns:
+        dict with evolution statistics
+    """
+    stats: dict = {}
+    evolver = state.strategy_evolver
+
+    # ── 1. Fitness update ──
+    step_weights = state.strategy_step_weights
+    if step_weights.sum() > EPSILON:
+        ema_decay = state.meta_params.strategy_fitness_ema_decay.item()
+        evolver.update_fitness(
+            state.strategy_bank, state.strategy_fitness,
+            step_weights, refinement_fe_delta, ema_decay,
+        )
+        stats['fitness_updated'] = True
+        stats['mean_fitness'] = state.strategy_fitness.mean().item()
+    else:
+        stats['fitness_updated'] = False
+
+    # Reset per-step accumulator
+    state.strategy_step_weights.zero_()
+
+    # ── 2. Re-orthogonalization ──
+    orthog_threshold = state.meta_params.strategy_orthog_min_similarity.item()
+    n_modified = evolver.reorthogonalize(
+        state.strategy_bank, state.strategy_fitness, orthog_threshold,
+    )
+    stats['reorthog_modified'] = n_modified
+
+    # ── 3. Strategy hypothesis generation (at sequence boundaries) ──
+    # Replace lowest-fitness strategies with new goal-directed candidates.
+    # Only run when there are active goals and at least one strategy has
+    # fitness below the promotion threshold.
+    stats['strategies_replaced'] = 0
+    promotion_threshold = state.meta_params.strategy_promotion_threshold.item()
+
+    if is_sequence_boundary and state.num_active_goals() > 0:
+        # Find strategies below threshold
+        below_mask = state.strategy_fitness < promotion_threshold
+        n_below = below_mask.sum().item()
+
+        if n_below > 0:
+            goal_indices, goal_embeds, _ = state.get_active_goals()
+
+            # Compute belief summary projected to hidden space
+            active_mask = state.get_active_mask()
+            if active_mask.any():
+                active_beliefs = state.beliefs.data[active_mask]
+                radii = active_beliefs.norm(dim=-1, keepdim=True).clamp(min=EPSILON)
+                belief_summary_raw = (active_beliefs * radii).sum(dim=0) / radii.sum()
+                # Project to hidden space via the evolver's projection
+                belief_summary_h = evolver.goal_proj(belief_summary_raw)
+            else:
+                belief_summary_h = torch.zeros(
+                    evolver.hidden_dim, device=state.beliefs.device,
+                )
+
+            beta = state.meta.data[0].item()
+
+            with torch.no_grad():
+                candidates, source_goals = evolver.generate_strategy_hypotheses(
+                    goal_embeds, goal_indices, belief_summary_h, beta,
+                )
+
+            if candidates.shape[0] > 0:
+                # Sort below-threshold strategies by fitness ascending
+                below_indices = below_mask.nonzero(as_tuple=False).squeeze(-1)
+                below_fitness = state.strategy_fitness[below_indices]
+                order = below_fitness.argsort()
+                below_sorted = below_indices[order]
+
+                # Replace worst strategies with new candidates
+                n_replace = min(candidates.shape[0], len(below_sorted))
+                with torch.no_grad():
+                    for i in range(n_replace):
+                        slot = below_sorted[i].item()
+                        old_direction = state.strategy_bank.data[slot].clone()
+
+                        # Normalize new strategy to match the bank's RMS scale.
+                        # This is not a magic number — it's derived from the
+                        # existing bank's scale so replacements don't inject
+                        # a magnitude discontinuity.
+                        bank_rms = state.strategy_bank.data.norm(dim=-1).mean().clamp(min=EPSILON)
+                        new_strat = F.normalize(candidates[i], dim=-1, eps=EPSILON) * bank_rms
+
+                        state.strategy_bank.data[slot] = new_strat
+                        state.strategy_fitness[slot] = 0.0  # neutral fitness
+                        state.strategy_access_count[slot] = 0.0
+
+                        # Log the replaced strategy as a failure for its goal
+                        if i < len(source_goals):
+                            goal_idx = source_goals[i].item()
+                            evolver.push_failure(
+                                goal_idx, old_direction,
+                                fe_delta=state.strategy_fitness[slot].item(),
+                            )
+
+                stats['strategies_replaced'] = n_replace
 
     return stats
 

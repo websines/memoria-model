@@ -47,16 +47,20 @@ from torch import Tensor
 from torch.distributions import Beta
 
 
-NUM_ACTIONS = 5
+NUM_ACTIONS = 6
 # Action indices
 ACT_ALLOCATE_RATE = 0
 ACT_MERGE_THRESHOLD = 1
 ACT_PRUNE_THRESHOLD = 2
 ACT_CONNECT_RATE = 3
 ACT_GOAL_RATE = 4
+ACT_STRATEGY_SCALE = 5
 
 # Action names for dict output
-ACTION_NAMES = ['allocate_rate', 'merge_threshold', 'prune_threshold', 'connect_rate', 'goal_rate']
+ACTION_NAMES = [
+    'allocate_rate', 'merge_threshold', 'prune_threshold',
+    'connect_rate', 'goal_rate', 'strategy_scale',
+]
 
 # Per-step outcome vector dimensions:
 #   [belief_advantage, d_fill, d_mean_radius, d_edge_count,
@@ -106,6 +110,7 @@ class CognitiveController(nn.Module):
                 (0.01, 0.50),  # prune_threshold
                 (0.0, 1.0),    # connect_rate
                 (0.0, 3.0),    # goal_rate
+                (0.0, 2.0),    # strategy_scale — multiplier on MetaParam perturbation_scale
             ]
         self.action_ranges = action_ranges
 

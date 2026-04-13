@@ -41,6 +41,14 @@ class StateConfig:
     # Per-goal failed-hypothesis ring buffer depth (Meta-Harness #2). Same
     # rationale as controller_history_depth — it's a tensor shape.
     failed_buffer_depth: int = 8
+    # ── LSR Strategy Bank ──
+    # Number of strategy vectors in the perturbation bank. Each refinement
+    # loop iteration selects from these via goal-conditioned entmax15.
+    # Kept modest by design — LSR's non-monotonic finding (2 tokens optimal,
+    # 8 degrades) suggests over-perturbation hurts more than under-perturbation.
+    max_strategies: int = 8
+    # Per-goal failed-strategy ring buffer depth (mirrors failed_buffer_depth).
+    failed_strategy_buffer_depth: int = 8
 
 
 class CognitiveState(nn.Module):
@@ -264,6 +272,37 @@ class CognitiveState(nn.Module):
             failed_buffer_depth=config.failed_buffer_depth,
         )
 
+        # ── LSR Strategy Bank (learned reasoning-mode perturbations) ──
+        from ..cognition.strategy_bank import (
+            StrategySelector, StrategyEvolver, initialize_strategy_bank,
+        )
+        # Strategy bank: orthonormal vectors in hidden space (n_embd).
+        # n_embd is not available here (it's a TransformerConfig field), so the
+        # bank is lazily initialized by MemoriaModel.__init__ which calls
+        # init_strategy_bank(n_embd) after construction. We register a
+        # placeholder so state_dict serialization works from step 0.
+        self._strategy_bank_initialized = False
+        self.strategy_bank = nn.Parameter(
+            torch.zeros(config.max_strategies, 1),  # placeholder, resized in init_strategy_bank
+            requires_grad=True,
+        )
+        self.register_buffer(
+            'strategy_fitness', torch.zeros(config.max_strategies),
+        )
+        self.register_buffer(
+            'strategy_access_count', torch.zeros(config.max_strategies),
+        )
+        # Accumulated selection weights per step (reset each step in pass 2).
+        # Used for fitness attribution: strategies that were selected more
+        # heavily during refinement get more credit/blame for FE changes.
+        self.register_buffer(
+            'strategy_step_weights', torch.zeros(config.max_strategies),
+        )
+        # Selector and evolver are None until init_strategy_bank is called
+        # (they need n_embd which only TransformerConfig knows).
+        self.strategy_selector: StrategySelector | None = None
+        self.strategy_evolver: StrategyEvolver | None = None
+
         # ── A4: SGM Safety Gate ──
         from ..cognition.safety_gate import SafetyGate
         self.safety_gate = SafetyGate(global_alpha=0.05, max_modifications=100)
@@ -321,6 +360,54 @@ class CognitiveState(nn.Module):
         # NOT registered as a buffer — it's transient per-forward and
         # must not be snapshotted or broadcast.
         self._updates_enabled: bool = True
+
+    # ── Strategy Bank Initialization ──
+
+    def init_strategy_bank(self, hidden_dim: int):
+        """Initialize strategy bank and associated modules.
+
+        Called by MemoriaModel.__init__ once n_embd is known. This two-step
+        initialization is necessary because CognitiveState is parameterized by
+        StateConfig (which doesn't know about n_embd), while the strategy bank
+        lives in hidden space (R^n_embd).
+
+        Args:
+            hidden_dim: transformer hidden dimension (n_embd)
+        """
+        import torch.nn.functional as _F
+        from ..cognition.strategy_bank import (
+            StrategySelector, StrategyEvolver, initialize_strategy_bank,
+        )
+        device = self.beliefs.device
+        max_s = self.config.max_strategies
+
+        # Initialize bank with Haar-random orthonormal rows.
+        # init_scale is set to the strategy_perturbation_scale MetaParam's
+        # initial value (softplus(-0.693) ≈ 0.5) so the bank starts at the
+        # right magnitude. The MetaParam then scales dynamically during forward.
+        init_scale = _F.softplus(torch.tensor(-0.693147)).item()
+        bank_data = initialize_strategy_bank(max_s, hidden_dim, init_scale, device)
+
+        # Replace placeholder parameter with correctly-sized one
+        self.strategy_bank = nn.Parameter(bank_data, requires_grad=True)
+        self.strategy_fitness = self.strategy_fitness.to(device)
+        self.strategy_access_count = self.strategy_access_count.to(device)
+        self.strategy_step_weights = self.strategy_step_weights.to(device)
+
+        # Build selector and evolver
+        self.strategy_selector = StrategySelector(
+            hidden_dim=hidden_dim,
+            belief_dim=self.config.belief_dim,
+            max_strategies=max_s,
+        )
+        self.strategy_evolver = StrategyEvolver(
+            hidden_dim=hidden_dim,
+            belief_dim=self.config.belief_dim,
+            max_strategies=max_s,
+            max_goals=self.config.max_goals,
+            failed_buffer_depth=self.config.failed_strategy_buffer_depth,
+        )
+        self._strategy_bank_initialized = True
 
     # ── Belief Region Accessors ──
 
@@ -791,6 +878,18 @@ class CognitiveState(nn.Module):
             },
             'skill_detector': self.skill_detector.state_dict(),
             'skill_composer': self.skill_composer.state_dict(),
+            # LSR Strategy Bank
+            'strategy_bank': self.strategy_bank.data.clone(),
+            'strategy_fitness': self.strategy_fitness.clone(),
+            'strategy_access_count': self.strategy_access_count.clone(),
+            'strategy_selector': (
+                self.strategy_selector.state_dict()
+                if self.strategy_selector is not None else None
+            ),
+            'strategy_evolver': (
+                self.strategy_evolver.state_dict()
+                if self.strategy_evolver is not None else None
+            ),
         }
 
     def load_state_cognitive(self, state: dict):
@@ -944,6 +1043,17 @@ class CognitiveState(nn.Module):
                 self.skill_detector.load_state_dict(state['skill_detector'])
             if 'skill_composer' in state:
                 self.skill_composer.load_state_dict(state['skill_composer'])
+            # LSR Strategy Bank
+            if 'strategy_bank' in state and self._strategy_bank_initialized:
+                self.strategy_bank.data.copy_(state['strategy_bank'])
+                self.strategy_fitness.copy_(state['strategy_fitness'])
+                self.strategy_access_count.copy_(state['strategy_access_count'])
+            if 'strategy_selector' in state and state['strategy_selector'] is not None:
+                if self.strategy_selector is not None:
+                    self.strategy_selector.load_state_dict(state['strategy_selector'])
+            if 'strategy_evolver' in state and state['strategy_evolver'] is not None:
+                if self.strategy_evolver is not None:
+                    self.strategy_evolver.load_state_dict(state['strategy_evolver'])
 
     # ── Summary ──
 

@@ -57,7 +57,7 @@ Each system handles something the others cannot. MLA+DSA gives exact sparse reca
 
 Memoria is a self-modifying architecture: the system changes its own compute graph — the number of nodes, the topology of edges, the optimization objective, and the parameters governing those modifications — at runtime. This is not parameter tuning within a fixed graph. The graph itself grows, splits, prunes, and rewires based on what the system learns.
 
-**11 self-modification mechanisms, organized in a recursive hierarchy:**
+**12 self-modification mechanisms, organized in a recursive hierarchy:**
 
 | Layer | Mechanism | What changes at runtime | Module |
 |-------|-----------|------------------------|--------|
@@ -66,13 +66,14 @@ Memoria is a self-modifying architecture: the system changes its own compute gra
 | 2 | Structural plasticity | Belief splitting (polysemantic → children) and pruning | `structural_plasticity.py` |
 | 3 | Provisional beliefs + autoresearch | Hypothesis beliefs generated, tested, promoted or killed; search/eval split requires post-allocation reads before promotion (Meta-Harness); evicted hypotheses feed back into HypothesisGenerator as per-goal failed-angle conditioning; PARL fair round-robin allocation | `autoresearch.py`, `provisional.py` |
 | 4 | SRWM | Meta-parameters become state-dependent via fast-weight matrix | `srwm.py` |
-| 5 | Cognitive controller | PARL staged reward: r_perf + r_parallel + r_finish (annealed). Learned policy over rates of layers 0-4. State encoder: 10 scalar features PLUS a GRU over the rolling (action, outcome) history (Meta-Harness rich-history encoding), added via zero-initialized projection so initial behavior matches scalar-only baseline | `cognitive_controller.py` |
+| 5 | Cognitive controller | PARL staged reward: r_perf + r_parallel + r_finish (annealed). Learned policy over rates of layers 0-5 + strategy_scale. State encoder: 10 scalar features PLUS a GRU over the rolling (action, outcome) history (Meta-Harness rich-history encoding), added via zero-initialized projection so initial behavior matches scalar-only baseline | `cognitive_controller.py` |
 | 6 | SGM safety gate | Statistical validation of modifications (e-value testing) | `safety_gate.py` |
 | 7 | Telos goal generation | Creates new goals from surprise → changes what the system optimizes for | `telos_module.py` |
 | 8 | Adaptive depth | Variable computation depth per belief (ACT halting) + per-position refinement routing (MoR) | `adaptive_depth.py`, `memoria_model.py:RefinementRouter` |
 | 9 | Message passing + dream | Belief positions shift via loopy BP on the causal graph | `message_passing.py` |
 | 10 | Parallel goal pursuit | Per-head goal routing in read path (MoH-style); different heads pursue different goals simultaneously | `read_path.py:GoalRouter` |
 | 11 | BLT byte encoding | Learned byte→patch compression replaces fixed tokenizer; N-gram conv replaces EngramCache hash tables | `blt.py:ByteEncoder` |
+| 12 | LSR strategy bank | Learned reasoning-mode perturbations in refinement loops; goal-conditioned selection, fitness-driven evolution, failed-strategy conditioning | `strategy_bank.py`, `memoria_model.py` |
 
 **The recursive autoresearch loop.** These mechanisms don't operate independently — they form a closed loop of self-directed architectural modification:
 
@@ -143,6 +144,51 @@ Reference: MoH (arXiv:2410.11842) — mixture-of-head attention routing
 Reference: MOORE (arXiv:2311.11385) — orthogonal expert specialization
 Reference: D3PO (arXiv:2602.07764) — provable diversity regularization
 Reference: GCR-PPO (arXiv:2509.14816) — per-objective gradient decomposition
+
+### LSR Strategy Bank (Learned Reasoning-Mode Perturbations)
+
+Latent Space Reasoning (LSR) demonstrated that injecting diverse continuous perturbation vectors into a frozen LLM's computation shifts it between different reasoning trajectories, and the union of trajectories covers more solution space than any single trajectory. Memoria internalizes this mechanism as the **Strategy Bank** — learned perturbation vectors that live in the cognitive state and evolve through Pass 2.
+
+**Three tiers:**
+
+| Tier | Mechanism | What it provides |
+|------|-----------|-----------------|
+| **1. Orthogonal bank** | `[max_strategies, n_embd]` parameter initialized via QR decomposition (Haar-random orthonormal basis) | Maximal directional diversity — each refinement iteration explores a genuinely different computational direction |
+| **2. Goal-conditioned selection** | `StrategySelector`: `(hidden_pooled, goal_embed, loop_fraction) → entmax15 weights → weighted strategy` | Task-type-specific reasoning modes — the model learns which perturbation patterns help for which goals |
+| **3. Pass 2 evolution** | `StrategyEvolver`: fitness EMA tracking, re-orthogonalization, hypothesis generation, failed-strategy conditioning | Strategies improve over training — bad strategies are replaced by goal-directed candidates |
+
+**Integration point: the refinement loop.** Each refinement loop iteration previously used a single learned direction (`refinement_gate * loop_fraction`). With the strategy bank, each iteration selects from the bank via goal-conditioned entmax15:
+
+```
+For each refinement loop iteration:
+  1. Pool hidden state → h_pooled [B, n_embd]
+  2. StrategySelector(h_pooled, goal_mean, loop_fraction, bank) → perturbation [B, n_embd]
+  3. Scale by strategy_perturbation_scale (learned MetaParam)
+  4. Add to residual stream: x = x + perturbation
+  5. Accumulate selection weights for fitness attribution
+```
+
+**Backward compatibility**: `StrategySelector` is zero-initialized. At t=0, entmax15 sees uniform logits → uniform weights → perturbation = mean of orthogonal bank → zero. The model behaves identically to pre-strategy-bank code until the selector learns to specialize.
+
+**Strategy evolution in Pass 2** (operation 5c, runs every step):
+
+1. **Fitness update**: per-strategy fitness is an EMA of FE improvement, attributed proportionally to selection weights. If the refinement loop improved FE and strategy 3 had weight 0.8, strategy 3 gets 80% of the credit.
+2. **Re-orthogonalization**: when max pairwise cosine similarity exceeds `strategy_orthog_min_similarity` (learned MetaParam, init 0.8), modified Gram-Schmidt restores diversity. Pivots by fitness (best strategy unchanged).
+3. **Strategy hypothesis generation**: at sequence boundaries, `StrategyEvolver` generates candidate strategy vectors from active goals (projected to hidden space), conditioned on the per-goal failed-strategy ring buffer. Candidates replace the lowest-fitness strategies.
+4. **Failed-strategy logging**: replaced strategies push their direction into a per-goal ring buffer of depth `failed_strategy_buffer_depth`. The generator learns to push away from previously-failed reasoning modes.
+
+**No magic numbers**: `strategy_perturbation_scale` (softplus, init ≈ 0.5), `strategy_fitness_ema_decay` (sigmoid, init ≈ 0.95), `strategy_orthog_min_similarity` (sigmoid, init ≈ 0.8), and `strategy_promotion_threshold` (centered sigmoid, init ≈ −0.8) are all learned MetaParams. `max_strategies` (8) and `failed_strategy_buffer_depth` (8) are structural tensor shapes in `StateConfig`. The cognitive controller adds `strategy_scale` as a 6th action (range [0, 2]) — it modulates perturbation intensity based on state uncertainty.
+
+**Relationship to LSR.** LSR discovered that random perturbations help frozen models access different reasoning trajectories. Memoria's strategy bank solves this systematically:
+- Random noise → learned, persistent, goal-conditioned strategies
+- External MLP scorer → intrinsic free energy signal
+- Evolutionary search (30 generations) → gradient-driven MetaParams + Pass 2 structural evolution
+- Discarded failures → per-goal failed-strategy ring buffer conditioning future generation
+- Oracle selection (try all, pick best) → entmax15 sparse selection (commit to 1-2 per iteration)
+
+Reference: Latent Space Reasoning (github.com/dl1683/Latent-Space-Reasoning) — soft prompt perturbation, orthogonal W projection, non-monotonic perturbation curve
+Reference: Johnson-Lindenstrauss (1984) — random orthogonal projections preserve distances
+Reference: Meta-Harness (Stanford, arXiv:2603.28052) — failed-hypothesis conditioning
 
 ### Belief-Conditioned Sparse Attention (DSA)
 

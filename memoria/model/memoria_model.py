@@ -405,6 +405,12 @@ class MemoriaModel(nn.Module):
             if self.predictive_refinement:
                 self.refinement_router = RefinementRouter(config.transformer.n_embd)
 
+        # ── LSR Strategy Bank initialization ──
+        # CognitiveState doesn't know n_embd (it's a TransformerConfig field),
+        # so strategy bank is lazily initialized here where both are available.
+        if self.max_refinement_loops > 0:
+            self.state.init_strategy_bank(config.transformer.n_embd)
+
         # Kendall/Gal uncertainty weighting (CVPR 2018, arXiv:1705.07115)
         # Learns optimal per-loss-group weighting automatically.
         # Three groups: token loss, free energy loss, auxiliary losses
@@ -688,6 +694,7 @@ class MemoriaModel(nn.Module):
         n_refinement_loops = 0
         mean_gate_value = 1.0  # tracking for diagnostics
         retrieval_skips = 0  # count of error-gated retrieval skips
+        strategy_step_weights = None  # accumulated strategy selection weights
         if self.max_refinement_loops > 0:
             # Re-run the last interface_every blocks (the final "cycle").
             # For 12 layers, interface_every=4: re-run blocks [8, 9, 10, 11].
@@ -722,18 +729,78 @@ class MemoriaModel(nn.Module):
 
             loop_limit = oracle_loops if self.training else self.max_refinement_loops
 
+            # ── LSR Strategy Bank: setup for goal-conditioned perturbation ──
+            # Compute the mean active goal embedding for strategy selection.
+            # Reset per-step accumulator for fitness attribution in Pass 2.
+            use_strategy = self.state._strategy_bank_initialized
+            if use_strategy:
+                strategy_step_weights = torch.zeros(
+                    self.state.config.max_strategies,
+                    device=x.device,
+                )
+                # Mean active goal embedding for the selector
+                goal_indices, goal_embeds, _ = self.state.get_active_goals()
+                if len(goal_indices) > 0:
+                    goal_embed_mean = goal_embeds.mean(dim=0)  # [belief_dim]
+                else:
+                    goal_embed_mean = torch.zeros(
+                        self.state.config.belief_dim, device=x.device,
+                    )
+                # Strategy perturbation scale: MetaParam * controller action
+                strat_base_scale = self.state.meta_params.strategy_perturbation_scale
+
             for loop_i in range(loop_limit):
                 n_refinement_loops += 1
 
                 # Save pre-loop state for delta computation (predictive refinement)
                 x_pre_loop = x if not use_pred_refine else x.clone()
 
-                # Step 1: Loop-index encoding — additive signal so the model
-                # knows which iteration it's on. Separate parameter from lifeline
-                # gate to avoid conflating two functions.
+                # Step 1: Loop-index encoding via goal-conditioned strategy
+                # perturbation (LSR Strategy Bank). Replaces the old single-
+                # direction loop_signal with diverse, learned perturbation
+                # vectors selected based on (hidden_state, goal, iteration).
+                #
+                # Backward compatible: if strategy bank is not initialized
+                # (max_refinement_loops was 0 at config time), falls back to
+                # the original refinement_gate * loop_fraction signal.
+                #
+                # Reference: LSR (dl1683/Latent-Space-Reasoning) — trajectory
+                #   perturbation via orthogonal soft prompt injection
                 loop_fraction = loop_i / max(self.max_refinement_loops, 1)
-                loop_signal = self.refinement_gate * loop_fraction
-                x = x + loop_signal.unsqueeze(0).unsqueeze(0)
+
+                if use_strategy and self.state.strategy_selector is not None:
+                    # Goal-conditioned strategy selection (Tier 2)
+                    h_pooled = x[:, :T, :].mean(dim=1) if M > 0 else x.mean(dim=1)
+                    perturbation = self.state.strategy_selector(
+                        h_pooled, goal_embed_mean, loop_fraction,
+                        self.state.strategy_bank,
+                    )  # [B, n_embd]
+
+                    # Scale by MetaParam (learned) — controller modulates further
+                    loop_signal = perturbation * strat_base_scale
+                    x = x + loop_signal.unsqueeze(1)  # [B, 1, n_embd] broadcast over T
+
+                    # Accumulate selection weights for fitness attribution.
+                    # The selector uses entmax15, so weights are sparse — only
+                    # the 1-2 selected strategies accumulate credit.
+                    with torch.no_grad():
+                        sel_logits = self.state.strategy_selector.proj(
+                            torch.cat([
+                                h_pooled.mean(dim=0, keepdim=True),
+                                goal_embed_mean.unsqueeze(0),
+                                torch.tensor([[loop_fraction]], device=x.device),
+                            ], dim=-1),
+                        )
+                        try:
+                            from entmax import entmax15
+                            sel_weights = entmax15(sel_logits, dim=-1).squeeze(0)
+                        except ImportError:
+                            sel_weights = torch.softmax(sel_logits, dim=-1).squeeze(0)
+                        strategy_step_weights += sel_weights
+                else:
+                    # Fallback: original refinement_gate * loop_fraction
+                    loop_signal = self.refinement_gate * loop_fraction
+                    x = x + loop_signal.unsqueeze(0).unsqueeze(0)
 
                 # Step 2: Re-run upper transformer layers
                 # Gradient checkpointing is REQUIRED here: the halt_logit_list
@@ -1095,6 +1162,12 @@ class MemoriaModel(nn.Module):
             result['loss_ponder'] = loss_ponder
             result['refinement_mean_gate'] = mean_gate_value
             result['refinement_retrieval_skips'] = retrieval_skips
+
+            # Store strategy selection weights for Pass 2 fitness attribution
+            if strategy_step_weights is not None:
+                with torch.no_grad():
+                    self.state.strategy_step_weights.copy_(strategy_step_weights)
+            result['strategy_step_weights'] = strategy_step_weights
 
             w_util = self.config.training.utility_loss_weight
             w_surp = self.config.training.surprise_loss_weight

@@ -653,6 +653,12 @@ def train(
             if isinstance(_current_fe, torch.Tensor):
                 _current_fe = _current_fe.item()
 
+            # LSR Strategy Bank: extract refinement FE delta for fitness
+            # attribution. The forward pass stores loss_fe which includes the
+            # effect of refinement loops. Belief advantage serves as the
+            # reward proxy — negative advantage means refinement helped.
+            _refinement_fe_delta = -belief_advantage_ema  # negate so lower FE = positive reward
+
             pass2_stats = run_pass2(
                 state=base_model.state,
                 candidates=gathered_candidates,
@@ -663,6 +669,7 @@ def train(
                 belief_advantage=belief_advantage_ema,
                 current_fe=_current_fe,
                 training_progress=step / max(max_steps, 1),
+                refinement_fe_delta=_refinement_fe_delta,
             )
         else:
             pass2_stats = {
