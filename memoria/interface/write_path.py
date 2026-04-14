@@ -35,7 +35,7 @@ class WriteCandidate:
     source_layer: int              # which state interface layer produced this
 
 
-def pack_candidates(candidates: list[WriteCandidate], device: torch.device | str = "cpu") -> Tensor:
+def pack_candidates(candidates: list[WriteCandidate], *, device: torch.device | str) -> Tensor:
     """Pack candidates into a single tensor for distributed gather.
 
     Vectorized: stacks belief vectors and metadata in one shot.

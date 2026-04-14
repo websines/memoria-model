@@ -96,6 +96,12 @@ class InPlaceTTT(nn.Module):
         self.ttt_layers = set(ttt_layers)
         self._ttt_layer_list = sorted(ttt_layers)
 
+        # Kaiming-style init scaled so the product A @ B starts O(1/D) — same
+        # magnitude as a single-layer residual perturbation.
+        # Zero init is a dead fixed point: grad_A ∝ h @ B^T = 0 when B = 0,
+        # so the TTT inner loop can never bootstrap.
+        init_std = (2.0 / (hidden_dim * rank)) ** 0.5
+
         # ── Per-layer persistent low-rank deltas ──
         # These are NOT nn.Parameters in the sense that the main optimizer
         # trains them. They ARE registered as parameters so they're saved/
@@ -109,10 +115,10 @@ class InPlaceTTT(nn.Module):
         for layer_idx in ttt_layers:
             key = str(layer_idx)
             self.delta_A[key] = nn.Parameter(
-                torch.zeros(hidden_dim, rank), requires_grad=False,
+                torch.randn(hidden_dim, rank) * init_std, requires_grad=False,
             )
             self.delta_B[key] = nn.Parameter(
-                torch.zeros(rank, hidden_dim), requires_grad=False,
+                torch.randn(rank, hidden_dim) * init_std, requires_grad=False,
             )
 
         # ── Meta-learned initialization (TTT-E2E, arXiv:2512.23675) ──
@@ -123,8 +129,8 @@ class InPlaceTTT(nn.Module):
         self.init_B = nn.ParameterDict()
         for layer_idx in ttt_layers:
             key = str(layer_idx)
-            self.init_A[key] = nn.Parameter(torch.zeros(hidden_dim, rank))
-            self.init_B[key] = nn.Parameter(torch.zeros(rank, hidden_dim))
+            self.init_A[key] = nn.Parameter(torch.randn(hidden_dim, rank) * init_std)
+            self.init_B[key] = nn.Parameter(torch.randn(rank, hidden_dim) * init_std)
 
         # Learnable step-size per layer (trained during training, fixed at inference)
         # Controls how much each layer adapts per chunk
@@ -180,8 +186,10 @@ class InPlaceTTT(nn.Module):
                 # which would rebind the Parameter's storage and silently
                 # break any stale reference held by DDP buckets or optimizer
                 # state).
-                self.delta_A[key].copy_(F.normalize(self.delta_A[key], dim=0))
-                self.delta_B[key].copy_(F.normalize(self.delta_B[key], dim=0))
+                norm_A = self.delta_A[key].norm(dim=0, keepdim=True).clamp(min=1e-8)
+                self.delta_A[key].div_(norm_A)
+                norm_B = self.delta_B[key].norm(dim=0, keepdim=True).clamp(min=1e-8)
+                self.delta_B[key].div_(norm_B)
 
     def apply_decay(self, hidden: Tensor, layer_key: str | None = None):
         """Apply learned Titans-style decay to deltas before TTT step.

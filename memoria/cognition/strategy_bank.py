@@ -111,9 +111,15 @@ class StrategySelector(nn.Module):
 
         # Sparse selection: entmax15 zeros out low-relevance strategies,
         # forcing each iteration to commit to a specific reasoning mode.
-        if entmax15 is not None:
+        # Guard: entmax15's bisection crashes (CUDA assert) on NaN/Inf or
+        # constant logits (support_size=0 → gather index -1). Clamp and
+        # fall back to softmax when logits are degenerate.
+        has_bad_logits = torch.isnan(logits).any() or torch.isinf(logits).any()
+        if entmax15 is not None and not has_bad_logits:
+            logits = logits.clamp(-30.0, 30.0)
             weights = entmax15(logits, dim=-1)  # [B, max_strategies]
         else:
+            logits = logits.clamp(-30.0, 30.0).nan_to_num(0.0)
             weights = F.softmax(logits, dim=-1)
 
         # Weighted combination of strategies

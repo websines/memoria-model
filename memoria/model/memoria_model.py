@@ -793,11 +793,14 @@ class MemoriaModel(nn.Module):
                                 torch.tensor([[loop_fraction]], device=x.device),
                             ], dim=-1),
                         )
+                        sel_logits = sel_logits.clamp(-30.0, 30.0)
+                        _bad = torch.isnan(sel_logits).any() or torch.isinf(sel_logits).any()
                         try:
                             from entmax import entmax15
-                            sel_weights = entmax15(sel_logits, dim=-1).squeeze(0)
+                            sel_weights = (torch.softmax(sel_logits.nan_to_num(0.0), dim=-1).squeeze(0)
+                                           if _bad else entmax15(sel_logits, dim=-1).squeeze(0))
                         except ImportError:
-                            sel_weights = torch.softmax(sel_logits, dim=-1).squeeze(0)
+                            sel_weights = torch.softmax(sel_logits.nan_to_num(0.0), dim=-1).squeeze(0)
                         strategy_step_weights += sel_weights
                 else:
                     # Fallback: original refinement_gate * loop_fraction
