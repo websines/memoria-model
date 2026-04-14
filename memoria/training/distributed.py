@@ -169,7 +169,7 @@ def sync_ranks(world_size: int):
         dist.barrier()
 
 
-def gather_candidates(packed_candidates: torch.Tensor, rank: int, world_size: int, belief_dim: int) -> torch.Tensor:
+def gather_candidates(packed_candidates: torch.Tensor, rank: int, world_size: int, belief_dim: int, device: torch.device | str | None = None) -> torch.Tensor:
     """Gather packed candidate tensors from all ranks to rank 0.
 
     Args:
@@ -177,6 +177,7 @@ def gather_candidates(packed_candidates: torch.Tensor, rank: int, world_size: in
         rank: this process rank
         world_size: total processes
         belief_dim: belief dimension (D)
+        device: CUDA device for NCCL collectives. Falls back to packed_candidates.device.
 
     Returns:
         On rank 0: [N_total, D+3] concatenated candidates from all ranks.
@@ -186,6 +187,10 @@ def gather_candidates(packed_candidates: torch.Tensor, rank: int, world_size: in
         return packed_candidates
 
     cols = belief_dim + 3
+
+    # Ensure tensors are on the NCCL-compatible device (empty packs may arrive on CPU)
+    if device is not None and packed_candidates.device != torch.device(device):
+        packed_candidates = packed_candidates.to(device)
 
     # First, share candidate counts so we can allocate receive buffers
     local_count = torch.tensor([packed_candidates.shape[0]], device=packed_candidates.device)

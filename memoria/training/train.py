@@ -629,8 +629,8 @@ def train(
             break
 
         # Gather candidates and read indices from all ranks to rank 0
-        packed = pack_candidates(all_candidates)
-        packed = gather_candidates(packed, rank, world_size, belief_dim)
+        packed = pack_candidates(all_candidates, device=device)
+        packed = gather_candidates(packed, rank, world_size, belief_dim, device=device)
         all_read_indices = gather_read_indices(all_read_indices, rank, world_size, device)
 
         # Pass 2: cognitive update on rank 0 only

@@ -35,17 +35,21 @@ class WriteCandidate:
     source_layer: int              # which state interface layer produced this
 
 
-def pack_candidates(candidates: list[WriteCandidate]) -> Tensor:
+def pack_candidates(candidates: list[WriteCandidate], device: torch.device | str = "cpu") -> Tensor:
     """Pack candidates into a single tensor for distributed gather.
 
     Vectorized: stacks belief vectors and metadata in one shot.
+
+    Args:
+        candidates: list of WriteCandidate from forward pass.
+        device: target device for the empty-case tensor (must match NCCL rank device).
 
     Returns:
         [N, D+3] tensor where last 3 cols are (matched_slot, match_similarity, source_layer).
         Returns empty [0, 0] tensor if no candidates.
     """
     if not candidates:
-        return torch.zeros(0, 0)
+        return torch.zeros(0, 0, device=device)
     D = candidates[0].belief_vector.shape[0]
     device = candidates[0].belief_vector.device
     N = len(candidates)

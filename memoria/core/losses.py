@@ -159,7 +159,7 @@ def compute_differentiable_free_energy(
         if huber_delta is not None:
             energy_terms.append(F.huber_loss(
                 disagreement, torch.zeros_like(disagreement),
-                reduction='mean', delta=float(huber_delta),
+                reduction='mean', delta=huber_delta.detach().item() if isinstance(huber_delta, Tensor) else huber_delta,
             ))
         else:
             energy_terms.append(disagreement.mean())

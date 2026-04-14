@@ -140,7 +140,7 @@ def compute_expected_free_energy(
         # Prevents catastrophic belief updates from spurious observation matches.
         # Reference: MIRAS/YAAD (arXiv:2504.13173); Huber (1964)
         disagreement = 1.0 - cos_sim                     # [N], range [0, 2]
-        delta = float(state.meta_params.huber_delta)
+        delta = state.meta_params.huber_delta.detach().item()
         risk = F.huber_loss(
             disagreement, torch.zeros_like(disagreement),
             reduction='mean', delta=delta,

@@ -1166,7 +1166,7 @@ class MemoriaModel(nn.Module):
             result['refinement_retrieval_skips'] = retrieval_skips
 
             # Store strategy selection weights for Pass 2 fitness attribution
-            if strategy_step_weights is not None:
+            if strategy_step_weights is not None and update_state:
                 with torch.no_grad():
                     self.state.strategy_step_weights.copy_(strategy_step_weights)
             result['strategy_step_weights'] = strategy_step_weights
