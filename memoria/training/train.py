@@ -21,6 +21,7 @@ import os
 import time
 import threading
 import queue
+import multiprocessing as mp
 import torch
 from contextlib import nullcontext
 from pathlib import Path
@@ -43,69 +44,111 @@ from ..cognition.meta_learning import compute_beta  # noqa: F401 — used transi
 from .cognitive_seed import save_cognitive_seed
 
 
-class DataPrefetcher:
-    """Background thread that prefetches batches from a data stream.
+def _prefetch_worker(
+    out_queue: mp.Queue,
+    stop_event,
+    batch_size: int,
+    seq_len: int,
+    synthetic_data: list[str] | None,
+    byte_mode: bool,
+    skip_documents: int,
+):
+    """Subprocess that creates its own data stream and puts batches onto a queue.
 
-    Keeps a queue of ready-to-go batches so the training loop never waits
-    on data loading. Propagates errors from the worker thread.
+    Runs in a separate process so fsspec/aiohttp get their own event loop
+    (the thread-based prefetcher crashed because fsspec's async HTTP client
+    conflicts with the main thread's asyncio loop).
+    """
+    from memoria.data.curated import curated_stream
+
+    stream = curated_stream(
+        tokenizer=None,
+        seq_len=seq_len,
+        synthetic_data=synthetic_data,
+        byte_mode=byte_mode,
+        skip_documents=skip_documents,
+    )
+    while not stop_event.is_set():
+        try:
+            seqs = []
+            for _ in range(batch_size):
+                while True:
+                    try:
+                        seq = next(stream)
+                        seqs.append(seq)
+                        break
+                    except StopIteration:
+                        return  # stream exhausted (shouldn't happen)
+                    except Exception as e:
+                        print(f"  [prefetcher] Skipping bad sample: {str(e)[:80]}")
+                        continue
+            input_ids = torch.stack([s['input_ids'] for s in seqs])
+            labels = torch.stack([s['labels'] for s in seqs])
+            # Put with timeout so we don't block forever if main process dies
+            while not stop_event.is_set():
+                try:
+                    out_queue.put((input_ids, labels), timeout=5)
+                    break
+                except Exception:
+                    continue
+        except Exception as e:
+            out_queue.put(e)
+            return
+
+
+class DataPrefetcher:
+    """Process-based prefetcher that keeps a queue of ready batches.
+
+    Uses a subprocess instead of a thread to avoid fsspec/aiohttp event loop
+    conflicts. The child process creates its own data stream and has its own
+    asyncio event loop, so HuggingFace datasets' async file resolution works.
     """
 
-    def __init__(self, data_stream, batch_size: int, device: torch.device, prefetch_count: int = 2):
-        self.stream = data_stream
-        self.batch_size = batch_size
+    def __init__(
+        self,
+        batch_size: int,
+        device: torch.device,
+        seq_len: int,
+        synthetic_data: list[str] | None,
+        byte_mode: bool,
+        skip_documents: int = 0,
+        prefetch_count: int = 3,
+    ):
         self.device = device
-        self.queue = queue.Queue(maxsize=prefetch_count)
-        self.stop_event = threading.Event()
-        self._error = None
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-
-    def _worker(self):
-        try:
-            while not self.stop_event.is_set():
-                seqs = []
-                for _ in range(self.batch_size):
-                    while True:
-                        try:
-                            seq = next(self.stream)
-                            seqs.append(seq)
-                            break
-                        except StopIteration:
-                            raise
-                        except Exception as e:
-                            # Skip bad samples (fsspec errors, malformed data)
-                            # but don't kill the worker
-                            print(f"  [prefetcher] Skipping bad sample: {str(e)[:80]}")
-                            continue
-                input_ids = torch.stack([s['input_ids'] for s in seqs])
-                labels = torch.stack([s['labels'] for s in seqs])
-                self.queue.put((input_ids, labels))
-        except StopIteration:
-            pass
-        except Exception as e:
-            self._error = e
+        ctx = mp.get_context('spawn')
+        self._queue = ctx.Queue(maxsize=prefetch_count)
+        self._stop = ctx.Event()
+        self._process = ctx.Process(
+            target=_prefetch_worker,
+            args=(
+                self._queue, self._stop, batch_size,
+                seq_len, synthetic_data, byte_mode, skip_documents,
+            ),
+            daemon=True,
+        )
+        self._process.start()
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._error is not None:
-            raise RuntimeError(f"Data prefetcher failed: {self._error}")
-        # Short poll intervals (5s) so worker errors surface quickly instead of
-        # blocking for the full 120s timeout before checking
-        deadline = time.monotonic() + 300  # 5 min timeout (HF downloads can be slow on DDP)
+        deadline = time.monotonic() + 300
         while True:
             try:
-                input_ids, labels = self.queue.get(timeout=10)
-                break
-            except queue.Empty:
-                if self._error is not None:
-                    raise RuntimeError(f"Data prefetcher failed: {self._error}")
-                if not self.thread.is_alive():
-                    raise RuntimeError("Data prefetcher thread died unexpectedly")
+                item = self._queue.get(timeout=10)
+            except Exception:
+                if not self._process.is_alive():
+                    raise RuntimeError("Data prefetcher process died")
                 if time.monotonic() > deadline:
-                    raise RuntimeError("Data prefetcher timed out after 300s — check data pipeline")
-        return input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
+                    raise RuntimeError("Data prefetcher timed out after 300s")
+                continue
+            if isinstance(item, Exception):
+                raise RuntimeError(f"Data prefetcher failed: {item}")
+            input_ids, labels = item
+            return input_ids.to(self.device, non_blocking=True), labels.to(self.device, non_blocking=True)
 
     def stop(self):
-        self.stop_event.set()
+        self._stop.set()
+        self._process.join(timeout=10)
+        if self._process.is_alive():
+            self._process.kill()
 
 
 def _load_env():
@@ -298,24 +341,11 @@ def train(
         else:
             print("Starting data stream...")
 
-    # Curated multi-tier mix for all modes: state-essential + reasoning + tool calling.
-    # BLT mode: encode as UTF-8 bytes (0-259) instead of BPE tokens.
-    #
-    # With dispatch_batches=True, only rank 0 loads data and broadcasts batches.
-    # Non-main ranks skip data stream creation entirely — no duplicate HF downloads.
+    # Data stream is created inside the prefetcher subprocess (see DataPrefetcher).
+    # Only rank 0 loads data; other ranks receive batches via broadcast.
     if is_main:
         mode_label = "byte-level" if blt_enabled else "token-level"
         print(f"Using curated dataset mix ({mode_label}, state-essential + reasoning + tool calling)")
-        data_stream = curated_stream(
-            tokenizer,
-            seq_len=config.transformer.sequence_len,
-            synthetic_data=synthetic_data if synthetic_data else None,
-            code_languages=["python", "javascript", "rust", "go"],
-            skip_documents=skip_docs,
-            byte_mode=blt_enabled,
-        )
-    else:
-        data_stream = None  # rank 1+ receives batches via dispatch_batches
 
     # Checkpoint dir
     ckpt_path = Path(checkpoint_dir)
@@ -345,15 +375,24 @@ def train(
         print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
         print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
 
-    # Data loading: synchronous on rank 0, broadcast to other ranks.
-    # No background thread prefetcher — fsspec's async HTTP client crashes
-    # in background threads (known issue: event loop conflicts).
-    # The data stream iterator is called directly in the training loop.
-    # GPU idles ~50-100ms between steps for cached data — acceptable tradeoff
-    # vs crashing every run.
+    # Data loading: process-based prefetcher on rank 0, broadcast to other ranks.
+    # Uses a subprocess (not a thread) so fsspec/aiohttp get their own asyncio
+    # event loop — the thread-based prefetcher crashed due to event loop conflicts.
+    # The worker process creates its own curated_stream and puts batches onto a
+    # multiprocessing.Queue, overlapping data loading with GPU compute.
     if is_main:
-        print("Data stream ready (synchronous loading, no prefetcher)")
-    prefetcher = None  # kept as None for cleanup code compatibility
+        prefetcher = DataPrefetcher(
+            batch_size=tc.device_batch_size,
+            device=device,
+            seq_len=config.transformer.sequence_len,
+            synthetic_data=synthetic_data if synthetic_data else None,
+            byte_mode=blt_enabled,
+            skip_documents=skip_docs,
+            prefetch_count=3,
+        )
+        print("Data stream ready (process-based prefetcher, queue depth 3)")
+    else:
+        prefetcher = None
 
     # torch.compile
     should_compile = (
@@ -395,35 +434,16 @@ def train(
     else:
         eval_data_stream = None
 
-    # ── Prime data_stream (rank 0 only) ─────────────────────────────────────
-    # The first `next(data_stream)` call is very expensive: it triggers lazy
-    # HF dataset probing for ~50 curated sources, FineWeb file resolution, and
-    # the initial fill of a 131072-byte packing buffer. 5-15 minutes of pure
-    # Python work on rank 0, with transient HF retries potentially extending
-    # it further.
-    #
-    # If this happens INSIDE the main training loop (as it did before this
-    # fix), rank 1 is already blocked at `torch.distributed.broadcast(
-    # input_ids, src=0)` waiting for rank 0. That broadcast is an NCCL
-    # collective, so rank 1's watchdog starts counting the moment the op is
-    # enqueued. At the default 10-minute watchdog deadline, rank 1 tears down
-    # with a BROADCAST timeout — a bogus diagnostic because the actual problem
-    # is a slow data load on the other rank, not a NCCL failure.
-    #
-    # Priming here instead means the slow load happens while rank 1 is idle
-    # in pure Python (stepping into the `else` branch of this same `if
-    # is_main` block, then reaching the DDP-warmup barrier). Rank 1 enqueues
-    # its first NCCL op only at the DDP warmup barrier; the bumped 30-minute
-    # InitProcessGroupKwargs timeout above gives a safety margin in case
-    # priming ever legitimately takes longer than 10 minutes.
-    #
-    # We prepend the first sequence back via itertools.chain so no data is
-    # wasted and the caller's iteration contract is preserved.
+    # ── Prime prefetcher (rank 0 only) ─────────────────────────────────────
+    # The prefetcher subprocess handles HF probing in the background while
+    # we proceed to DDP warmup. Wait for the first batch to be ready so we
+    # know the stream is alive before entering the training loop.
     if is_main:
-        import itertools
-        print("Priming data stream (first next() triggers HF probing — this takes several minutes)...")
-        _primed_first = next(data_stream)
-        data_stream = itertools.chain([_primed_first], data_stream)
+        print("Priming data stream (prefetcher subprocess resolving HF sources)...")
+        # Block until the first batch is ready — confirms the subprocess is alive
+        # and HF probing is complete. The batch is discarded (1 of 20000 steps).
+        _prime_ids, _prime_labels = prefetcher.next_batch()
+        del _prime_ids, _prime_labels
         print("Data stream primed.")
 
     # ── Compile / DDP warmup ─────────────────────────────────────────────────
@@ -492,46 +512,10 @@ def train(
             if step == 0 and is_main:
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
-            # Rank 0 loads data synchronously and broadcasts to other ranks.
+            # Rank 0 fetches pre-loaded batches from the prefetcher process,
+            # other ranks allocate empty tensors to receive the broadcast.
             if is_main:
-                seqs = []
-                for _ in range(tc.device_batch_size):
-                    while True:
-                        try:
-                            seq = next(data_stream)
-                            seqs.append(seq)
-                            break
-                        except StopIteration:
-                            # curated_stream() is supposed to be infinite. If
-                            # it raises StopIteration, the generator body
-                            # either returned normally (shouldn't be possible
-                            # — there's no `return` inside its while True) or,
-                            # far more likely, some previous `next()` call
-                            # let an exception escape the generator body, which
-                            # permanently kills the generator; all subsequent
-                            # calls raise StopIteration. If you see this,
-                            # check for an earlier "[data] ... raised ..." log
-                            # line — that's the real cause. The fix is to add
-                            # another `except Exception` branch inside
-                            # curated_stream at whichever site the exception
-                            # escaped from.
-                            raise RuntimeError(
-                                f"Data stream exhausted at step {step} — "
-                                f"should be infinite. An exception likely "
-                                f"escaped curated_stream; scroll up for "
-                                f"'[data] ... raised ...' log lines."
-                            )
-                        except Exception as e:
-                            # Print at every step, not just step 0. Hiding
-                            # these after step 0 is what turned this bug
-                            # into a mystery.
-                            print(
-                                f"  [data] Skipping bad sample at step {step}: "
-                                f"{type(e).__name__}: {str(e)[:120]}"
-                            )
-                            continue
-                input_ids = torch.stack([s['input_ids'] for s in seqs]).to(device)
-                labels = torch.stack([s['labels'] for s in seqs]).to(device)
+                input_ids, labels = prefetcher.next_batch()
                 # SkyLadder: truncate to current context length
                 if ctx_len < input_ids.shape[1]:
                     input_ids = input_ids[:, :ctx_len]
