@@ -42,6 +42,7 @@ from .distributed import (
 from ..interface.write_path import pack_candidates, unpack_candidates
 from ..cognition.meta_learning import compute_beta  # noqa: F401 — used transitively via pass2
 from .cognitive_seed import save_cognitive_seed
+from . import nan_debug
 
 
 def _prefetch_worker(
@@ -129,15 +130,32 @@ class DataPrefetcher:
         self._process.start()
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        deadline = time.monotonic() + 300
+        # Hard ceiling only — we don't kill the subprocess for slow HF shards
+        # (downloads can legitimately take minutes on cold cache + HF retry
+        # backoffs). We only declare failure if the process actually died.
+        # 30 min covers the worst observed shard download + 5-retry envelope.
+        HARD_CEILING = 1800
+        HEARTBEAT = 30
+        start = time.monotonic()
+        last_heartbeat = start
         while True:
             try:
-                item = self._queue.get(timeout=10)
+                item = self._queue.get(timeout=5)
             except Exception:
                 if not self._process.is_alive():
                     raise RuntimeError("Data prefetcher process died")
-                if time.monotonic() > deadline:
-                    raise RuntimeError("Data prefetcher timed out after 300s")
+                now = time.monotonic()
+                if now - last_heartbeat > HEARTBEAT:
+                    waited = int(now - start)
+                    print(f"  [prefetcher] waiting for batch… {waited}s "
+                          f"(subprocess alive; likely downloading HF shard)")
+                    last_heartbeat = now
+                if now - start > HARD_CEILING:
+                    raise RuntimeError(
+                        f"Data prefetcher stalled > {HARD_CEILING}s; "
+                        "HF may be rate-limiting. Check HF_TOKEN, "
+                        "HF_DATASETS_CACHE, and network."
+                    )
                 continue
             if isinstance(item, Exception):
                 raise RuntimeError(f"Data prefetcher failed: {item}")
@@ -158,6 +176,54 @@ def _load_env():
         load_dotenv()
     except ImportError:
         pass
+
+
+def _configure_hf_hub():
+    """Configure HF Hub for rate-limit survival.
+
+    - Authenticate with HF_TOKEN if present → 5000 req/300s instead of 500 anon.
+      (Hit by curl earlier: `ratelimit: api;r=499;t=45` on the anon window.)
+    - Enable hf-transfer → faster + resumable shard downloads, bypasses the
+      httpx read-timeout path that tripped `OpenMathReasoning/cot-00000.parquet`.
+    - Pin HF_DATASETS_CACHE + HF_HOME to a persistent dir so re-runs don't
+      re-hit the API for shards already on disk. Defaults to $HOME/.cache/hf
+      (survives container restarts on most setups); override with HF_HOME_DIR.
+    - Bump per-request etag timeout from 10s default to 60s so one slow HEAD
+      doesn't kick us into the retry loop unnecessarily.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+
+    # Authenticate
+    token = _os.environ.get("HF_TOKEN") or _os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        _os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", token)
+        _os.environ.setdefault("HF_TOKEN", token)
+        try:
+            from huggingface_hub import login
+            login(token=token, add_to_git_credential=False)
+            print(f"HF Hub: authenticated (rate limit: 5000 req/300s)")
+        except Exception as e:
+            print(f"HF Hub: auth attempt failed ({e}); continuing unauthenticated")
+    else:
+        print("HF Hub: no HF_TOKEN set — using anon rate limit (500 req/300s). "
+              "Set HF_TOKEN in .env for 10× headroom.")
+
+    # hf-transfer for faster, more resilient downloads
+    _os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+    # Persistent cache location
+    cache_root = _os.environ.get("HF_HOME_DIR") or str(_Path.home() / ".cache" / "hf")
+    _os.environ.setdefault("HF_HOME", cache_root)
+    _os.environ.setdefault("HF_DATASETS_CACHE", str(_Path(cache_root) / "datasets"))
+    _os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(_Path(cache_root) / "hub"))
+    _Path(_os.environ["HF_DATASETS_CACHE"]).mkdir(parents=True, exist_ok=True)
+    _Path(_os.environ["HUGGINGFACE_HUB_CACHE"]).mkdir(parents=True, exist_ok=True)
+    print(f"HF cache: {cache_root}")
+
+    # Longer etag/metadata HEAD timeout — covers slow CDN HEADs without tripping retry
+    _os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "60")
+    _os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
 
 
 def train(
@@ -182,6 +248,7 @@ def train(
         resume_from: checkpoint path to resume from
     """
     _load_env()
+    _configure_hf_hub()
     tc = config.training
 
     # ── Accelerate setup ──
@@ -484,6 +551,16 @@ def train(
                 print(f"DDP warmup: skipped ({e})")
         torch.distributed.barrier()
 
+    # ── NaN tripwire (opt-in: MEMORIA_DEBUG_NAN=1) ───────────────────────────
+    # Registers a forward hook on every submodule. First module to produce a
+    # non-finite output raises — this localizes the NaN to the exact producer
+    # instead of discovering it at the loss level (where the culprit is already
+    # many layers upstream).
+    if nan_debug.enabled():
+        nan_debug.install_nan_hooks(base_model)
+        if is_main:
+            print("NaN tripwire: installed (MEMORIA_DEBUG_NAN=1)")
+
     for step in range(start_step, max_steps):
         t0 = time.time()
 
@@ -544,10 +621,27 @@ def train(
             # Without this, in-place mutations inside forward trigger
             # "one of the variables needed for gradient computation has been
             # modified by an inplace operation" in backward().
-            with sync_ctx, torch.autograd.graph.allow_mutation_on_saved_tensors():
-                result = model(input_ids, targets=labels, alpha=alpha)
-                loss = result['loss'] / grad_accum
-                accelerator.backward(loss)
+            try:
+                with sync_ctx, torch.autograd.graph.allow_mutation_on_saved_tensors():
+                    result = model(input_ids, targets=labels, alpha=alpha)
+                    loss = result['loss'] / grad_accum
+                    accelerator.backward(loss)
+            except nan_debug.Tripped as e:
+                dump_path = Path(f"nan_repro_step{step}_rank{rank}.pt")
+                torch.save(
+                    {
+                        'step': step,
+                        'rank': rank,
+                        'input_ids': input_ids.detach().cpu(),
+                        'labels': labels.detach().cpu(),
+                        'alpha': alpha,
+                        'message': str(e),
+                    },
+                    dump_path,
+                )
+                print(f"\n[NaN tripwire] step={step} rank={rank}: {e}")
+                print(f"[NaN tripwire] offending batch saved to {dump_path}")
+                raise
 
             total_loss += loss.item()
             total_loss_token += result['loss_token'].item() / grad_accum
