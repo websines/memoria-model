@@ -361,7 +361,8 @@ class MLACausalSelfAttention(nn.Module):
         self._yarn_scale = 1.0
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
-                beliefs: Tensor | None = None) -> Tensor:
+                beliefs: Tensor | None = None,
+                attn_mask: Tensor | None = None) -> Tensor:
         B, T, C = x.size()
 
         # Query: standard projection + full RoPE
@@ -411,7 +412,18 @@ class MLACausalSelfAttention(nn.Module):
                 v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
 
             W = self.mla_window_size
-            if W <= 0 or T <= W:
+            # DDTree verify: when attn_mask is provided, force SDPA path
+            # (FlashAttention-2 does not support the tree attention pattern).
+            if attn_mask is not None:
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                y = F.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_mask,
+                    scale=self._yarn_scale / math.sqrt(self.head_dim),
+                )
+                y = y.transpose(1, 2)
+            elif W <= 0 or T <= W:
                 # Full causal attention
                 if _flash_attn_available and x.is_cuda and W > 0:
                     y = flash_attn_func(
@@ -610,7 +622,8 @@ class CausalSelfAttention(nn.Module):
         # YaRN attention temperature scaling
         self._yarn_scale = 1.0
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
+                attn_mask: Tensor | None = None) -> Tensor:
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -628,10 +641,20 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)  # [B, H, T, D]
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True,
-            scale=self._yarn_scale / math.sqrt(self.head_dim),
-        )
+        # DDTree verify: when attn_mask is provided, use it instead of is_causal.
+        # attn_mask is [1, 1, T, T] additive mask (0 = attend, -inf = block).
+        # Only used during spec_generate tree verification — training path
+        # always passes attn_mask=None → is_causal=True (unchanged behavior).
+        if attn_mask is not None:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask,
+                scale=self._yarn_scale / math.sqrt(self.head_dim),
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True,
+                scale=self._yarn_scale / math.sqrt(self.head_dim),
+            )
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -689,13 +712,24 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor,
                 resid_lambda: Tensor, x0_lambda: Tensor,
-                beliefs: Tensor | None = None) -> Tensor:
+                beliefs: Tensor | None = None,
+                attn_mask: Tensor | None = None) -> Tensor:
         # Per-layer residual scaling (from autoresearch)
         x = resid_lambda * x + x0_lambda * x0
         # Pass beliefs to MLA layers for DSA belief-conditioned attention
+        # attn_mask is only set during DDTree verify (spec_generate) — None in training.
         if isinstance(self.attn, MLACausalSelfAttention) and self.attn.dsa_enabled:
-            x = x + self.attn(norm(x), cos, sin, beliefs=beliefs)
+            x = x + self.attn(norm(x), cos, sin, beliefs=beliefs, attn_mask=attn_mask)
+        elif isinstance(self.attn, (CausalSelfAttention, MLACausalSelfAttention)):
+            # CausalSelfAttention and non-DSA MLA accept attn_mask
+            if attn_mask is not None:
+                x = x + self.attn(norm(x), cos, sin, attn_mask=attn_mask)
+            else:
+                x = x + self.attn(norm(x), cos, sin)
         else:
+            # Mamba, SlidingWindow, DeltaProduct, etc. — no mask support needed
+            # (these layers use O(T) linear recurrence or local windows,
+            # not global attention — tree structure handled by the attention layers)
             x = x + self.attn(norm(x), cos, sin)
         x = x + self.mlp(norm(x))
         return x

@@ -169,6 +169,31 @@ class TransformerConfig:
     dflash_max_block_size: int = 32    # inference max (adaptive cutoff reduces to block_size in hard regions)
     dflash_loss_weight: float = 0.1    # weight for draft training loss
 
+    # DDTree: Diffusion Draft Tree (tree-based verification for DFlash)
+    # Builds a draft tree from the per-position marginals of a single DFlash
+    # forward pass and verifies the entire tree in one target-model pass using
+    # ancestor-only tree attention. Replaces single-trajectory verification
+    # with multi-branch exploration. Preserves output distribution (lossless).
+    #
+    # The tree budget controls how many candidate nodes the verifier evaluates.
+    # Acceptance length increases monotonically with budget, but speedup peaks
+    # at an intermediate budget when verifier cost becomes dominant (DDTree Fig. 3).
+    # Optimal budget is hardware-dependent: the default 256 is chosen as the
+    # geometric mean of the paper's optimal range [128, 512] across benchmarks
+    # (Table 1: best budget varies by dataset-model pair but clusters there).
+    #
+    # Tree-aware training adds three terms alongside existing streak distillation:
+    # 1. Position blend: interpolates decay (DFlash-optimal) ↔ uniform (DDTree-optimal)
+    # 2. Tree prefix mass bonus: uniform-weighted cumprod of P(correct)
+    # 3. Top-K recall: penalizes when target token is outside draft's top-K
+    # All weights are learned MetaParams — no hardcoded thresholds.
+    #
+    # Reference: DDTree (Ringel & Romano — liranringel.github.io/ddtree/)
+    # Reference: OPT-Tree (Wang et al. — TACL 2025) — adaptive draft tree
+    ddtree_enabled: bool = False       # enable DDTree on top of DFlash (requires dflash_enabled)
+    ddtree_default_budget: int = 256   # default tree node budget (geometric mean of optimal range [128, 512])
+    ddtree_train_budget: int = 64      # tree budget used in training loss computation (smaller for speed)
+
 
 @dataclass
 class TrainingConfig:

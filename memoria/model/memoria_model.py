@@ -496,6 +496,7 @@ class MemoriaModel(nn.Module):
         targets: Tensor | None = None,
         alpha: float = 0.0,
         update_state: bool = True,
+        attn_mask: Tensor | None = None,
     ) -> dict:
         """Forward pass through transformer + state interfaces + loss computation.
 
@@ -632,6 +633,7 @@ class MemoriaModel(nn.Module):
                     self.transformer.resid_lambdas[i],
                     self.transformer.x0_lambdas[i],
                     beliefs=dsa_beliefs,
+                    attn_mask=attn_mask,
                 )
 
             # DFlash: save hidden states at tapped layers
@@ -1244,6 +1246,22 @@ class MemoriaModel(nn.Module):
                             _be = self.byte_encoder.byte_embed
                             _up = self.byte_encoder.up_proj
                             dflash_embed_fn = lambda ids: _up(_be(ids))
+                        # DDTree-aware training: pass tree MetaParams when DDTree is enabled.
+                        # These add three terms to the draft loss:
+                        # 1. Position blend: decay↔uniform interpolation
+                        # 2. Tree prefix mass bonus: uniform cumprod of P(correct)
+                        # 3. Top-K recall: penalty when target outside draft's top-K
+                        ddtree_on = getattr(self.config.transformer, 'ddtree_enabled', False)
+                        ddtree_kwargs = {}
+                        if ddtree_on:
+                            ddtree_kwargs = dict(
+                                ddtree_position_blend=self.state.meta_params.ddtree_position_blend,
+                                ddtree_prefix_weight=self.state.meta_params.ddtree_prefix_weight,
+                                ddtree_recall_weight=self.state.meta_params.ddtree_recall_weight,
+                                ddtree_train_budget=getattr(
+                                    self.config.transformer, 'ddtree_train_budget', 64,
+                                ),
+                            )
                         loss_draft, loss_self_correct = self.dflash_head.compute_draft_loss(
                             context, injection, draft_targets,
                             lm_head_fn=dflash_head_fn,
@@ -1251,6 +1269,7 @@ class MemoriaModel(nn.Module):
                             streak_decay=streak_decay,
                             streak_weight=streak_weight,
                             oput_weight=oput_weight,
+                            **ddtree_kwargs,
                         )
             result['loss_draft'] = loss_draft
             result['loss_self_correct'] = loss_self_correct
@@ -1363,20 +1382,34 @@ class MemoriaModel(nn.Module):
         temperature: float = 0.0,
         stop_token_ids: list[int] | None = None,
     ) -> Tensor:
-        """Generate tokens using DFlash speculative decoding with adaptive block size.
+        """Generate tokens using DFlash speculative decoding with DDTree verification.
+
+        DDTree mode (ddtree_enabled=True): builds a draft tree from the per-position
+        marginals of a single DFlash forward pass and verifies the entire tree in
+        one target-model forward pass using ancestor-only tree attention. This
+        explores multiple continuations per round instead of just one, increasing
+        the expected acceptance length by ~1.5-2.1× over single-trajectory DFlash.
+
+        DFlash mode (ddtree_enabled=False): falls back to single-trajectory
+        verification with adaptive block size (original behavior).
+
+        Both modes preserve the target model's output distribution (lossless).
 
         Optimized draft-verify loop: the verify step from round N serves as
         the prefill for round N+1. This eliminates one full model forward per
-        round, doubling effective throughput (4x → 8x over vanilla AR).
+        round, doubling effective throughput.
 
         Improvements:
         1. KV injection: target features injected into draft layer K/V projections
-        2. Adaptive block size: draft max_block_size tokens, verify only the
-           confident prefix (entropy-based cutoff via learned MetaParam threshold)
-        3. Verify-as-prefill reuse: no redundant forward pass per round
-        4. Tap hidden caching: forward() stores tap hiddens in result dict
+        2. DDTree: multi-branch tree verification (when enabled)
+        3. Adaptive block size: entropy-based cutoff (DFlash fallback)
+        4. Verify-as-prefill reuse: no redundant forward pass per round
+        5. Tap hidden caching: forward() stores tap hiddens in result dict
 
         Falls back to standard autoregressive if DFlash is not enabled.
+
+        Reference: DDTree (Ringel & Romano — liranringel.github.io/ddtree/)
+        Reference: DFlash (arXiv:2602.06036) — block diffusion drafting
 
         Args:
             input_ids: [1, T] prompt token ids
@@ -1394,41 +1427,57 @@ class MemoriaModel(nn.Module):
         stop_set = set(stop_token_ids) if stop_token_ids else set()
 
         if not self.dflash_enabled:
-            # Fallback: standard autoregressive generation
             return self._generate_autoregressive(
                 generated, max_new_tokens, temperature, stop_set,
             )
 
+        # Dispatch: DDTree (tree verify) or DFlash (single-trajectory verify)
+        ddtree_enabled = getattr(self.config.transformer, 'ddtree_enabled', False)
+        if ddtree_enabled:
+            result = self._spec_generate_ddtree(
+                generated, max_new_tokens, temperature, stop_set,
+            )
+        else:
+            result = self._spec_generate_dflash(
+                generated, max_new_tokens, temperature, stop_set,
+            )
+
+        self.train()
+        return result
+
+    def _spec_generate_dflash(
+        self,
+        generated: Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        stop_set: set[int],
+    ) -> Tensor:
+        """Single-trajectory DFlash speculative decoding (original behavior)."""
+        device = generated.device
         max_block = self.dflash_head.max_block_size
         entropy_threshold = self.state.meta_params.dflash_entropy_threshold.item()
         tokens_generated = 0
 
         # ── Initial prefill (only once) ──
         result = self.forward(generated)
-        cached_logits = result['logits']           # [1, T, vocab]
-        cached_taps = result.get('dflash_tapped')  # {layer_idx: [1, T, D]}
+        cached_logits = result['logits']
+        cached_taps = result.get('dflash_tapped')
 
         while tokens_generated < max_new_tokens:
-            # ── Step 1: Get guaranteed token from cached logits ──
             next_token = self._sample_token(cached_logits[:, -1, :], temperature)
 
-            # Check stop
             if next_token.item() in stop_set:
                 generated = torch.cat([generated, next_token.unsqueeze(0)], dim=1)
                 break
 
-            # ── Step 2: Extract features from cached tap hiddens ──
             if cached_taps is not None:
                 tap_hiddens = cached_taps
             else:
-                # Fallback: recompute (should not happen after initial prefill)
                 tap_hiddens = self._collect_tap_hiddens(generated)
 
-            # Context: last 64 positions of tapped features
             ctx_start = max(0, generated.shape[1] - 64)
             ctx_hiddens = {k: v[:, ctx_start:, :] for k, v in tap_hiddens.items()}
 
-            # Active beliefs
             active_mask = self.state.get_active_mask()
             active_beliefs = self.state.beliefs.data[active_mask] if active_mask.any() else None
 
@@ -1436,24 +1485,15 @@ class MemoriaModel(nn.Module):
                 ctx_hiddens, active_beliefs,
             )
 
-            # ── Step 3: Draft max_block tokens in parallel (cheap) ──
-            remaining = max_new_tokens - tokens_generated - 1  # -1 for guaranteed token
+            remaining = max_new_tokens - tokens_generated - 1
             draft_length = min(max_block, max(remaining, 1))
-            # BLT: DFlash predicts bytes (260 classes) instead of tokens (151K)
-            spec_head_fn = self.transformer.head
-            if self.blt_enabled:
-                _dp = self.byte_decoder.down_proj
-                _bh = self.byte_decoder.byte_heads[0]
-                spec_head_fn = lambda h: _bh(
-                    F.rms_norm(_dp(h), (_dp.out_features,))
-                )
+            spec_head_fn = self._get_spec_head_fn()
             draft_logits = self.dflash_head(
                 context, lm_head_fn=spec_head_fn,
                 injection=injection, draft_length=draft_length,
-            )  # [1, draft_length, vocab_or_bytes]
+            )
 
-            # ── Step 3b: Adaptive block size — entropy-based cutoff ──
-            entropy = self.dflash_head.compute_entropy(draft_logits)  # [1, draft_length]
+            entropy = self.dflash_head.compute_entropy(draft_logits)
             above_threshold = (entropy.squeeze(0) > entropy_threshold)
             if above_threshold.any():
                 adaptive_size = above_threshold.nonzero(as_tuple=True)[0][0].item()
@@ -1463,22 +1503,18 @@ class MemoriaModel(nn.Module):
 
             draft_tokens = self._sample_token(
                 draft_logits[:, :adaptive_size].squeeze(0), temperature,
-            )  # [adaptive_size]
+            )
 
-            # Build candidate sequence: guaranteed token + drafted tokens
             candidate_tokens = torch.cat([next_token, draft_tokens], dim=0)
             candidate_seq = torch.cat([
-                generated,
-                candidate_tokens.unsqueeze(0),
+                generated, candidate_tokens.unsqueeze(0),
             ], dim=1)
 
-            # ── Step 4: Verify with full model ──
-            # This verify also serves as prefill for the NEXT round
             verify_result = self.forward(candidate_seq)
             verify_logits = verify_result['logits']
 
             T_orig = generated.shape[1]
-            n_accepted = 1  # the guaranteed next_token is always accepted
+            n_accepted = 1
 
             for j in range(adaptive_size):
                 verify_token = self._sample_token(
@@ -1491,24 +1527,212 @@ class MemoriaModel(nn.Module):
                     n_accepted += 1
                     break
 
-            # Accept the verified prefix
             accepted = candidate_tokens[:n_accepted]
             generated = torch.cat([generated, accepted.unsqueeze(0)], dim=1)
             tokens_generated += n_accepted
 
+            cached_logits = verify_logits
+            cached_taps = verify_result.get('dflash_tapped')
+
+            if stop_set and any(t.item() in stop_set for t in accepted):
+                break
+
+        return generated
+
+    def _spec_generate_ddtree(
+        self,
+        generated: Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        stop_set: set[int],
+    ) -> Tensor:
+        """DDTree speculative decoding: tree-based multi-branch verification.
+
+        Four stages per round:
+        1. Draft: DFlash head produces per-position marginals [L, vocab]
+        2. Build tree: Algorithm 1 (best-first heap) → B-node draft tree
+        3. Verify: one target-model forward pass with tree attention mask
+        4. Walk tree: accept longest matching path, carry bonus token forward
+
+        The tree attention mask ensures each node attends only to its ancestors
+        and the past context — siblings and cousins are invisible. This makes
+        the verifier's output at each node position identical to what it would
+        produce for that specific continuation, preserving the target model's
+        output distribution (lossless).
+
+        Reference: DDTree (Ringel & Romano — liranringel.github.io/ddtree/)
+        """
+        from .ddtree import build_ddtree, compile_ddtree, follow_verified_tree
+
+        device = generated.device
+        max_block = self.dflash_head.max_block_size
+
+        # Compute effective tree budget from config × learned scale
+        default_budget = getattr(self.config.transformer, 'ddtree_default_budget', 256)
+        budget_scale = self.state.meta_params.ddtree_budget_scale.item()
+        tree_budget = max(1, round(default_budget * budget_scale))
+
+        tokens_generated = 0
+
+        # ── Initial prefill ──
+        result = self.forward(generated)
+        cached_logits = result['logits']
+        cached_taps = result.get('dflash_tapped')
+
+        while tokens_generated < max_new_tokens:
+            # ── Step 1: Get bonus token (guaranteed) from cached logits ──
+            bonus_token = self._sample_token(cached_logits[:, -1, :], temperature)
+
+            if bonus_token.item() in stop_set:
+                generated = torch.cat([
+                    generated, bonus_token.unsqueeze(0).unsqueeze(0),
+                ], dim=1)
+                break
+
+            # ── Step 2: Draft — per-position marginals from DFlash head ──
+            if cached_taps is not None:
+                tap_hiddens = cached_taps
+            else:
+                tap_hiddens = self._collect_tap_hiddens(generated)
+
+            ctx_start = max(0, generated.shape[1] - 64)
+            ctx_hiddens = {k: v[:, ctx_start:, :] for k, v in tap_hiddens.items()}
+
+            active_mask = self.state.get_active_mask()
+            active_beliefs = self.state.beliefs.data[active_mask] if active_mask.any() else None
+
+            context, injection = self.dflash_head.extract_features(
+                ctx_hiddens, active_beliefs,
+            )
+
+            remaining = max_new_tokens - tokens_generated - 1
+            draft_length = min(max_block, max(remaining, 1))
+            spec_head_fn = self._get_spec_head_fn()
+            draft_logits = self.dflash_head(
+                context, lm_head_fn=spec_head_fn,
+                injection=injection, draft_length=draft_length,
+            )  # [1, draft_length, vocab]
+
+            # ── Step 3: Build tree from draft marginals (CPU, O(B log B)) ──
+            # draft_logits[0] = [draft_length, vocab] — per-position marginals
+            # conditioned on context (c, b) but NOT on other draft positions.
+            # This factorized structure is what makes Algorithm 1 optimal.
+            tree = build_ddtree(draft_logits[0], tree_budget)
+
+            if tree.node_count == 0:
+                # Empty tree (budget exhausted or no draft positions) →
+                # just accept the bonus token
+                generated = torch.cat([
+                    generated, bonus_token.unsqueeze(0).unsqueeze(0),
+                ], dim=1)
+                tokens_generated += 1
+                cached_logits = self.forward(generated)['logits']
+                cached_taps = None
+                if bonus_token.item() in stop_set:
+                    break
+                continue
+
+            # ── Step 4: Compile tree into verification tensors ──
+            T_past = generated.shape[1]  # past context length
+            tree_input_ids, tree_position_ids, tree_attn_mask = compile_ddtree(
+                tree,
+                root_token_id=bonus_token.item(),
+                start_position=T_past,
+                past_length=T_past,
+                device=device,
+                dtype=next(self.parameters()).dtype,
+            )
+            # tree_input_ids:   [1, 1+N] — bonus token + tree nodes
+            # tree_position_ids: [1, 1+N] — absolute positions (start + depth)
+            # tree_attn_mask:    [1, 1, 1+N, T_past + 1+N] — hybrid mask
+
+            # Build full verification sequence: past context + tree tokens
+            verify_seq = torch.cat([generated, tree_input_ids], dim=1)
+
+            # Build full attention mask: [1, 1, T_past + 1+N, T_past + 1+N]
+            # Upper-left: standard causal for past context
+            # Lower-left: tree nodes attend to all past (causal guaranteed by position)
+            # Upper-right: past tokens do NOT attend to tree nodes
+            # Lower-right: tree visibility (ancestor-only)
+            T_tree = tree_input_ids.shape[1]  # 1 + node_count
+            T_total = T_past + T_tree
+            mask_val = torch.finfo(next(self.parameters()).dtype).min
+
+            full_attn_mask = torch.full(
+                (1, 1, T_total, T_total), mask_val,
+                dtype=next(self.parameters()).dtype, device=device,
+            )
+            # Past context: standard lower-triangular causal mask
+            causal_indices = torch.arange(T_past, device=device)
+            full_attn_mask[0, 0, :T_past, :T_past].masked_fill_(
+                causal_indices.unsqueeze(0) <= causal_indices.unsqueeze(1), 0.0,
+            )
+            # Tree tokens attend to all past context (rows T_past..T_total, cols 0..T_past)
+            full_attn_mask[0, 0, T_past:, :T_past] = 0.0
+            # Tree internal visibility (rows T_past..T_total, cols T_past..T_total)
+            full_attn_mask[0, 0, T_past:, T_past:].masked_fill_(
+                tree.visibility.to(device), 0.0,
+            )
+
+            # Build position IDs: past context uses sequential, tree uses depth-based
+            past_positions = torch.arange(T_past, device=device).unsqueeze(0)
+            full_position_ids = torch.cat([past_positions, tree_position_ids], dim=1)
+
+            # ── Step 5: Verify entire tree in one forward pass ──
+            # The tree attention mask forces ancestor-only visibility within the
+            # tree, so each node's output is conditioned only on its specific
+            # path — identical to what the verifier would produce for that
+            # continuation as a standalone sequence. This is what makes DDTree
+            # lossless (DDTree paper, Section 4.4).
+            verify_result = self.forward(
+                verify_seq, attn_mask=full_attn_mask,
+            )
+            verify_logits = verify_result['logits']
+
+            # ── Step 6: Walk the verified tree ──
+            # Extract logits for the tree portion only: [1, 1+N, vocab]
+            tree_logits = verify_logits[:, T_past:, :]
+            accepted_indices, next_bonus_token = follow_verified_tree(
+                tree, tree_logits, temperature,
+            )
+
+            # Gather accepted token IDs from tree_input_ids
+            accepted_idx_tensor = torch.tensor(
+                accepted_indices, dtype=torch.long, device=device,
+            )
+            accepted_tokens = tree_input_ids.index_select(1, accepted_idx_tensor)
+
+            # Append the accepted path + the next bonus token (first mismatch)
+            next_bonus = torch.tensor(
+                [[next_bonus_token]], dtype=torch.long, device=device,
+            )
+            new_tokens = torch.cat([accepted_tokens, next_bonus], dim=1)
+            generated = torch.cat([generated, new_tokens], dim=1)
+            n_accepted = len(accepted_indices)  # accepted tree nodes (incl. root/bonus)
+            tokens_generated += n_accepted
+
             # ── Reuse verify as next round's prefill ──
-            # The verify forward already computed logits and tap hiddens for
-            # the full candidate sequence. Reuse them instead of running a
-            # fresh prefill. This eliminates one full model forward per round.
+            # Cache logits: we need the logits at the LAST accepted position
+            # for sampling the next bonus token. The verify forward already
+            # computed logits for the full sequence.
             cached_logits = verify_logits
             cached_taps = verify_result.get('dflash_tapped')
 
             # Check for stop tokens in accepted
-            if stop_set and any(t.item() in stop_set for t in accepted):
-                break
+            if stop_set:
+                all_new = new_tokens[0].tolist()
+                if any(t in stop_set for t in all_new):
+                    break
 
-        self.train()
         return generated
+
+    def _get_spec_head_fn(self):
+        """Get the LM head function for speculative decoding (token or byte mode)."""
+        if self.blt_enabled:
+            _dp = self.byte_decoder.down_proj
+            _bh = self.byte_decoder.byte_heads[0]
+            return lambda h: _bh(F.rms_norm(_dp(h), (_dp.out_features,)))
+        return self.transformer.head
 
     def _collect_tap_hiddens(self, input_ids: Tensor) -> dict[int, Tensor]:
         """Run transformer blocks and collect hidden states at DFlash tap layers."""

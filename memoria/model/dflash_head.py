@@ -9,7 +9,7 @@ Why this helps MemoriaModel specifically:
 - Speculative decoding amortizes that cost across accepted blocks
 - Cognitive state as additional cross-attention context improves drafts
 
-Four improvements over baseline block diffusion:
+Five improvements over baseline block diffusion:
 1. KV injection (DFlash arXiv:2602.06036): per-layer K/V projections for
    tapped target features → tighter alignment with verifier than concat
 2. Streak distillation (SpecDiff-2 arXiv:2511.00606): position-weighted CE
@@ -19,6 +19,9 @@ Four improvements over baseline block diffusion:
 4. OPUT on-policy training (DMax arXiv:2604.08302): train draft head on its
    own (possibly wrong) predictions via SPD hybrid embeddings. Teaches
    self-correction within a block → higher streak length at zero inference cost.
+5. DDTree-aware training (DDTree, Ringel & Romano 2026): tree position blend
+   (decay↔uniform), prefix mass bonus (DDTree surrogate), top-K recall penalty.
+   Optimizes draft quality for multi-branch tree verification, not just single path.
 
 Architecture:
 - Mask token embeddings + positional encoding for draft positions
@@ -35,6 +38,7 @@ Reference: FailFast (Pan, Chen, Netravali — arXiv:2512.20573) — adaptive blo
 Reference: DEER (Cheng et al. — arXiv:2512.15176) — single-step diffusion drafting
 Reference: Speculative Decoding (Leviathan et al., ICML 2023)
 Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT + SPD self-correction
+Reference: DDTree (Ringel & Romano — liranringel.github.io/ddtree/) — draft tree
 """
 
 import torch
@@ -347,16 +351,35 @@ class DFlashDraftHead(nn.Module):
         target_tokens: Tensor,
         streak_decay: Tensor | None,
         streak_weight: Tensor | None,
+        ddtree_position_blend: Tensor | None = None,
     ) -> Tensor:
         """Position-weighted CE + expected streak bonus.
 
         Shared between teacher pass and OPUT self-correction pass.
+
+        When ddtree_position_blend is provided, the position weights are
+        interpolated between exponential decay (DFlash-optimal: early
+        positions matter most for single-trajectory acceptance) and uniform
+        (DDTree-optimal: all positions matter because tree branches recover
+        from early mismatches). The model learns the optimal blend.
         """
         B, S, V = logits.shape
 
         if streak_decay is not None:
             positions = torch.arange(S, device=logits.device, dtype=logits.dtype)
-            weights = streak_decay ** positions
+            decay_weights = streak_decay ** positions
+
+            # DDTree position blend: interpolate decay ↔ uniform
+            # At blend=0: pure exponential decay (DFlash single-path optimal)
+            # At blend=1: uniform weights (DDTree tree-path optimal)
+            if ddtree_position_blend is not None:
+                uniform_weights = torch.ones_like(decay_weights)
+                weights = (
+                    ddtree_position_blend * uniform_weights
+                    + (1.0 - ddtree_position_blend) * decay_weights
+                )
+            else:
+                weights = decay_weights
 
             per_pos_loss = F.cross_entropy(
                 logits.reshape(-1, V), target_tokens.reshape(-1),
@@ -390,6 +413,52 @@ class DFlashDraftHead(nn.Module):
 
         return loss
 
+    def _tree_prefix_mass_bonus(
+        self,
+        logits: Tensor,
+        target_tokens: Tensor,
+    ) -> Tensor:
+        """Tree prefix mass bonus: uniform-weighted cumulative product of P(correct).
+
+        Directly optimizes the DDTree surrogate objective: the probability that
+        the target continuation appears in the draft tree. Unlike the decayed
+        streak bonus (which emphasizes early positions for single-path acceptance),
+        this uses UNIFORM weights — all depths matter equally because the tree
+        verifies multiple branches independently.
+
+        The DDTree surrogate is (Proposition 1):
+            E_Q[α_T(Y)] = ∑_{u ∈ T} q(u|c,b) = ∑_{u ∈ T} ∏_i q_i(u_i|c,b)
+        Training maximizes q(target|c,b) = ∏_i q_i(target_i|c,b), the prefix
+        probability of the ground truth under the factorized draft distribution.
+        This ensures the target path has high probability and thus survives
+        the budget cutoff in Algorithm 1.
+
+        Args:
+            logits: [B, S, V] draft logits (before softmax).
+            target_tokens: [B, S] target token IDs (-1 = padding).
+
+        Returns:
+            scalar: negative mean prefix mass (to be minimized as a bonus).
+        """
+        B, S, _ = logits.shape
+        probs = F.softmax(logits.float(), dim=-1)
+        p_correct = probs.gather(
+            -1, target_tokens.clamp(min=0).unsqueeze(-1),
+        ).squeeze(-1)  # [B, S]
+
+        valid = (target_tokens != -1).float()
+        p_correct = p_correct * valid + (1.0 - valid)
+        p_correct = p_correct.clamp(min=1e-8)
+
+        # Cumulative product: prefix probability at each depth
+        # No decay — uniform weighting across all positions (tree-optimal)
+        prefix_probs = p_correct.cumprod(dim=-1)  # [B, S]
+
+        # Bonus = mean prefix probability across positions and batch
+        # Negated because this is subtracted from the total loss
+        prefix_mass = (prefix_probs * valid).sum(dim=-1).mean() / max(S, 1)
+        return -prefix_mass
+
     def compute_draft_loss(
         self,
         context: Tensor,
@@ -400,14 +469,18 @@ class DFlashDraftHead(nn.Module):
         streak_decay: Tensor | None = None,
         streak_weight: Tensor | None = None,
         oput_weight: Tensor | None = None,
+        ddtree_position_blend: Tensor | None = None,
+        ddtree_prefix_weight: Tensor | None = None,
+        ddtree_recall_weight: Tensor | None = None,
+        ddtree_train_budget: int = 0,
     ) -> tuple[Tensor, Tensor]:
-        """Compute streak-distilled training loss with OPUT self-correction.
+        """Compute streak-distilled training loss with OPUT self-correction
+        and DDTree-aware training terms.
 
-        Three components:
-        1. Position-weighted CE: w_i = decay^i emphasizes early positions.
-           Earlier positions matter more because speculative decoding stops
-           at the first mismatch — high accuracy at position 5 is worthless
-           if position 2 is wrong.
+        Six components:
+        1. Position-weighted CE: w_i = blend(decay^i, 1.0) emphasizes positions
+           according to learned decay↔uniform blend. Pure decay = DFlash-optimal,
+           uniform = DDTree-optimal where tree branches recover from early mismatches.
         2. Expected streak bonus: directly maximizes P(consecutive correct).
            Complementary to weighted CE — CE shapes per-position logits,
            streak bonus shapes the joint probability of consecutive matches.
@@ -418,9 +491,16 @@ class DFlashDraftHead(nn.Module):
            the correct output. Teaches the draft head to recover from its own
            errors within a block — directly addresses error accumulation in
            parallel decoding. Training-only, zero inference cost.
+        4. Tree prefix mass bonus (DDTree): uniform-weighted cumprod of P(correct)
+           directly optimizes the DDTree surrogate ∑ q(u|c,b), ensuring the
+           target path has high prefix probability and survives budget cutoff.
+        5. Top-K recall penalty (DDTree): penalizes positions where the target
+           token falls outside the draft's top-K. These are "tree misses" where
+           DDTree cannot accept the correct token regardless of budget.
 
         Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
         Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT + SPD
+        Reference: DDTree (Ringel & Romano) — tree surrogate, top-K recall
 
         Args:
             context: [B, T_ctx, D] belief context
@@ -431,13 +511,39 @@ class DFlashDraftHead(nn.Module):
             streak_decay: per-position weight decay λ ∈ (0,1) — learned MetaParam
             streak_weight: weight on expected streak bonus — learned MetaParam
             oput_weight: weight on self-correction loss — learned MetaParam
+            ddtree_position_blend: blend between decay/uniform weights — learned MetaParam
+            ddtree_prefix_weight: weight on tree prefix mass bonus — learned MetaParam
+            ddtree_recall_weight: weight on top-K recall penalty — learned MetaParam
+            ddtree_train_budget: tree budget for top-K recall computation (0 = disabled)
 
         Returns:
             (total_loss, loss_self_correct) — both scalar tensors
         """
-        # ── Pass 1: teacher-forced (standard streak distillation) ──
+        # ── Pass 1: teacher-forced (streak distillation + tree-aware blend) ──
         logits = self.forward(context, lm_head_fn, injection=injection)
-        loss_teacher = self._streak_loss(logits, target_tokens, streak_decay, streak_weight)
+        loss_teacher = self._streak_loss(
+            logits, target_tokens, streak_decay, streak_weight,
+            ddtree_position_blend=ddtree_position_blend,
+        )
+
+        # ── DDTree term 1: tree prefix mass bonus ──
+        if ddtree_prefix_weight is not None:
+            pw_val = ddtree_prefix_weight.item() if isinstance(ddtree_prefix_weight, Tensor) else ddtree_prefix_weight
+            if pw_val > 0:
+                tree_prefix_bonus = self._tree_prefix_mass_bonus(logits, target_tokens)
+                loss_teacher = loss_teacher + ddtree_prefix_weight * tree_prefix_bonus
+
+        # ── DDTree term 2: top-K recall penalty ──
+        if ddtree_recall_weight is not None and ddtree_train_budget > 0:
+            rw_val = ddtree_recall_weight.item() if isinstance(ddtree_recall_weight, Tensor) else ddtree_recall_weight
+            if rw_val > 0:
+                from .ddtree import compute_tree_top_k_for_training
+                # K = min(budget, vocab): Lemma 1 guarantees optimal tree uses only top-K
+                effective_k = min(ddtree_train_budget, logits.shape[-1])
+                recall_loss = compute_tree_top_k_for_training(
+                    logits, target_tokens, effective_k,
+                )
+                loss_teacher = loss_teacher + ddtree_recall_weight * recall_loss
 
         # ── Pass 2: OPUT on-policy self-correction (DMax) ──
         loss_self_correct = torch.tensor(0.0, device=logits.device)
@@ -484,8 +590,10 @@ class DFlashDraftHead(nn.Module):
             else:
                 refined_logits = draft
 
+            # OPUT loss also gets tree-aware position blend
             loss_self_correct = self._streak_loss(
                 refined_logits, target_tokens, streak_decay, streak_weight,
+                ddtree_position_blend=ddtree_position_blend,
             )
 
         if oput_weight is not None and oput_w > 0:

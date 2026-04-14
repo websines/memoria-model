@@ -328,6 +328,41 @@ class MetaParams(nn.Module):
         # Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT + SPD
         self._oput_self_correct_weight = nn.Parameter(torch.tensor(-0.693147))
 
+        # ── F3b: DDTree — Tree-Aware Training Parameters ──
+
+        # Position weight blend: interpolates between decay-weighted (DFlash-optimal,
+        # emphasizes early positions for single-trajectory acceptance) and uniform-
+        # weighted (DDTree-optimal, all positions matter because tree branches recover
+        # from early mismatches). sigmoid(0.0) = 0.5 → equal blend at init.
+        # DDTree paper Fig. 4: full-block acceptance jumps from ~18% to ~32% with
+        # tree verification, meaning late-position accuracy becomes load-bearing.
+        # Reference: DDTree (Ringel & Romano) — position weighting for tree surrogate
+        self._ddtree_position_blend = nn.Parameter(torch.tensor(0.0))
+
+        # Tree prefix mass weight: scales the uniform-weighted prefix mass bonus
+        # that directly optimizes the DDTree surrogate ∑ q(u|c,b).
+        # Unlike the decayed streak bonus (optimizes single-path consecutive acceptance),
+        # this term uses uniform position weights and maximizes the probability that
+        # the correct continuation is high-ranked in the tree.
+        # softplus(-2.302) ≈ 0.1 → mild initial tree bonus (matches streak_weight init)
+        # Reference: DDTree Proposition 1 — surrogate = additive sum of prefix probs
+        self._ddtree_prefix_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # Top-K recall weight: scales the loss penalizing target tokens that fall
+        # outside the draft's top-K predictions. These are "tree misses" — positions
+        # where DDTree cannot accept the correct token regardless of budget.
+        # softplus(-2.302) ≈ 0.1 → mild initial recall penalty
+        # Reference: DDTree Lemma 1 — optimal tree uses only top-K tokens per depth
+        self._ddtree_recall_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # Budget scale: multiplicative factor on the configured tree budget at
+        # inference time. Allows the model to learn hardware- and domain-dependent
+        # budget preferences. softplus(0.0) ≈ 0.693 → scale ≈ 0.7× initially
+        # (conservative, since small budgets have lower verify cost).
+        # Actual budget = round(config.ddtree_default_budget * budget_scale).
+        # softplus(0.693) ≈ 1.0 → neutral scale
+        self._ddtree_budget_scale = nn.Parameter(torch.tensor(0.693147))
+
         # ── G1: LSR Strategy Bank ──
         # Perturbation scale: magnitude of the strategy perturbation injected
         # into the residual stream during refinement loops. Unit-norm strategies
@@ -791,6 +826,54 @@ class MetaParams(nn.Module):
         Reference: DMax (arXiv:2604.08302)
         """
         return F.softplus(self._oput_self_correct_weight)
+
+    # ── F3b: DDTree — Tree-Aware Training ──
+
+    @property
+    def ddtree_position_blend(self) -> torch.Tensor:
+        """Blend between decay (0) and uniform (1) position weights. Range: (0, 1).
+
+        At 0: pure exponential decay λ^i (DFlash-optimal for single trajectory).
+        At 1: uniform weights (DDTree-optimal — all positions matter equally
+        because the tree can branch past early mismatches).
+        The model learns the optimal blend for its hardware/domain.
+        """
+        return torch.sigmoid(self._ddtree_position_blend)
+
+    @property
+    def ddtree_prefix_weight(self) -> torch.Tensor:
+        """Weight on tree prefix mass bonus (DDTree surrogate). Range: (0, inf).
+
+        Scales the uniform-weighted prefix probability bonus that directly
+        optimizes the DDTree surrogate ∑ q(u|c,b). Complementary to the
+        decayed streak bonus: streak emphasizes early consecutive accuracy,
+        prefix mass emphasizes coverage at ALL depths.
+        Reference: DDTree Proposition 1
+        """
+        return F.softplus(self._ddtree_prefix_weight)
+
+    @property
+    def ddtree_recall_weight(self) -> torch.Tensor:
+        """Weight on top-K recall penalty (tree coverage signal). Range: (0, inf).
+
+        Penalizes positions where the target token falls outside the draft's
+        top-K predictions. These are tree misses: DDTree cannot accept the
+        correct token regardless of budget. Strong gradient signal for pushing
+        correct tokens into the top-K at each position.
+        Reference: DDTree Lemma 1
+        """
+        return F.softplus(self._ddtree_recall_weight)
+
+    @property
+    def ddtree_budget_scale(self) -> torch.Tensor:
+        """Multiplicative scale for inference tree budget. Range: (0, inf).
+
+        Actual budget = round(config.ddtree_default_budget * budget_scale).
+        Allows the model to learn domain-dependent budget preferences.
+        Values < 1 = conservative (lower verify cost), > 1 = aggressive
+        (more branches, longer acceptance). Hardware-optimal typically 0.5-2.0.
+        """
+        return F.softplus(self._ddtree_budget_scale)
 
     # ── G1: LSR Strategy Bank ──
 

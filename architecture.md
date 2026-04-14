@@ -632,7 +632,7 @@ L_total = L_token + α · L_fe + α · 0.1 · L_utility + α · 0.1 · L_surpris
 | **L_halt** | `F.binary_cross_entropy_with_logits` | RefinementProbe | Teaches the halting probe when to stop refinement loops. Teacher forcing with random oracle loop count. |
 | **L_ponder** | `ponder_cost × mean(gate)` | RefinementRouter | Per-position penalty for continuing refinement. Ponder cost is a learned MetaParam. Encourages router to halt positions early. Reference: PonderNet (arXiv:2107.05407). |
 | **L_jac** | DEQ Jacobian regularization | Message passing | Ensures the factor graph fixed-point map stays contractive. Periodic (every 10 steps). |
-| **L_draft** | `DFlashDraftHead.compute_draft_loss` | Draft head + KV injection | Streak-distilled draft quality: position-weighted CE (w_i = λ^i) + expected streak bonus. NOT alpha-gated — trains from step 0. λ and streak_weight are learned MetaParams. |
+| **L_draft** | `DFlashDraftHead.compute_draft_loss` | Draft head + KV injection | Streak-distilled draft quality: position-blended CE (w_i = blend(λ^i, 1)) + expected streak bonus + DDTree prefix mass bonus + top-K recall penalty. NOT alpha-gated — trains from step 0. λ, streak_weight, position_blend, prefix_weight, recall_weight are learned MetaParams. |
 | **L_dsa_kl** | `LightningIndexer.compute_kl_loss` | Indexer projections | KL alignment: trains indexer to predict dense attention distribution. NOT alpha-gated. Full weight phase 1, reduced (0.1) after. Only computed in dense path (short context). |
 
 ### Bethe Free Energy (Factor Graph)
@@ -686,7 +686,7 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 17 | Hypothesis generator | 0.01 | Autoresearch loop |
 | 18a | BLT byte encoder | 0.01 | Byte embedding + N-gram conv + LocalDeltaProduct + strided pool |
 | 18b | BLT byte decoder | 0.01 | Down projection + LocalDeltaProduct + 4 multi-byte heads |
-| 19 | DFlash draft head (+ KV injection + OPUT) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block, OPUT self-correction. Attention 4-bit, MLP 3-bit, injection 3-bit RotorQuant. |
+| 19 | DFlash draft head (+ KV injection + OPUT + DDTree) | 0.01 | Block diffusion with KV injection, streak distillation, adaptive block, OPUT self-correction, DDTree tree-aware training (position blend + prefix mass + top-K recall). Attention 4-bit, MLP 3-bit, injection 3-bit RotorQuant. |
 | 20 | Refinement router (MoR adaptive) | 0.01 | Per-position routing in refinement loops |
 | 21 | Working memory prefix | 0.5 | Learnable scratchpad tokens (scalar LR) |
 | 22 | Refinement probe + gate | 0.01 / 0.5 | Halt decision (interface LR) + lifeline/loop encoding (scalar LR) |
@@ -904,7 +904,7 @@ For loop_i in range(max_loops):
 
 - **Training**: teacher forcing with deterministic oracle loop count (derived from input hash for DDP sync); halt probe learns from diverse targets via `binary_cross_entropy_with_logits`
 - **Inference**: halt when P(halt) > threshold or max loops reached
-- **Cost**: ~3-4× per token (amortized by DFlash speculative decoding ~7-8× + predictive refinement)
+- **Cost**: ~3-4× per token (amortized by DFlash+DDTree speculative decoding ~10-12× + predictive refinement)
 - **Advantage over text CoT**: no output tokens wasted, vector representations richer than language, TTT adapts weights during reasoning, different beliefs retrieved each loop as understanding shifts
 
 ### Predictive Refinement (MoR + SCORE + Error-Gated Retrieval)
@@ -948,6 +948,10 @@ Loop 1+: delta = blocks(x) - x_pre
 | `dflash_streak_weight` | softplus | 0.1 | Weight on expected streak length bonus |
 | `dflash_entropy_threshold` | softplus | 2.0 | Entropy cutoff (nats) for adaptive block sizing |
 | `oput_self_correct_weight` | softplus | 0.5 | Weight on OPUT on-policy self-correction loss |
+| `ddtree_position_blend` | sigmoid | 0.5 | Blend between decay (0) and uniform (1) position weights for tree-aware streak |
+| `ddtree_prefix_weight` | softplus | 0.1 | Weight on tree prefix mass bonus (DDTree surrogate) |
+| `ddtree_recall_weight` | softplus | 0.1 | Weight on top-K recall penalty (tree coverage signal) |
+| `ddtree_budget_scale` | softplus | 1.0 | Multiplicative scale on inference tree budget |
 
 **References**:
 - MoR: Mixture-of-Recursions (NeurIPS 2025, arXiv:2507.10524) — per-token adaptive recursion depth
@@ -1158,14 +1162,15 @@ Reference: Bolmo (Allen AI, arXiv:2512.15586) — mLSTM byte encoder at 1B-7B
 Reference: ByteFlow (arXiv:2603.03583) — learned byte segmentation
 Reference: LM head gradient bottleneck (arXiv:2603.10145) — 95-99% gradient loss
 
-## DFlash Speculative Decoding
+## DFlash Speculative Decoding + DDTree
 
-Native block diffusion draft head for inference acceleration. Especially valuable because refinement loops multiply per-token cost by ~4×. Four improvements over baseline:
+Native block diffusion draft head for inference acceleration. Especially valuable because refinement loops multiply per-token cost by ~4×. Five improvements over baseline:
 
 1. **KV injection**: Per-layer K/V projections for tapped target features (not concatenated as context tokens). Each draft layer independently interprets target representations. Injection projections are 3-bit RotorQuant eligible.
-2. **Streak distillation**: Position-weighted CE (w_i = λ^i, λ learned) + expected streak length bonus. Optimizes consecutive acceptance, not per-token accuracy.
-3. **Adaptive block size**: Draft up to `max_block_size` (32) tokens, but verify only the confident prefix. Entropy-based cutoff via learned MetaParam threshold.
+2. **Streak distillation**: Position-weighted CE (w_i = blend(λ^i, 1.0), λ and blend learned) + expected streak length bonus. Optimizes consecutive acceptance, not per-token accuracy. DDTree position blend interpolates between decay-weighted (DFlash single-path optimal) and uniform (DDTree tree-path optimal).
+3. **Adaptive block size**: Draft up to `max_block_size` (32) tokens, but verify only the confident prefix. Entropy-based cutoff via learned MetaParam threshold. (DFlash fallback mode; DDTree handles uncertainty via branching instead.)
 4. **OPUT on-policy self-correction** (DMax arXiv:2604.08302): During training, the draft head samples from its own predictions, constructs SPD hybrid embeddings (confidence-weighted interpolation between predicted token embedding and mask embedding), and runs a second forward pass. Trains the draft head to recover from its own errors within a block. Training-only — zero inference cost. The OPUT noise-robustness also enables RotorQuant on all draft head weights (previously excluded as "sensitive").
+5. **DDTree verification** (DDTree, Ringel & Romano 2026): Builds a draft tree from the per-position marginals of a single DFlash forward pass and verifies the entire tree in one target-model forward pass using ancestor-only tree attention. Replaces single-trajectory verification with multi-branch exploration. Preserves the target model's output distribution (lossless). Projected ~1.5-2.1× additional speedup over vanilla DFlash.
 
 **Gradient flow into backbone**: Tapped target features are NOT detached — L_draft gradient flows through tapped hidden states at layers [0, 5, 11] into the backbone. This provides an implicit multi-token prediction (MTP) signal: the backbone learns to produce hidden states that help the draft head predict k tokens ahead consecutively. Unlike dedicated MTP heads, this signal is streak-optimized, multi-layer, and belief-conditioned.
 
@@ -1196,12 +1201,42 @@ Mask embeddings + positional encoding (up to max_block_size=32)
 - **Cross+self attention with KV injection**: draft tokens attend to beliefs + each other via standard KV, AND to target features via injected KV pairs
 - **Shared LM head**: No extra 117M vocab projection
 - **Trained jointly**: Streak-distilled loss from step 0 (not alpha-gated)
-- **Inference**: `spec_generate()` — adaptive draft → verify confident prefix → accept/reject → repeat
+- **Inference**: `spec_generate()` → DDTree (multi-branch) or DFlash (single-trajectory) based on `ddtree_enabled`
 
-### Speculative Decoding Loop (Optimized)
+### DDTree: Diffusion Draft Tree Verification
 
-Verify-as-prefill reuse: the verify step from round N provides logits + tap hiddens
-for round N+1. Only ONE full model forward per round (not two).
+DDTree builds a draft tree from the per-position marginal distributions that the DFlash head already produces, then verifies the entire tree in one forward pass. The DFlash head is **unchanged** — DDTree is purely a change to the verification strategy in `spec_generate()`.
+
+**Algorithm (best-first heap, O(B log B)):**
+
+The drafter produces per-position factorized marginals q_i(v | c, b), which are independent across positions. A prefix ρ = (ρ₁,...,ρ_d) has probability q(ρ) = ∏ q_i^{(ρ_i)}. Algorithm 1 uses a max-heap over log-probabilities to enumerate the B highest-probability prefixes. Each popped prefix generates at most 2 successors: a sibling (next-best token at current depth) and a first child (best token at next depth). The resulting tree is provably optimal for the surrogate expected acceptance length E_Q[α_T(Y)] = ∑_{u∈T} q(u|c,b) (Proposition 2 & 3, DDTree paper).
+
+**Four-stage decoding round:**
+
+```
+1. Draft:      DFlash head → draft_logits [L, vocab] (per-position marginals)
+2. Build tree: Algorithm 1 (CPU heap) → B-node tree with ancestor visibility
+3. Verify:     forward(past_context + tree, attn_mask=tree_attention) → logits
+4. Walk tree:  follow matching children → accept longest path → carry bonus token
+```
+
+**Tree attention mask.** Each tree node attends to: (a) all past context tokens (causal, same as standard), (b) the root/bonus token, (c) its ancestors in the tree, and (d) itself. Siblings and cousins are invisible. This is enforced via a visibility matrix built during tree construction and passed as a custom attention mask to `forward()`. FlashAttention-2 does not support this pattern — the verifier falls back to PyTorch SDPA.
+
+**Losslessness.** The target model uses its own decoding rule (greedy or temperature sampling) at every tree node. DDTree only changes which candidate tokens are presented for evaluation, not how the verifier chooses among them. The output distribution is preserved exactly.
+
+**Tree-aware training.** Three additional loss terms alongside existing streak distillation:
+
+1. **Position blend** (`ddtree_position_blend`, learned MetaParam): interpolates between exponential decay weights λ^i (DFlash-optimal: early positions dominate single-path acceptance) and uniform weights (DDTree-optimal: all positions matter because the tree branches past early mismatches). DDTree paper Fig. 4 shows full-block acceptance jumps from ~18% to ~32% with tree verification, meaning late-position accuracy becomes load-bearing.
+
+2. **Tree prefix mass bonus** (`ddtree_prefix_weight`, learned MetaParam): uniform-weighted cumulative product of P(correct at each position). Directly optimizes the DDTree surrogate ∑ q(u|c,b) along the target path, ensuring the correct continuation has high prefix probability and survives the budget cutoff in Algorithm 1. Unlike the decayed streak bonus, this provides strong gradient signal at ALL depths.
+
+3. **Top-K recall penalty** (`ddtree_recall_weight`, learned MetaParam): penalizes positions where the target token falls outside the draft's top-K predictions (K = min(budget, vocab)). These are "tree misses" where DDTree cannot accept the correct token regardless of budget (DDTree Lemma 1: optimal tree uses only top-K tokens at each depth). Differentiable via the gap between the top-K log-sum-exp ceiling and the target's log-probability.
+
+**Belief conditioning synergy.** Memoria's drafter has belief embeddings as attention context, making the marginals q_i belief-conditioned — higher quality than vanilla DFlash. Higher-quality marginals → the surrogate ∑ q(u|c,b) is a tighter proxy for the true target distribution → the tree captures more of the verifier's actual output space.
+
+### Speculative Decoding Loops
+
+**DDTree mode** (ddtree_enabled=True):
 
 ```
 # Initial prefill (once)
@@ -1209,14 +1244,17 @@ result = forward(generated)
 cached_logits, cached_taps = result['logits'], result['dflash_tapped']
 
 while tokens_generated < max_new_tokens:
-    1. Get guaranteed token from cached_logits[:, -1, :]
+    1. Get bonus token from cached_logits[:, -1, :]
     2. Extract KV injection from cached_taps (no recomputation)
-    3. Draft head generates max_block_size tokens in parallel (cheap)
-    4. Entropy-based adaptive cutoff → verify only confident prefix
-    5. Verify: forward(candidate_seq) → verify_logits, verify_taps
-    6. Accept tokens until first mismatch with verifier
-    7. cached_logits, cached_taps = verify_logits, verify_taps  ← REUSE
+    3. Draft head generates draft_length tokens in parallel (cheap)
+    4. build_ddtree(draft_logits, budget) → tree (CPU, O(B log B))
+    5. compile_ddtree(tree) → input_ids, position_ids, tree_attention_mask
+    6. Verify: forward(past + tree, attn_mask=tree_mask) → tree_logits
+    7. follow_verified_tree(tree, tree_logits) → accepted path + next bonus
+    8. cached_logits, cached_taps = verify_logits, verify_taps  ← REUSE
 ```
+
+**DFlash fallback** (ddtree_enabled=False): same as before (single trajectory, entropy cutoff, sequential prefix match).
 
 ### Bandwidth Analysis (RTX 3090)
 
@@ -1234,11 +1272,15 @@ DFlash round cost (verify + draft): 185.3 MB → ~9 accepted tokens
 |---------------|-------|---------|
 | Vanilla AR | ~3,000 | 1.0x |
 | DFlash (all optimizations) | ~22,000 | 7.4x |
+| **DFlash + DDTree (projected)** | **~30,000** | **~10-12x** |
+
+DDTree adds ~1.5-2.1× over DFlash by exploring multiple branches per round. The tree building is O(B log B) CPU work (negligible), and the verify cost grows with tree size but is amortized by the longer acceptance length. DDTree Fig. 3 shows speedup peaks at B=256-512 for the paper's models; Memoria's higher per-token cost (refinement loops) shifts the optimal budget downward but increases the per-accepted-token amortization.
 
 Key optimizations and their contributions:
 - KV injection: +21% acceptance rate (tighter verifier alignment)
 - Streak distillation: +38% (consecutive accuracy optimization)
-- Adaptive block size: +90% (draft many, verify few in hard regions)
+- Adaptive block size: +90% (draft many, verify few in hard regions) [DFlash mode]
+- DDTree tree verification: +50-110% additional (multi-branch exploration) [DDTree mode]
 - Verify-as-prefill reuse: 2x (eliminates redundant forward pass per round)
 - LM head 4-bit QAT: 2x (233 MB → 58 MB, 71% bandwidth savings)
 
@@ -1247,6 +1289,8 @@ Reference: SpecDiff-2 (arXiv:2511.00606) — streak distillation
 Reference: FailFast (arXiv:2512.20573) — adaptive speculation length
 Reference: DEER (arXiv:2512.15176) — single-step diffusion drafting
 Reference: DMax (Chen et al. — arXiv:2604.08302) — OPUT on-policy training + SPD hybrid embeddings
+Reference: DDTree (Ringel & Romano — liranringel.github.io/ddtree/) — diffusion draft tree
+Reference: OPT-Tree (Wang et al. — TACL 2025) — adaptive draft tree for AR drafters
 
 ## In-Place Test-Time Training (TTT)
 
@@ -1469,20 +1513,21 @@ Standard autoregressive generation with cognitive state active:
 3. **Between chunks**: Pass 2 runs — allocate beliefs, create edges, update goals. Dream phase if at sequence boundary.
 4. **Cognitive state persists**: After generation ends, beliefs/edges/goals remain for next conversation.
 
-### Speculative Decoding (DFlash)
+### Speculative Decoding (DFlash + DDTree)
 
-DFlash draft head amortizes refinement loop cost. Optimized loop reuses verify as next prefill (1 forward per round, not 2):
+DFlash draft head amortizes refinement loop cost. DDTree builds a draft tree from DFlash's per-position marginals and verifies the entire tree in one forward pass with ancestor-only tree attention. Lossless — preserves target model's output distribution.
 
 ```
 while tokens_generated < max_new_tokens:
   1. Run full model on current sequence (with refinement loops)
-  2. Draft head generates block_size tokens in parallel (cheap: 15.9M params)
-  3. Verify: run full model on [sequence + drafted block]
-  4. Accept tokens until first mismatch
-  5. Append accepted, continue
+  2. Draft head generates draft_length tokens in parallel (cheap: 15.9M params)
+  3. build_ddtree(draft_logits, budget) → B-node tree (CPU, O(B log B))
+  4. Verify: forward(past + tree, attn_mask=tree_attention) → tree_logits
+  5. Walk tree: accept longest matching path, carry bonus token forward
+  6. Reuse verify as next prefill
 ```
 
-~7-8× speedup with KV injection + streak distillation + adaptive block + verify-as-prefill reuse. Estimated ~22K tok/s on RTX 3090 (with 4-bit LM head QAT).
+~10-12× projected speedup (DDTree adds ~1.5-2.1× over DFlash's ~7.4×). Falls back to single-trajectory DFlash when `ddtree_enabled=False`.
 
 ### Session Persistence
 
@@ -1515,6 +1560,7 @@ memoria/model/
   blt.py                 — BLT byte encoder/decoder (tokenizer-free byte-level I/O)
   pretrained_model.py    — PretrainedMemoriaModel: frozen HF backbone + interfaces
   dflash_head.py         — DFlash block diffusion draft head for speculative decoding
+  ddtree.py              — DDTree: tree building (Algorithm 1), compilation, verification walk
 
 memoria/core/
   state.py           — CognitiveState: beliefs, edges, goals, meta-parameters
