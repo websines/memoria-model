@@ -1375,6 +1375,98 @@ class MemoriaModel(nn.Module):
         return self.forward(idx, targets, alpha=alpha, update_state=update_state)
 
     @torch.no_grad()
+    def incremental_forward(
+        self,
+        new_token_ids: Tensor,
+        incremental_state: 'IncrementalState',
+        position_offset: int,
+        commit: bool = False,
+        attn_mask: Tensor | None = None,
+    ) -> dict:
+        """Process only new tokens using cached state from previous rounds.
+
+        This is the incremental counterpart to forward(). Instead of processing
+        the full sequence, it:
+        1. Embeds only new tokens + applies engram
+        2. Runs new tokens through transformer blocks with cached state:
+           - H/D layers: use saved recurrent state as initial_state
+           - L layers: attend new queries to cached KV + new KV
+        3. Applies LM head → logits for new tokens only
+
+        Skips: state interfaces, refinement loops, working memory prefix.
+        These are training-time features not needed for verification.
+        The logits produced are sufficient for DDTree tree walking.
+
+        Args:
+            new_token_ids: [1, T_new] token IDs for new positions only.
+            incremental_state: IncrementalState with per-layer caches.
+            position_offset: absolute position of first new token (= seq_len so far).
+            commit: if True, update persistent caches. If False (speculative
+                verify), process without persisting state changes.
+            attn_mask: optional attention mask for tree verification.
+                [1, 1, T_new, T_past + T_new] if provided.
+
+        Returns:
+            dict with 'logits': [1, T_new, vocab] and 'dflash_tapped': tap hiddens.
+        """
+        from .kv_cache import IncrementalState
+
+        B, T_new = new_token_ids.shape
+        assert B == 1, "incremental_forward only supports batch_size=1"
+
+        device = new_token_ids.device
+
+        # ── Embed new tokens ──
+        x = self.transformer.wte(new_token_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+
+        # Engram: only on new tokens (hash-based lookup, position-independent)
+        engram_out = self.engram_cache(x, new_token_ids)
+        x = x + engram_out
+
+        # x0 for residual scaling (same as forward)
+        x0 = x
+
+        # RoPE: generate cos/sin for the NEW token positions
+        T_total = position_offset + T_new
+        self.transformer._ensure_rope(T_total)
+        cos = self.transformer.cos[:, position_offset:T_total]
+        sin = self.transformer.sin[:, position_offset:T_total]
+
+        # ── Process through transformer blocks with cached state ──
+        dflash_tapped = {}
+        tap_set = set(self.dflash_head.tap_indices) if self.dflash_enabled else set()
+
+        for i, block in enumerate(self.transformer.blocks):
+            layer_cache = incremental_state.layer_caches.get(i)
+            x = block(
+                x, x0, cos, sin,
+                self.transformer.resid_lambdas[i],
+                self.transformer.x0_lambdas[i],
+                layer_cache=layer_cache,
+                commit=commit,
+                attn_mask=attn_mask,
+            )
+            # Collect tap hiddens for DFlash draft head
+            if i in tap_set:
+                dflash_tapped[i] = x.clone()
+
+        # ── LM head ──
+        x = F.rms_norm(x, (x.size(-1),))
+        if self.blt_enabled:
+            logits = self.byte_decoder(x)
+        else:
+            logits = self.transformer.head(x)
+
+        if commit:
+            incremental_state.seq_len = T_total
+
+        return {
+            'logits': logits,
+            'dflash_tapped': dflash_tapped if dflash_tapped else None,
+        }
+
+    @torch.no_grad()
     def spec_generate(
         self,
         input_ids: Tensor,
@@ -1546,23 +1638,24 @@ class MemoriaModel(nn.Module):
         temperature: float,
         stop_set: set[int],
     ) -> Tensor:
-        """DDTree speculative decoding: tree-based multi-branch verification.
+        """DDTree speculative decoding with incremental KV cache.
 
-        Four stages per round:
-        1. Draft: DFlash head produces per-position marginals [L, vocab]
-        2. Build tree: Algorithm 1 (best-first heap) → B-node draft tree
-        3. Verify: one target-model forward pass with tree attention mask
-        4. Walk tree: accept longest matching path, carry bonus token forward
+        Three-phase loop per round:
+        1. Draft: DFlash head produces per-position marginals from cached taps
+        2. Build tree + verify (speculative): incremental forward on tree tokens
+           with checkpointed recurrent state and tree attention mask
+        3. Walk + commit: determine accepted path, rollback recurrent state,
+           replay only accepted tokens to update persistent caches
 
-        The tree attention mask ensures each node attends only to its ancestors
-        and the past context — siblings and cousins are invisible. This makes
-        the verifier's output at each node position identical to what it would
-        produce for that specific continuation, preserving the target model's
-        output distribution (lossless).
+        The incremental KV cache eliminates full-sequence reprocessing:
+        - H/D layers: save/restore Fenwick tree recurrent state
+        - L layers: cache assembled K/V, attend new queries to cached + new
+        - Per-round cost: O(B + accepted) instead of O(T_past + B)
 
         Reference: DDTree (Ringel & Romano — liranringel.github.io/ddtree/)
         """
         from .ddtree import build_ddtree, compile_ddtree, follow_verified_tree
+        from .kv_cache import IncrementalState
 
         device = generated.device
         max_block = self.dflash_head.max_block_size
@@ -1574,13 +1667,27 @@ class MemoriaModel(nn.Module):
 
         tokens_generated = 0
 
-        # ── Initial prefill ──
-        result = self.forward(generated)
-        cached_logits = result['logits']
-        cached_taps = result.get('dflash_tapped')
+        # ── Phase 0: Prefill — full forward on prompt, build initial caches ──
+        # This runs once. All subsequent rounds use incremental_forward.
+        inc_state = IncrementalState.build_for_model(self)
+        prefill_result = self.forward(generated)
+        cached_logits = prefill_result['logits']
+        cached_taps = prefill_result.get('dflash_tapped')
+
+        # Populate caches from prefill: extract KV and recurrent states
+        # For the first round, we need the caches populated. Since forward()
+        # doesn't directly expose per-layer state, we run a commit pass on
+        # the prompt tokens to seed the caches.
+        _commit_result = self.incremental_forward(
+            generated, inc_state,
+            position_offset=0, commit=True,
+        )
+        # Use the full forward's logits (which include refinement) over the
+        # incremental forward's logits (which skip refinement).
+        # cached_logits stays from prefill_result.
 
         while tokens_generated < max_new_tokens:
-            # ── Step 1: Get bonus token (guaranteed) from cached logits ──
+            # ── Step 1: Get bonus token from cached logits ──
             bonus_token = self._sample_token(cached_logits[:, -1, :], temperature)
 
             if bonus_token.item() in stop_set:
@@ -1589,7 +1696,7 @@ class MemoriaModel(nn.Module):
                 ], dim=1)
                 break
 
-            # ── Step 2: Draft — per-position marginals from DFlash head ──
+            # ── Step 2: Draft — DFlash head produces per-position marginals ──
             if cached_taps is not None:
                 tap_hiddens = cached_taps
             else:
@@ -1613,27 +1720,28 @@ class MemoriaModel(nn.Module):
                 injection=injection, draft_length=draft_length,
             )  # [1, draft_length, vocab]
 
-            # ── Step 3: Build tree from draft marginals (CPU, O(B log B)) ──
-            # draft_logits[0] = [draft_length, vocab] — per-position marginals
-            # conditioned on context (c, b) but NOT on other draft positions.
-            # This factorized structure is what makes Algorithm 1 optimal.
+            # ── Step 3: Build tree (CPU, O(B log B)) ──
             tree = build_ddtree(draft_logits[0], tree_budget)
 
             if tree.node_count == 0:
-                # Empty tree (budget exhausted or no draft positions) →
-                # just accept the bonus token
-                generated = torch.cat([
-                    generated, bonus_token.unsqueeze(0).unsqueeze(0),
-                ], dim=1)
+                # Empty tree → just accept bonus token
+                bonus_ids = bonus_token.unsqueeze(0).unsqueeze(0)
+                generated = torch.cat([generated, bonus_ids], dim=1)
                 tokens_generated += 1
+                # Commit the single bonus token
+                self.incremental_forward(
+                    bonus_ids, inc_state,
+                    position_offset=inc_state.seq_len, commit=True,
+                )
+                # Get fresh logits via full forward (fallback for empty tree)
                 cached_logits = self.forward(generated)['logits']
                 cached_taps = None
                 if bonus_token.item() in stop_set:
                     break
                 continue
 
-            # ── Step 4: Compile tree into verification tensors ──
-            T_past = generated.shape[1]  # past context length
+            # ── Step 4: Compile tree → verification tensors ──
+            T_past = inc_state.seq_len
             tree_input_ids, tree_position_ids, tree_attn_mask = compile_ddtree(
                 tree,
                 root_token_id=bonus_token.item(),
@@ -1642,83 +1750,85 @@ class MemoriaModel(nn.Module):
                 device=device,
                 dtype=next(self.parameters()).dtype,
             )
-            # tree_input_ids:   [1, 1+N] — bonus token + tree nodes
-            # tree_position_ids: [1, 1+N] — absolute positions (start + depth)
-            # tree_attn_mask:    [1, 1, 1+N, T_past + 1+N] — hybrid mask
 
-            # Build full verification sequence: past context + tree tokens
-            verify_seq = torch.cat([generated, tree_input_ids], dim=1)
+            # ── Step 5: Speculative verify (incremental, no commit) ──
+            # Checkpoint recurrent states so we can rollback after verify.
+            # Attention caches are append-only — we don't commit during verify.
+            inc_state.checkpoint()
 
-            # Build full attention mask: [1, 1, T_past + 1+N, T_past + 1+N]
-            # Upper-left: standard causal for past context
-            # Lower-left: tree nodes attend to all past (causal guaranteed by position)
-            # Upper-right: past tokens do NOT attend to tree nodes
-            # Lower-right: tree visibility (ancestor-only)
-            T_tree = tree_input_ids.shape[1]  # 1 + node_count
-            T_total = T_past + T_tree
+            # Build tree attention mask for incremental verify:
+            # The attention layers have cached KV from positions 0..T_past-1.
+            # New tokens are the tree (1+N positions). The mask controls how
+            # tree tokens attend to each other (ancestor-only visibility).
+            # Attention to cached KV is handled by the KV cache (always causal).
+            # So the mask only needs to cover the tree-to-tree portion.
+            T_tree = tree_input_ids.shape[1]
             mask_val = torch.finfo(next(self.parameters()).dtype).min
-
-            full_attn_mask = torch.full(
-                (1, 1, T_total, T_total), mask_val,
+            tree_only_mask = torch.full(
+                (1, 1, T_tree, T_past + T_tree), mask_val,
                 dtype=next(self.parameters()).dtype, device=device,
             )
-            # Past context: standard lower-triangular causal mask
-            causal_indices = torch.arange(T_past, device=device)
-            full_attn_mask[0, 0, :T_past, :T_past].masked_fill_(
-                causal_indices.unsqueeze(0) <= causal_indices.unsqueeze(1), 0.0,
-            )
-            # Tree tokens attend to all past context (rows T_past..T_total, cols 0..T_past)
-            full_attn_mask[0, 0, T_past:, :T_past] = 0.0
-            # Tree internal visibility (rows T_past..T_total, cols T_past..T_total)
-            full_attn_mask[0, 0, T_past:, T_past:].masked_fill_(
+            # Tree tokens attend to all past (columns 0..T_past-1)
+            tree_only_mask[:, :, :, :T_past] = 0.0
+            # Tree-to-tree: ancestor-only visibility
+            tree_only_mask[0, 0, :, T_past:].masked_fill_(
                 tree.visibility.to(device), 0.0,
             )
 
-            # Build position IDs: past context uses sequential, tree uses depth-based
-            past_positions = torch.arange(T_past, device=device).unsqueeze(0)
-            full_position_ids = torch.cat([past_positions, tree_position_ids], dim=1)
-
-            # ── Step 5: Verify entire tree in one forward pass ──
-            # The tree attention mask forces ancestor-only visibility within the
-            # tree, so each node's output is conditioned only on its specific
-            # path — identical to what the verifier would produce for that
-            # continuation as a standalone sequence. This is what makes DDTree
-            # lossless (DDTree paper, Section 4.4).
-            verify_result = self.forward(
-                verify_seq, attn_mask=full_attn_mask,
+            verify_result = self.incremental_forward(
+                tree_input_ids, inc_state,
+                position_offset=T_past,
+                commit=False,  # speculative — don't persist
+                attn_mask=tree_only_mask,
             )
-            verify_logits = verify_result['logits']
+            verify_logits = verify_result['logits']  # [1, 1+N, vocab]
 
-            # ── Step 6: Walk the verified tree ──
-            # Extract logits for the tree portion only: [1, 1+N, vocab]
-            tree_logits = verify_logits[:, T_past:, :]
+            # ── Step 6: Walk tree → accepted path ──
             accepted_indices, next_bonus_token = follow_verified_tree(
-                tree, tree_logits, temperature,
+                tree, verify_logits, temperature,
             )
 
-            # Gather accepted token IDs from tree_input_ids
+            # ── Step 7: Rollback + commit accepted path only ──
+            inc_state.restore()  # rollback recurrent states
+
+            # Gather accepted token IDs
             accepted_idx_tensor = torch.tensor(
                 accepted_indices, dtype=torch.long, device=device,
             )
             accepted_tokens = tree_input_ids.index_select(1, accepted_idx_tensor)
 
-            # Append the accepted path + the next bonus token (first mismatch)
-            next_bonus = torch.tensor(
+            # Commit: replay accepted tokens through backbone incrementally.
+            # This updates recurrent state correctly (only accepted tokens affect it)
+            # and appends only accepted KV to attention caches.
+            commit_result = self.incremental_forward(
+                accepted_tokens, inc_state,
+                position_offset=T_past,
+                commit=True,
+            )
+
+            # Also commit the next bonus token (first unmatched verifier token)
+            next_bonus_ids = torch.tensor(
                 [[next_bonus_token]], dtype=torch.long, device=device,
             )
-            new_tokens = torch.cat([accepted_tokens, next_bonus], dim=1)
+            bonus_commit = self.incremental_forward(
+                next_bonus_ids, inc_state,
+                position_offset=T_past + len(accepted_indices),
+                commit=True,
+            )
+
+            # Update generated sequence
+            new_tokens = torch.cat([accepted_tokens, next_bonus_ids], dim=1)
             generated = torch.cat([generated, new_tokens], dim=1)
-            n_accepted = len(accepted_indices)  # accepted tree nodes (incl. root/bonus)
+            n_accepted = len(accepted_indices)
             tokens_generated += n_accepted
 
-            # ── Reuse verify as next round's prefill ──
-            # Cache logits: we need the logits at the LAST accepted position
-            # for sampling the next bonus token. The verify forward already
-            # computed logits for the full sequence.
-            cached_logits = verify_logits
-            cached_taps = verify_result.get('dflash_tapped')
+            # Cache logits: the verify pass has logits for all tree nodes.
+            # The last accepted node's logits are used for drafting next round.
+            # Use the verify logits at the last accepted index for the bonus token.
+            cached_logits = bonus_commit['logits']  # logits after bonus token
+            cached_taps = bonus_commit.get('dflash_tapped')
 
-            # Check for stop tokens in accepted
+            # Check for stop tokens
             if stop_set:
                 all_new = new_tokens[0].tolist()
                 if any(t in stop_set for t in all_new):

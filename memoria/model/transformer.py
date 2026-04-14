@@ -362,7 +362,9 @@ class MLACausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
                 beliefs: Tensor | None = None,
-                attn_mask: Tensor | None = None) -> Tensor:
+                attn_mask: Tensor | None = None,
+                kv_cache=None,
+                commit: bool = False) -> Tensor:
         B, T, C = x.size()
 
         # Query: standard projection + full RoPE
@@ -387,10 +389,21 @@ class MLACausalSelfAttention(nn.Module):
         q = apply_rotary_emb_partial(q, cos, sin, self.d_rope)
 
         # Assemble full key: [rope_dims | nope_dims]
-        k = torch.cat([k_rope, k_nope], dim=-1)  # [B, T, n_kv_head, head_dim]
+        k_new = torch.cat([k_rope, k_nope], dim=-1)  # [B, T, n_kv_head, head_dim]
 
         # Decompress values from latent
-        v = self.v_up(latent).view(B, T, self.n_kv_head, self.head_dim)
+        v_new = self.v_up(latent).view(B, T, self.n_kv_head, self.head_dim)
+
+        # Incremental KV cache: prepend cached K/V from previous rounds.
+        # K already has RoPE applied; V is position-invariant. Both are
+        # fully assembled and ready for attention — no latent recomputation.
+        k, v = k_new, v_new
+        if kv_cache is not None:
+            from .kv_cache import AttentionCache
+            if isinstance(kv_cache, AttentionCache) and kv_cache.k is not None:
+                k, v = kv_cache.append(k_new, v_new)
+                if commit:
+                    kv_cache.commit_indices(k_new, v_new, list(range(T)))
 
         # QK norm
         q, k = norm(q), norm(k)
@@ -623,31 +636,62 @@ class CausalSelfAttention(nn.Module):
         self._yarn_scale = 1.0
 
     def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
-                attn_mask: Tensor | None = None) -> Tensor:
+                attn_mask: Tensor | None = None,
+                kv_cache=None,
+                commit: bool = False) -> Tensor:
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        k_new = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v_new = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
+        q, k_new = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k_new, cos, sin)
+        q, k_new = norm(q), norm(k_new)
+
+        # Incremental KV cache: prepend cached K/V from previous rounds.
+        # In incremental mode, x contains only NEW tokens, and cos/sin are
+        # already sliced to the correct positions. The cached KV already has
+        # RoPE applied from when those positions were first processed.
+        k, v = k_new, v_new
+        if kv_cache is not None:
+            from .kv_cache import AttentionCache
+            if isinstance(kv_cache, AttentionCache) and kv_cache.k is not None:
+                k_full, v_full = kv_cache.append(k_new, v_new)
+                k, v = k_full, v_full
+                if commit:
+                    kv_cache.commit_indices(k_new, v_new, list(range(T)))
 
         # GQA: expand kv heads if needed
         if self.n_kv_head < self.n_head:
             rep = self.n_head // self.n_kv_head
-            k = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
-            v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, T, self.n_head, self.head_dim)
+            k = k.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, k.shape[1], self.n_head, self.head_dim)
+            v = v.unsqueeze(3).expand(-1, -1, -1, rep, -1).reshape(B, v.shape[1], self.n_head, self.head_dim)
 
-        q = q.transpose(1, 2)  # [B, H, T, D]
-        k = k.transpose(1, 2)
+        q = q.transpose(1, 2)  # [B, H, T_q, D]
+        k = k.transpose(1, 2)  # [B, H, T_kv, D] (T_kv >= T_q when cache is used)
         v = v.transpose(1, 2)
-        # DDTree verify: when attn_mask is provided, use it instead of is_causal.
-        # attn_mask is [1, 1, T, T] additive mask (0 = attend, -inf = block).
-        # Only used during spec_generate tree verification — training path
-        # always passes attn_mask=None → is_causal=True (unchanged behavior).
+
+        # When using KV cache (incremental mode), T_q != T_kv so is_causal
+        # can't be used — build a causal mask manually or use attn_mask.
         if attn_mask is not None:
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask,
+                scale=self._yarn_scale / math.sqrt(self.head_dim),
+            )
+        elif kv_cache is not None and k.shape[2] > T:
+            # Incremental: Q has T tokens, KV has T_cached + T tokens.
+            # Build causal mask: each query at position p attends to KV at positions ≤ p.
+            T_kv = k.shape[2]
+            T_cached = T_kv - T
+            # Query positions are T_cached..T_cached+T-1 (absolute)
+            # KV positions are 0..T_kv-1
+            q_pos = torch.arange(T_cached, T_cached + T, device=x.device).unsqueeze(1)
+            kv_pos = torch.arange(T_kv, device=x.device).unsqueeze(0)
+            causal = (kv_pos <= q_pos).to(dtype=x.dtype)
+            causal = causal.masked_fill(causal == 0, torch.finfo(x.dtype).min)
+            causal = causal.masked_fill(causal == 1, 0.0)
+            causal = causal.unsqueeze(0).unsqueeze(0)  # [1, 1, T, T_kv]
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=causal,
                 scale=self._yarn_scale / math.sqrt(self.head_dim),
             )
         else:
@@ -713,24 +757,48 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor, cos: Tensor, sin: Tensor,
                 resid_lambda: Tensor, x0_lambda: Tensor,
                 beliefs: Tensor | None = None,
-                attn_mask: Tensor | None = None) -> Tensor:
+                attn_mask: Tensor | None = None,
+                layer_cache=None,
+                commit: bool = False) -> Tensor:
+        """Transformer block with optional incremental state.
+
+        Args:
+            layer_cache: per-layer cache from IncrementalState. Type depends on
+                layer: RecurrentCache for H/D, AttentionCache for L, None for M/S.
+            commit: if True, persist state changes to cache. If False (speculative
+                verify), process without updating persistent cache.
+        """
         # Per-layer residual scaling (from autoresearch)
         x = resid_lambda * x + x0_lambda * x0
-        # Pass beliefs to MLA layers for DSA belief-conditioned attention
-        # attn_mask is only set during DDTree verify (spec_generate) — None in training.
-        if isinstance(self.attn, MLACausalSelfAttention) and self.attn.dsa_enabled:
-            x = x + self.attn(norm(x), cos, sin, beliefs=beliefs, attn_mask=attn_mask)
-        elif isinstance(self.attn, (CausalSelfAttention, MLACausalSelfAttention)):
-            # CausalSelfAttention and non-DSA MLA accept attn_mask
-            if attn_mask is not None:
-                x = x + self.attn(norm(x), cos, sin, attn_mask=attn_mask)
-            else:
-                x = x + self.attn(norm(x), cos, sin)
-        else:
-            # Mamba, SlidingWindow, DeltaProduct, etc. — no mask support needed
-            # (these layers use O(T) linear recurrence or local windows,
-            # not global attention — tree structure handled by the attention layers)
+
+        # Dispatch attention with appropriate kwargs based on layer type
+        from .deltaproduct_layers import DeltaProductBlock, LogLinearDeltaProductBlock
+
+        if isinstance(self.attn, LogLinearDeltaProductBlock):
+            # H layer: recurrent with Fenwick tree — pass incremental cache
+            x = x + self.attn(
+                norm(x), cos, sin,
+                incremental_cache=layer_cache, commit=commit,
+            )
+        elif isinstance(self.attn, DeltaProductBlock):
+            # D layer: recurrent without Fenwick — pass initial/final state
             x = x + self.attn(norm(x), cos, sin)
+        elif isinstance(self.attn, MLACausalSelfAttention) and self.attn.dsa_enabled:
+            # L layer with DSA: belief-conditioned sparse attention + KV cache
+            x = x + self.attn(
+                norm(x), cos, sin, beliefs=beliefs,
+                attn_mask=attn_mask, kv_cache=layer_cache, commit=commit,
+            )
+        elif isinstance(self.attn, (CausalSelfAttention, MLACausalSelfAttention)):
+            # L layer (standard): attention + KV cache
+            x = x + self.attn(
+                norm(x), cos, sin,
+                attn_mask=attn_mask, kv_cache=layer_cache, commit=commit,
+            )
+        else:
+            # Mamba, SlidingWindow, etc. — no cross-round cache
+            x = x + self.attn(norm(x), cos, sin)
+
         x = x + self.mlp(norm(x))
         return x
 

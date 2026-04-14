@@ -1256,6 +1256,53 @@ while tokens_generated < max_new_tokens:
 
 **DFlash fallback** (ddtree_enabled=False): same as before (single trajectory, entropy cutoff, sequential prefix match).
 
+### Incremental KV Cache (IncrementalState)
+
+Eliminates full-sequence reprocessing in `spec_generate()`. Instead of running the entire generated sequence through the model each round, only new tokens (tree or accepted path) are processed. Per-layer caches persist across rounds:
+
+| Layer type | Cache content | Shape per layer | Save/restore |
+|------------|--------------|-----------------|-------------|
+| **H** (LogLinearDeltaProduct) | Fenwick tree state (all levels + active mask + chunk count) | [L, B, H, K, V] float32 | `save_fenwick()` / `restore_fenwick()` |
+| **D** (DeltaProduct) | Recurrent state matrix | [B, H, K, V] float32 | FLA `initial_state` / `output_final_state` |
+| **L** (MLA/CausalSelfAttention) | Assembled K + V (RoPE pre-applied) | [B, T, n_kv_head, head_dim] | `append()` / `commit_indices()` |
+| **M** (Mamba), **S** (SlidingWindow) | Internal — no cross-round cache | — | — |
+
+**Three-phase DDTree loop with incremental state:**
+
+```
+Phase 0 (once): Prefill
+  forward(prompt) → populate IncrementalState caches
+  Cost: O(T_prompt²) — same as before, runs once
+
+Per round:
+  Phase 1: Speculative verify (read-only, checkpointed)
+    inc_state.checkpoint()     ← snapshot recurrent states
+    incremental_forward(tree_tokens, inc_state, commit=False)
+    follow_verified_tree()     → accepted_indices
+    Cost: O(B) through H layers + O(B × T_past) for L layer attention
+
+  Phase 2: Selective commit (accepted path only)
+    inc_state.restore()        ← rollback recurrent states
+    incremental_forward(accepted_tokens, inc_state, commit=True)
+    incremental_forward(bonus_token, inc_state, commit=True)
+    Cost: O(accepted) through H layers + O(accepted × T_past) for L layers
+```
+
+**Per-round cost comparison** (T_past=1000, B=64, accepted=12):
+
+| Mode | H layers (×10) | L layers (×2) | Total |
+|------|---------------|--------------|-------|
+| **Full reprocess** (old) | O(1065) × 10 | O(1065²) × 2 | ~O(2.3M) |
+| **Incremental** (new) | O(76) × 10 | O(76 × 1000) × 2 | ~O(153K) |
+| **Speedup** | — | — | **~15×** per round |
+
+The O(B × T_past) attention cost for L layers dominates in incremental mode. With only 2 L layers vs 10 H layers in the HHHHL pattern, the effective compute reduction is massive.
+
+**Speculative verify + selective commit.** Recurrent states (H/D layers) are irreversibly modified by processing tokens — tree branches can't be selectively removed from the state. The checkpoint/restore pattern snapshots recurrent states before verify, rolls back after, then replays only accepted tokens. Attention caches (L layers) are append-only and handle compaction via `commit_indices(keep_indices)`.
+
+Reference: FLA `initial_state` / `output_final_state` — stateful recurrence
+Reference: FenwickStateTree `get_all_states()` — save/load hierarchical state
+
 ### Bandwidth Analysis (RTX 3090)
 
 | Component | Size | % of per-token BW |
@@ -1272,7 +1319,8 @@ DFlash round cost (verify + draft): 185.3 MB → ~9 accepted tokens
 |---------------|-------|---------|
 | Vanilla AR | ~3,000 | 1.0x |
 | DFlash (all optimizations) | ~22,000 | 7.4x |
-| **DFlash + DDTree (projected)** | **~30,000** | **~10-12x** |
+| DFlash + DDTree (full reprocess, B≈64) | ~27,000 | ~9x |
+| **DFlash + DDTree + incremental cache (B≈128)** | **~36,000** | **~12x** |
 
 DDTree adds ~1.5-2.1× over DFlash by exploring multiple branches per round. The tree building is O(B log B) CPU work (negligible), and the verify cost grows with tree size but is amortized by the longer acceptance length. DDTree Fig. 3 shows speedup peaks at B=256-512 for the paper's models; Memoria's higher per-token cost (refinement loops) shifts the optimal budget downward but increases the per-accepted-token amortization.
 
@@ -1561,6 +1609,7 @@ memoria/model/
   pretrained_model.py    — PretrainedMemoriaModel: frozen HF backbone + interfaces
   dflash_head.py         — DFlash block diffusion draft head for speculative decoding
   ddtree.py              — DDTree: tree building (Algorithm 1), compilation, verification walk
+  kv_cache.py            — IncrementalState: per-layer KV/recurrent cache for spec_generate
 
 memoria/core/
   state.py           — CognitiveState: beliefs, edges, goals, meta-parameters

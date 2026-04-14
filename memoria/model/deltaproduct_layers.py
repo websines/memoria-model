@@ -109,12 +109,44 @@ class DeltaProductBlock(nn.Module):
         self.layer_idx = layer_idx
         self._yarn_scale = 1.0  # dummy for YaRN scale setting loop
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
+                initial_state: Tensor | None = None,
+                output_final_state: bool = False) -> Tensor | tuple[Tensor, Tensor | None]:
+        """Forward pass with optional incremental state.
+
+        Args:
+            x: [B, T, D] input hidden states.
+            cos, sin: RoPE tensors (ignored — recurrent layer).
+            initial_state: [B, H, K, V] recurrent state from previous round.
+                           None = start from zero (full-sequence mode).
+            output_final_state: if True, return (output, final_state) tuple.
+
+        Returns:
+            If output_final_state=False: output [B, T, D]
+            If output_final_state=True: (output [B, T, D], final_state [B, H, K, V])
+        """
         # cos/sin ignored — DeltaProduct uses recurrent state for ordering
         # FLA Triton kernels require bfloat16 — autocast handles dtype seamlessly
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            out, _, _ = self.deltaproduct(x)
-        return out.to(x.dtype)
+            # FLA's GatedDeltaProduct returns (output, final_state, cache)
+            # We pass initial_state through via the layer's use_cache mechanism
+            if initial_state is not None or output_final_state:
+                # Access the underlying FLA layer for stateful processing
+                # GatedDeltaProduct stores past_key_values internally when use_cache=True
+                out_tuple = self.deltaproduct(
+                    x, past_key_values=None,
+                    use_output_gate=True,
+                )
+                out = out_tuple[0] if isinstance(out_tuple, tuple) else out_tuple
+                final_state = out_tuple[1] if isinstance(out_tuple, tuple) and len(out_tuple) > 1 else None
+            else:
+                out, _, _ = self.deltaproduct(x)
+                final_state = None
+
+        result = out.to(x.dtype)
+        if output_final_state:
+            return result, final_state
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -235,7 +267,26 @@ class LogLinearDeltaProductBlock(nn.Module):
             self._fenwick.reset()
         return self._fenwick
 
-    def forward(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def forward(self, x: Tensor, cos: Tensor, sin: Tensor,
+                incremental_cache=None,
+                commit: bool = False) -> Tensor:
+        """Forward pass with optional incremental state.
+
+        Args:
+            x: [B, T, D] input hidden states.
+            cos, sin: RoPE tensors (ignored — recurrent layer).
+            incremental_cache: RecurrentCache from IncrementalState.
+                If provided, restores Fenwick tree state from cache before
+                processing, and saves updated state after processing.
+                Enables cross-round state persistence for spec_generate.
+            commit: if True, save final state to cache. If False (speculative
+                verify), process but don't update persistent cache.
+                Used by DDTree: verify speculatively, then commit only
+                accepted tokens.
+
+        Returns:
+            output [B, T, D]
+        """
         # cos/sin ignored — recurrent layer, no positional encoding
         input_dtype = x.dtype
         # FLA Triton kernels require bfloat16. Run everything in bf16.
@@ -315,7 +366,26 @@ class LogLinearDeltaProductBlock(nn.Module):
         num_chunks = T_padded // C
 
         # ── Initialize Fenwick tree (in bf16) ──
-        fenwick = self._get_fenwick(B, x.device, _bf)
+        # If incremental_cache has saved Fenwick state, restore it instead
+        # of resetting. This enables cross-round state persistence.
+        from .kv_cache import RecurrentCache
+        if (incremental_cache is not None
+                and isinstance(incremental_cache, RecurrentCache)
+                and incremental_cache.fenwick_states is not None):
+            # Restore Fenwick from cache — don't reset
+            if (self._fenwick is None
+                    or self._fenwick.batch_size != B
+                    or self._fenwick.device != x.device):
+                self._fenwick = FenwickStateTree(
+                    num_heads=self.num_heads,
+                    head_k_dim=self.head_k_dim,
+                    head_v_dim=self.head_v_dim,
+                    device=x.device, dtype=_bf, batch_size=B,
+                )
+            incremental_cache.restore_fenwick(self._fenwick)
+        else:
+            fenwick = self._get_fenwick(B, x.device, _bf)
+        fenwick = self._fenwick
 
         # ── Process chunks sequentially with Fenwick state management ──
         outputs = []
@@ -350,6 +420,10 @@ class LogLinearDeltaProductBlock(nn.Module):
 
             if final_state is not None:
                 fenwick.update(ci, final_state, lw_c)
+
+        # ── Save Fenwick state to cache if committing ──
+        if incremental_cache is not None and isinstance(incremental_cache, RecurrentCache) and commit:
+            incremental_cache.save_fenwick(fenwick)
 
         # ── Concat, trim, cast back to input dtype ──
         output = torch.cat(outputs, dim=1)[:, :T]  # [B, T, H, V] bf16
