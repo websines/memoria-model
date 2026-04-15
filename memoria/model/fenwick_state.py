@@ -148,13 +148,27 @@ class FenwickStateTree:
         merge_level = min(merge_level, self.num_levels - 2)  # don't exceed buffer
 
         if merge_level > 0:
-            # Merge levels 0..merge_level into level merge_level
+            # Merge levels 0..merge_level into level merge_level.
+            #
+            # Average — not raw sum. Levels represent temporal resolutions of
+            # the same recurrent state; they must remain magnitude-comparable
+            # for the weighted query Σ_l w_l · state[l] to be non-expanding.
+            # Raw summation makes level-l magnitude grow as 2^l × chunk_mag,
+            # which compounds geometrically through query→kernel→update
+            # (observed: |state| = 1.8e37 within a single 2048-chunk forward).
+            # Dividing by the active count keeps each merged state bounded by
+            # the max single-chunk magnitude.
             target_level = merge_level
             merged = torch.zeros_like(self.states[0])
+            active_count = 0
 
             for l in range(merge_level):
                 if self.active[l]:
                     merged = merged + self.states[l]
+                    active_count += 1
+
+            if active_count > 0:
+                merged = merged / active_count
 
             self.states[target_level] = merged
             self.active[target_level] = True
