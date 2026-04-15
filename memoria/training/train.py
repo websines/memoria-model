@@ -683,7 +683,18 @@ def train(
                 adamw = getattr(optimizer, 'adamw', optimizer)  # _CombinedOptimizer or plain AdamW
                 clip_params = [p for g in adamw.param_groups for p in g['params'] if p.grad is not None]
                 if clip_params:
-                    torch.nn.utils.clip_grad_norm_(clip_params, tc.grad_clip_norm)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(clip_params, tc.grad_clip_norm)
+                    # `grad_norm` is the TOTAL pre-clip norm. If it's non-finite,
+                    # at least one parameter has NaN/inf gradient — stepping would
+                    # corrupt its weight (which is how we got the g_norm NaN
+                    # silently). Skip and zero grads.
+                    if not torch.isfinite(grad_norm):
+                        skip_step = True
+                        if is_main:
+                            print(f"  WARNING: non-finite grad_norm={grad_norm.item()} "
+                                  f"at step {step}, skipping optimizer step")
+
+        if not skip_step:
             optimizer.step()
 
             # CAGE post-step correction: nudge weights toward quantization grid

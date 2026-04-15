@@ -55,20 +55,51 @@ def _check(tag: str, name: str, obj) -> None:
 def install_nan_hooks(model: nn.Module) -> list:
     """Register NaN-detecting forward hooks on every submodule.
 
-    Returns the list of hook handles so the caller can remove them.
-    The hook raises _Tripped on first non-finite output — train.py catches
-    it, prints context, and re-raises.
+    The hook checks BOTH inputs and outputs so we can distinguish:
+      - input clean + output NaN → this module is the producer
+      - input NaN already        → bug is upstream (possibly a raw function
+        call invisible to hooks, e.g. a Triton kernel)
+    On trip, also dumps the module's own parameter stats so corrupted
+    `weight` / `bias` is visible in the same error message.
     """
     handles = []
     for name, module in model.named_modules():
         if name == "":
             continue
 
-        def hook(mod, inputs, output, _name=name):
-            _check("output", _name, output)
+        def hook(mod, inputs, output, _name=name, _mod=module):
+            # Check inputs first — if they're already NaN, bug is upstream.
+            try:
+                _check("input", _name, inputs)
+            except _Tripped as e:
+                # Annotate with this module's param health for context.
+                param_stats = _param_summary(_mod)
+                raise _Tripped(f"{e}\n  (at module '{_name}'; params: {param_stats})")
+            # Input is clean — check output.
+            try:
+                _check("output", _name, output)
+            except _Tripped as e:
+                param_stats = _param_summary(_mod)
+                raise _Tripped(f"{e}\n  (producer '{_name}'; params: {param_stats})")
 
         handles.append(module.register_forward_hook(hook))
     return handles
+
+
+def _param_summary(module: nn.Module) -> str:
+    """Summarize immediate (non-recursive) parameters' finiteness + range."""
+    parts = []
+    for pname, p in module.named_parameters(recurse=False):
+        with torch.no_grad():
+            n_nan = torch.isnan(p).sum().item()
+            n_inf = torch.isinf(p).sum().item()
+            finite = p[torch.isfinite(p)]
+            if finite.numel() > 0:
+                absmax = finite.abs().max().item()
+            else:
+                absmax = float("nan")
+        parts.append(f"{pname} nan={n_nan} inf={n_inf} absmax={absmax:.3e}")
+    return "; ".join(parts) if parts else "no direct params"
 
 
 def enabled() -> bool:
