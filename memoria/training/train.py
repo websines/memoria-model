@@ -637,11 +637,7 @@ def train(
                     # is the one that needs to be added to
                     # _ddp_params_and_buffers_to_ignore.
                     _dbg_interval = max(1, tc.eval_interval // 5)
-                    if (
-                        os.environ.get("MEMORIA_DDP_DEBUG", "0") == "1"
-                        and step in (1, _dbg_interval + 1)
-                        and micro_step == 0
-                    ):
+                    if step in (1, _dbg_interval + 1) and micro_step == 0:
                         try:
                             from torch.distributed.utils import _get_unused_params
                             unused = _get_unused_params(model, loss)
