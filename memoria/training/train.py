@@ -259,7 +259,23 @@ def train(
     # find_unused_parameters=True is required: cognitive state is dynamic (beliefs
     # appear/disappear, goals come and go), so the set of parameters that contribute
     # to loss changes between steps. static_graph won't work either.
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    #
+    # broadcast_buffers=False is critical. DDP's default (True) calls
+    # _sync_buffers() inside _pre_forward() on every model(...) call, which
+    # fires a BROADCAST collective. Our training loop has rank-0-only
+    # forwards (belief_advantage eval at train.py:1051, eval_perplexity,
+    # checkpointing reads), which would trigger DDP's buffer-broadcast on
+    # rank 0 only while rank 1 is in a different collective
+    # (broadcast_state's all_reduce) — triggering "Detected mismatch
+    # between collectives on ranks" at the next step. We manage cognitive
+    # state buffers manually via broadcast_state() anyway, so DDP's
+    # automatic buffer sync is redundant *and* broken for this workload.
+    # Reference: torch/nn/parallel/distributed.py _sync_buffers();
+    # fix verified via PyTorch DDP init logs (broadcast_buffers: 0|1).
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=True,
+        broadcast_buffers=False,
+    )
 
     # NCCL collective timeout of 30 min. The default (10 min) is too aggressive
     # for this workload because:
