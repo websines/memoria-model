@@ -270,7 +270,14 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
         log_sigmoid = torch.nn.functional.logsigmoid(agreement * temperature)
         energy_per_factor = -weights * src_radii * tgt_radii * log_sigmoid
 
-        total_energy = energy_per_factor.sum()
+        # Mean-aggregate over factors (not sum) for the same reason as the
+        # entropy term below: each factor's magnitude can be O(weight × r²)
+        # ≈ 10-20 at saturating radii, and 1024 factors at smoke cap would
+        # give U ≈ 15k — still swamping the token loss at α=0.1. Mean gives
+        # per-factor average energy which is O(1-10). Qualitative Bethe
+        # semantics preserved: well-justified relations reduce F, broken
+        # ones increase it.
+        total_energy = energy_per_factor.mean()
     else:
         total_energy = torch.tensor(0.0, device=device)
 
@@ -287,30 +294,37 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
         telos_energy = torch.tensor(0.0, device=device)
 
     # --- Bethe free energy ---
-    # F_B = Σ_a U_a - Σ_i (d_i - 1) × H_i
+    # F_B = Σ_a U_a + Σ_i (d_i - 1) × H_i     (standard Bethe sign convention)
     #
-    # Sign convention: Power Spherical differential entropy is SIGNED —
-    # positive at the uniform limit (kappa → 0) and going to -∞ as kappa → ∞
-    # (see power_spherical_entropy docstring: "monotonically decreasing with
-    # kappa"). Standard-textbook Bethe uses H ≥ 0 as "uncertainty" with the
-    # + (d-1)H convention: the two sign conventions are equivalent.
+    # Critical: H must be dimension-normalized. Power Spherical differential
+    # entropy scales with D (for D=256, H≈-319 even at the uniform limit;
+    # grows more negative with κ). The raw Σ (d-1)·H then produces O(10^5)
+    # values — 256 beliefs × avg(d-1)≈6 × |H|≈500 ≈ 768k — which overwhelms
+    # the bounded energy term, makes α·fe explosive once α > 0, and causes
+    # the optimizer to wreck the transformer regardless of sign convention.
+    # Observed in smoke before this fix: fe=-601k with + convention (runaway
+    # down), fe=+263k with - convention (runaway up).
     #
-    # Using + (d-1)H with a signed, unbounded-below H (the previous code) is
-    # NOT equivalent: it creates a reward for driving H → -∞ (beliefs
-    # concentrating), which is what was observed in smoke — fe went to -601k
-    # at step 40, grads went to inf. Subtracting flips the incentive: a more
-    # concentrated belief (more negative H) now INCREASES F, which is the
-    # correct variational-inference direction (concentrated beliefs must be
-    # well-justified by the energy term, otherwise F grows).
-    #
-    # Isolated beliefs (d_i=0) get counting_correction = -1 → they still
-    # receive a small entropy credit under the subtraction convention, so
-    # exploration of unconnected beliefs is still encouraged (just bounded).
+    # Normalize per-dimension so |H_norm| ≈ O(1). Keeps Bethe semantics
+    # (concentrated well-connected beliefs → lower F, incentivizing the
+    # model to commit to beliefs that are justified by their relation
+    # context) but makes the signal dimensionally stable.
     counting_correction = degree - 1.0
-    total_entropy = (counting_correction * H_per_var).sum()
+    H_per_var_normalized = H_per_var / float(D)
+    # Mean-aggregate over active beliefs (not sum) to keep the entropy signal
+    # O(1) regardless of how many beliefs are active. Without this, a smoke
+    # run with 256 beliefs × avg(d-1)=6 × |H_norm|=2 ≈ 3000, which at α=0.1
+    # still dominates the token loss (≈5). Bethe semantics are preserved
+    # qualitatively: highly-connected uncertain beliefs still increase fe
+    # more than sparsely-connected ones, just in per-belief rather than
+    # total units. The energy term U is likewise averaged over factors
+    # (it's disagreement.mean() in compute_differentiable_free_energy and
+    # is summed here — but U_a is already bounded per factor, and the sum
+    # scales with n_edges ≤ max_edges, so it's practically bounded).
+    total_entropy = (counting_correction * H_per_var_normalized).mean()
 
     full_energy = total_energy + telos_energy
-    free_energy = full_energy - total_entropy  # F = E - (d-1)*H
+    free_energy = full_energy + total_entropy  # F = E + mean((d-1)·H_normalized)
 
     # β: exploration/exploitation balance
     H_raw = H_per_var.sum()
