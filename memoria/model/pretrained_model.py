@@ -395,16 +395,15 @@ class PretrainedMemoriaModel(nn.Module):
                         result['loss_surprise'] = result['loss_surprise'] + p.sum() * 0.0
 
             # DDP participation for conditionally-used state parameters —
-            # see memoria_model.py for full rationale. state.beliefs /
-            # edge_weights / edge_relations are only in the autograd graph
-            # when active beliefs/edges exist; without this zero-coefficient
-            # touch, DDP's reducer trips on undefined gradients around step
-            # ~100 when consolidation first mutates state.beliefs.data in-place.
-            _ddp_ground = (
-                self.state.beliefs.sum() * 0.0
-                + self.state.edge_weights.sum() * 0.0
-                + self.state.edge_relations.sum() * 0.0
-            )
+            # see memoria_model.py for full rationale. Grounds every trainable
+            # Parameter under state (beliefs, edges, goals, plus all cognition
+            # submodules) with a zero-coefficient touch so DDP's reducer never
+            # sees an undefined gradient when consolidation/autoresearch paths
+            # intermittently activate their modules.
+            _ddp_ground = torch.zeros((), device=idx.device)
+            for _p in self.state.parameters():
+                if _p.requires_grad:
+                    _ddp_ground = _ddp_ground + _p.sum() * 0.0
 
             result['loss'] = (
                 result['loss_token']

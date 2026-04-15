@@ -1323,29 +1323,27 @@ class MemoriaModel(nn.Module):
                 dsa_kl_w = tc.dsa_kl_weight if alpha == 0.0 else tc.dsa_kl_weight_after
 
             # ── DDP participation for conditionally-used state parameters ──
-            # state.beliefs / edge_weights / edge_relations are trainable Parameters
-            # but only enter the autograd graph when active beliefs/edges exist
-            # (see free_energy.py, message_passing.py, read_path.py — all gated on
-            # `active_mask.any()` or `edge_active.any()`). With DDP + find_unused
-            # _parameters=True, a Parameter that is "used" on some iterations and
-            # "unused" on others can trip the reducer with:
+            # Every trainable Parameter under CognitiveState — beliefs, edges,
+            # goal_embeddings, plus all submodule params (telos, sleep_gate,
+            # message_passing, hypothesis_gen, meta_params, running_stats) —
+            # only enters the autograd graph when its specific code path fires
+            # (active beliefs exist, active edges exist, consolidation runs,
+            # hypothesis generation runs, etc.). With DDP + find_unused_params,
+            # a Parameter that flips between "used" and "unused" across
+            # iterations trips the reducer with:
             #   "Encountered gradient which is undefined, but still allreduced"
-            # when the used/unused decision diverges between ranks or between the
-            # iteration DDP recorded buckets and the current backward. Observed
-            # consistently at step ~100–120 when hard consolidation first fires
-            # and mutates `state.beliefs.data` in-place (two_factor_sleep.py),
-            # invalidating DDP's cached bucket view.
+            # Observed consistently at step ~100–120 when hard consolidation
+            # first fires and activates modules that were dormant before.
             #
-            # Fix matches the existing pattern for goal_embeddings above: a
-            # zero-coefficient touch keeps each Parameter unconditionally in the
-            # autograd graph every step, so DDP always sees a defined gradient
-            # (zero is defined; None is not). Cost: three extra `.sum()` reductions
-            # over ~10M elements — negligible next to the transformer forward.
-            _ddp_ground = (
-                self.state.beliefs.sum() * 0.0
-                + self.state.edge_weights.sum() * 0.0
-                + self.state.edge_relations.sum() * 0.0
-            )
+            # Whitelisting is fragile (every new cognitive module needs adding
+            # here). Instead, ground every trainable state Parameter once via
+            # a generic zero-coefficient touch. Cost: one extra `.sum()` per
+            # param per step, summed into a single scalar — total ~tens of
+            # reductions, negligible vs the transformer forward.
+            _ddp_ground = torch.zeros((), device=idx.device)
+            for _p in self.state.parameters():
+                if _p.requires_grad:
+                    _ddp_ground = _ddp_ground + _p.sum() * 0.0
 
             # Alpha gating: phase 1 = token only, phase 2-3 = all terms.
             # Draft + DSA KL are NOT alpha-gated — they train from step 0.
