@@ -625,25 +625,39 @@ def train(
                 with sync_ctx, torch.autograd.graph.allow_mutation_on_saved_tensors():
                     result = model(input_ids, targets=labels, alpha=alpha)
                     loss = result['loss'] / grad_accum
-                    # On the step just before the recurring DDP crash (~step 100),
-                    # dump the set of parameters whose gradients DDP will mark as
-                    # undefined. Fires once per rank to avoid log flooding.
+                    # Dump the set of parameters whose gradients DDP will mark as
+                    # undefined, at two key points:
+                    #   - step 1: baseline. What's unused on a "healthy" step.
+                    #   - step belief_eval_interval + 1: first main backward AFTER
+                    #     the rank-0-only REINFORCE fires. This is where the
+                    #     "undefined gradient, still allreduced" crash reproduces
+                    #     (step 3 on smoke, step 101 on full).
+                    # Comparing the two lists on each rank — and across ranks —
+                    # tells us exactly which param's registration flips, which
+                    # is the one that needs to be added to
+                    # _ddp_params_and_buffers_to_ignore.
+                    _dbg_interval = max(1, tc.eval_interval // 5)
                     if (
                         os.environ.get("MEMORIA_DDP_DEBUG", "0") == "1"
-                        and step == 100
+                        and step in (1, _dbg_interval + 1)
                         and micro_step == 0
                     ):
                         try:
                             from torch.distributed.utils import _get_unused_params
                             unused = _get_unused_params(model, loss)
-                            print(
-                                f"\n[DDP debug] rank={rank} step={step}: "
-                                f"{len(unused)} unused params:"
+                            header = (
+                                f"\n[DDP debug] rank={rank} step={step} "
+                                f"(REINFORCE fires every {_dbg_interval} steps): "
+                                f"{len(unused)} unused params"
                             )
+                            print(header, flush=True)
                             for name, _ in unused:
-                                print(f"  - {name}")
+                                print(f"  - {name}", flush=True)
                         except Exception as _dbg_exc:
-                            print(f"[DDP debug] get_unused_params failed: {_dbg_exc}")
+                            print(
+                                f"[DDP debug] get_unused_params failed: {_dbg_exc}",
+                                flush=True,
+                            )
                     accelerator.backward(loss)
             except nan_debug.Tripped as e:
                 dump_path = Path(f"nan_repro_step{step}_rank{rank}.pt")
