@@ -567,3 +567,49 @@ def full_config() -> MemoriaConfig:
             cage_lambda_base=10.0,
         ),
     )
+
+
+def smoke_config() -> MemoriaConfig:
+    """50-step smoke test — exercise every feature before committing to a 20k run.
+
+    Derived from `full_config()` with two classes of modification:
+
+    1. Step-based schedules compressed 400× (target 20000 → 50 steps)
+       so phase1 → α-ramp → phase2 → autoresearch all fire inside the window.
+       Ratio-based schedules (warmup_ratio, skyladder_ratio) are unit-less and
+       need no scaling, but skyladder itself targets 131K ctx — meaningless at
+       50 steps — so we disable it and fix sequence_len=2048.
+
+    2. Cognitive state capacity shrunk so fill_ratio saturates quickly.
+       max_beliefs 8192 → 256 (~32×) means pass2.py:185's fill_ratio > 0.9
+       branch, periodic_hard_cleanup, conflict-scan-under-pressure, and
+       homeostatic erosion all get exercised — otherwise a smoke run that
+       never touches capacity paths masks real bugs that only surface at
+       step 2500 in the real run.
+
+    If this 50-step run finishes cleanly with non-trivial autoresearch
+    activity, belief merges, and at least one hard_cleanup, `full` is safe
+    to commit to 20k.
+
+    Step-budget math (20000 / 400 = 50):
+      phase1_steps   2000 → 5
+      phase2_steps   3000 → 8
+      α_warmup       1000 → 3   (so α reaches max by step 8)
+      eval_interval   500 → 10  (belief_eval/REINFORCE at step % 2)
+      checkpoint     1000 → 25
+      log_interval     10 → 2
+    """
+    cfg = full_config()
+    cfg.transformer.sequence_len = 2048  # skyladder's 131K endpoint is meaningless at 50 steps
+    cfg.state.max_beliefs = 256          # 32× shrink → fill saturates → capacity branches fire
+    cfg.state.max_edges = 1024           # 32× shrink in lockstep with beliefs
+    cfg.state.max_goals = 32             # keeps goal-pressure tests active
+    cfg.training.total_batch_size = 2**13  # 8K bytes/step — fits easily, step time stays fast
+    cfg.training.phase1_steps = 5
+    cfg.training.phase2_steps = 8
+    cfg.training.alpha_warmup_steps = 3
+    cfg.training.skyladder_ratio = 0.0   # disabled — see docstring
+    cfg.training.eval_interval = 10
+    cfg.training.checkpoint_interval = 25
+    cfg.training.log_interval = 2
+    return cfg
