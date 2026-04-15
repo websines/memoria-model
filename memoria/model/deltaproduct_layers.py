@@ -349,8 +349,24 @@ class LogLinearDeltaProductBlock(nn.Module):
         o_gate = o_gate.view(B, T, H * V)
 
         # ── Level scales (Log-Linear) ──
+        # The raw softplus here is unbounded on top. Fenwick update() stores
+        # chunk_state verbatim and query() returns Σ_l weight[l] * state[l]
+        # over up to MAX_NUM_LEVELS active levels. Any per-chunk amplification
+        # > 1 compounds geometrically across chunks — with ~2048 chunks per
+        # 131k-byte sequence, even 1.007× per chunk overflows bf16 within one
+        # forward pass (observed: |state| = 8.6e36 at step 19).
+        #
+        # Bound: require Σ_l weight[l] ≤ 1 so query() is a contraction on
+        # state magnitude. Conservative per-level cap:
+        #     per_level_cap = 1 / MAX_NUM_LEVELS
+        # even if every level is simultaneously active the weighted sum stays
+        # ≤ 1. Preserves the data-dependent *shape* of softplus while
+        # suppressing runaway magnitude.
         dl = _lin(self.l_proj, xb).view(B, T, H, MAX_NUM_LEVELS)
-        level_weights = nn.functional.softplus(self.L.to(_bf).unsqueeze(0).unsqueeze(0) * dl)
+        per_level_cap = 1.0 / MAX_NUM_LEVELS
+        level_weights = nn.functional.softplus(
+            self.L.to(_bf).unsqueeze(0).unsqueeze(0) * dl
+        ).clamp(max=per_level_cap)
 
         # ── Pad sequence to multiple of chunk_size ──
         pad_len = (C - T % C) % C
