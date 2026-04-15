@@ -205,20 +205,48 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
 
     active_indices = active.nonzero(as_tuple=False).squeeze(-1)
     active_radii = radii[active_indices]
-    # Clamp kappa for numerical stability (digamma lower bound) AND for bounded
-    # entropy upper bound. power_spherical_entropy(kappa, D) → -∞ as kappa → ∞.
-    # Without a ceiling, the Bethe (d-1)·H sum (see line ~287) becomes an
-    # unbounded reward for concentrating beliefs further, creating a runaway
-    # feedback where the optimizer drives radii → ∞ and fe → -∞ (observed in
-    # smoke: fe=-601k at step 40, grads=inf). Ceiling = per-belief share of the
-    # learned homeostatic total-precision budget: each belief gets at most its
-    # fair share before homeostatic_scaling would pull it back anyway.
+    # Clamp kappa on both sides, both derivations:
+    # - Lower bound 1e-4: floating-point floor for digamma (digamma(x) → -∞
+    #   as x → 0⁺). Numerical epsilon, not a design parameter.
+    # - Upper bound = homeostatic_target / n_active: each belief's fair
+    #   share of the learned total precision budget that two_factor_sleep's
+    #   homeostatic_scaling targets. Using this ceiling makes the FE
+    #   entropy term consistent with the consolidation cycle that enforces
+    #   the budget — beliefs can't contribute entropy from κ regions that
+    #   the sleep gate would pull them back out of anyway.
     n_active_for_ceiling = max(int(active.sum().item()), 1)
-    kappa_ceiling = (
-        state.meta_params.homeostatic_target / n_active_for_ceiling
-    ).clamp(min=1.0)
+    kappa_ceiling = state.meta_params.homeostatic_target / n_active_for_ceiling
     kappa = active_radii.clamp(min=1e-4).clamp(max=kappa_ceiling)
-    H_per_var = power_spherical_entropy(kappa, D)  # [N_active]
+
+    # Per-variable entropy as KL-divergence-to-uniform.
+    #
+    # Bethe free energy F = Σ_a U_a + Σ_i (d_i-1) H_i requires H to be a
+    # non-negative "uncertainty" in the variational-inference sense (amount
+    # by which the current belief differs from maximum entropy). Power
+    # Spherical differential entropy H_PS(κ, D) is SIGNED (its docstring
+    # says so: "monotonically decreasing with kappa") and unbounded below,
+    # so plugging it directly into Bethe is a category error — the formula
+    # rewards concentration without bound.
+    #
+    # The correct transformation is KL(PS(κ) || Uniform_on_sphere), which
+    # for any exponential family on a common support equals H(reference) -
+    # H(current). For the Power Spherical family the uniform distribution
+    # on the unit sphere is the κ=0 limit, so:
+    #
+    #   H_proper(κ, D) = H_PS(0, D) - H_PS(κ, D)      ≥ 0
+    #
+    # This is the KL divergence of the concentrated distribution from the
+    # uniform reference. It is:
+    #   - zero at κ=0 (uniform → no information),
+    #   - monotonically increasing with κ (more confident → more departure
+    #     from uniform → higher uncertainty-about-null-hypothesis),
+    #   - bounded above by H_PS(0, D) - H_PS(κ_ceiling, D) via the clamp.
+    # No hacks, no dimension divisions, no magic constants — pure
+    # distributional geometry. The sign and magnitude issues that plagued
+    # the earlier raw-H_PS implementation disappear.
+    kappa_zero = torch.zeros((), device=device, dtype=active_radii.dtype)
+    H_uniform = power_spherical_entropy(kappa_zero, D)   # scalar, reference
+    H_per_var = H_uniform - power_spherical_entropy(kappa, D)   # [N_active], ≥ 0
 
     # --- Compute degree d_i for each active belief ---
     src_idx, tgt_idx, relations, weights = state.get_active_edges()
@@ -270,14 +298,7 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
         log_sigmoid = torch.nn.functional.logsigmoid(agreement * temperature)
         energy_per_factor = -weights * src_radii * tgt_radii * log_sigmoid
 
-        # Mean-aggregate over factors (not sum) for the same reason as the
-        # entropy term below: each factor's magnitude can be O(weight × r²)
-        # ≈ 10-20 at saturating radii, and 1024 factors at smoke cap would
-        # give U ≈ 15k — still swamping the token loss at α=0.1. Mean gives
-        # per-factor average energy which is O(1-10). Qualitative Bethe
-        # semantics preserved: well-justified relations reduce F, broken
-        # ones increase it.
-        total_energy = energy_per_factor.mean()
+        total_energy = energy_per_factor.sum()   # Σ_a U_a  (standard Bethe)
     else:
         total_energy = torch.tensor(0.0, device=device)
 
@@ -294,37 +315,26 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
         telos_energy = torch.tensor(0.0, device=device)
 
     # --- Bethe free energy ---
-    # F_B = Σ_a U_a + Σ_i (d_i - 1) × H_i     (standard Bethe sign convention)
+    # F_B = Σ_a U_a + Σ_i (d_i − 1) · H_i     (Yedidia, Freeman, Weiss 2005)
     #
-    # Critical: H must be dimension-normalized. Power Spherical differential
-    # entropy scales with D (for D=256, H≈-319 even at the uniform limit;
-    # grows more negative with κ). The raw Σ (d-1)·H then produces O(10^5)
-    # values — 256 beliefs × avg(d-1)≈6 × |H|≈500 ≈ 768k — which overwhelms
-    # the bounded energy term, makes α·fe explosive once α > 0, and causes
-    # the optimizer to wreck the transformer regardless of sign convention.
-    # Observed in smoke before this fix: fe=-601k with + convention (runaway
-    # down), fe=+263k with - convention (runaway up).
+    # Standard form, standard summation. H_i here is the non-negative KL-to-
+    # uniform transformation computed above — that's what makes the formula
+    # both mathematically correct and numerically finite. No per-dimension
+    # normalization, no mean-in-place-of-sum: both were symptom-management
+    # for the wrong entropy measure, not the actual fix.
     #
-    # Normalize per-dimension so |H_norm| ≈ O(1). Keeps Bethe semantics
-    # (concentrated well-connected beliefs → lower F, incentivizing the
-    # model to commit to beliefs that are justified by their relation
-    # context) but makes the signal dimensionally stable.
+    # Magnitude bound (for sanity, not enforced): F is bounded above by
+    #   (Σ_a U_a bound) + max(d_i−1) · Σ_i H_PS(0, D) − H_PS(κ_ceil, D)
+    # which is finite because every factor is bounded (radii ≤ κ_ceil,
+    # log_sigmoid ∈ [log 0.5, 0]) and every H_i is bounded by the κ-ceiling.
+    # It still grows with state size, and that's correct — Bethe free energy
+    # of a larger factor graph naturally has larger magnitude. The α
+    # schedule is the right place to manage relative scale vs. L_token.
     counting_correction = degree - 1.0
-    H_per_var_normalized = H_per_var / float(D)
-    # Mean-aggregate over active beliefs (not sum) to keep the entropy signal
-    # O(1) regardless of how many beliefs are active. Without this, a smoke
-    # run with 256 beliefs × avg(d-1)=6 × |H_norm|=2 ≈ 3000, which at α=0.1
-    # still dominates the token loss (≈5). Bethe semantics are preserved
-    # qualitatively: highly-connected uncertain beliefs still increase fe
-    # more than sparsely-connected ones, just in per-belief rather than
-    # total units. The energy term U is likewise averaged over factors
-    # (it's disagreement.mean() in compute_differentiable_free_energy and
-    # is summed here — but U_a is already bounded per factor, and the sum
-    # scales with n_edges ≤ max_edges, so it's practically bounded).
-    total_entropy = (counting_correction * H_per_var_normalized).mean()
+    total_entropy = (counting_correction * H_per_var).sum()
 
     full_energy = total_energy + telos_energy
-    free_energy = full_energy + total_entropy  # F = E + mean((d-1)·H_normalized)
+    free_energy = full_energy + total_entropy  # F = E + (d−1)·H
 
     # β: exploration/exploitation balance
     H_raw = H_per_var.sum()
