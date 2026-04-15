@@ -336,10 +336,17 @@ class LogLinearDeltaProductBlock(nn.Module):
             v = _conv_bf16(self.v_conv, v)
 
         # Activations and reshape (FLA interleaving convention)
-        # q: [B, T, H, K] — normal
-        q = q.view(B, T, H, K)
+        # q: [B, T, H, K] — silu + L2-normalize for delta-rule stability.
+        # Without normalization the kernel's `v - S·k` subtraction produces
+        # 1/0 when |k| grows: observed as 2 inf values + 18430 NaN in output
+        # with otherwise healthy inputs in [-0.08, 0.15]. L2-normalizing both
+        # q and k on the head dim bounds inner products to [-1, 1] so the
+        # delta rule stays well-conditioned.
+        q = nn.functional.silu(q).view(B, T, H, K)
+        q = nn.functional.normalize(q, dim=-1, eps=1e-6)
         # k: interleave n_h into time dim → [B, T*n_h, H, K]
         k = nn.functional.silu(k).view(B, T, H, K, n_h).permute(0, 1, 4, 2, 3).reshape(B, T * n_h, H, K)
+        k = nn.functional.normalize(k, dim=-1, eps=1e-6)
         # v: interleave n_h into time dim → [B, T*n_h, H, V]
         v = nn.functional.silu(v).view(B, T, H, V, n_h).permute(0, 1, 4, 2, 3).reshape(B, T * n_h, H, V)
         # beta: interleave n_h into time dim → [B, T*n_h, H]
