@@ -639,19 +639,45 @@ def train(
                     _dbg_interval = max(1, tc.eval_interval // 5)
                     if step in (1, _dbg_interval + 1) and micro_step == 0:
                         try:
-                            from torch.distributed.utils import _get_unused_params
-                            unused = _get_unused_params(model, loss)
-                            header = (
+                            # Walk the autograd graph from loss.grad_fn to find
+                            # which params are reachable (will get a grad in
+                            # this backward). Everything else is "unused" from
+                            # DDP's perspective. This replaces the removed
+                            # torch.distributed.utils._get_unused_params helper
+                            # and works across torch versions.
+                            reachable_ids = set()
+                            visited = set()
+                            stack = [loss.grad_fn]
+                            while stack:
+                                fn = stack.pop()
+                                if fn is None or id(fn) in visited:
+                                    continue
+                                visited.add(id(fn))
+                                if hasattr(fn, 'variable'):
+                                    reachable_ids.add(id(fn.variable))
+                                for nxt, _ in fn.next_functions:
+                                    stack.append(nxt)
+                            unused_names = []
+                            reachable_names = []
+                            for _name, _p in model.named_parameters():
+                                if not _p.requires_grad:
+                                    continue
+                                if id(_p) in reachable_ids:
+                                    reachable_names.append(_name)
+                                else:
+                                    unused_names.append(_name)
+                            print(
                                 f"\n[DDP debug] rank={rank} step={step} "
-                                f"(REINFORCE fires every {_dbg_interval} steps): "
-                                f"{len(unused)} unused params"
+                                f"(REINFORCE interval={_dbg_interval}): "
+                                f"{len(reachable_names)} reachable, "
+                                f"{len(unused_names)} unused",
+                                flush=True,
                             )
-                            print(header, flush=True)
-                            for name, _ in unused:
-                                print(f"  - {name}", flush=True)
+                            for _n in unused_names:
+                                print(f"  UNUSED  {_n}", flush=True)
                         except Exception as _dbg_exc:
                             print(
-                                f"[DDP debug] get_unused_params failed: {_dbg_exc}",
+                                f"[DDP debug] graph walk failed: {_dbg_exc}",
                                 flush=True,
                             )
                     accelerator.backward(loss)
