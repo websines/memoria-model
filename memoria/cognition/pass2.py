@@ -29,7 +29,12 @@ from ..core.message_passing import FactorGraphMessagePassing, apply_belief_shift
 from ..interface.write_path import WriteCandidate
 from .surprise import compute_surprise_batch
 from .belief_update import allocate_new_beliefs
-from .hebbian import extract_co_activations
+from .hebbian import (
+    extract_co_activations,
+    decay_edge_weights,
+    hebbian_update,
+    reinforce_existing_edges,
+)
 from .consolidation import soft_consolidation, periodic_hard_cleanup
 from .meta_learning import compute_beta
 from .sleep import SleepGate, run_sleep_cycle, run_dream_phase
@@ -195,6 +200,17 @@ def run_pass2(
     }
 
     # ── 1. Structural cleanup: zero-norm beliefs and edges (always runs) ──
+    # Edge lifecycle (Ba-Hinton Fast Weights, NeurIPS 2016):
+    #   decay → reinforce (in section 3 below) → zero-weight sweep
+    # Multiplicative decay is applied FIRST so the subsequent sweep
+    # catches edges that just crossed EPSILON on this step. Without
+    # this, edges accumulated via co-activation are never removed,
+    # the 0.9 fill gate in need_edges permanently freezes graph
+    # plasticity (observed in smoke: edges stuck at 972/1024).
+    decay_stats = decay_edge_weights(state)
+    stats['edges_decayed'] = decay_stats['n_decayed']
+    stats['edge_weight_mean'] = decay_stats['mean_weight_after']
+
     with torch.no_grad():
         radii = state.beliefs.data.norm(dim=-1)
         dead_beliefs = (radii > 0) & (radii < EPSILON) & ~state.immutable_beliefs
@@ -305,9 +321,24 @@ def run_pass2(
             state.propagate_confidence(idx_t, old_radii)
         stats['confidence_propagated'] = len(updated_indices)
 
-    # ── 3. Learned edge proposal ──
+    # ── 3. Learned edge proposal + Hebbian reinforcement ──
+    # Extract co-activations ONCE — needed both for reinforcement
+    # (always runs) and for creation (gated on edge_fill < 0.9).
+    co_activations = extract_co_activations(state, read_belief_indices)
+
+    # Ba-Hinton reinforcement: η·h·hᵀ for existing edges. Runs
+    # unconditionally — most critical when edge_fill ≥ 0.9 (creation
+    # gate off), because reinforcement is what separates useful edges
+    # (weight grows) from dormant ones (weight decays to zero via the
+    # decay_edge_weights call in section 1). Without this, all active
+    # edges decay at the same rate and the graph homogenizes.
+    if co_activations:
+        n_reinforced = reinforce_existing_edges(state, co_activations)
+        stats['edges_reinforced'] = n_reinforced
+    else:
+        stats['edges_reinforced'] = 0
+
     if need_edges:
-        co_activations = extract_co_activations(state, read_belief_indices)
         causal_pairs = _extract_causal_candidates(state, updated_indices, surprise_values)
         all_candidate_pairs = co_activations + causal_pairs
 
@@ -335,7 +366,9 @@ def run_pass2(
     else:
         stats['edges_proposed'] = 0
         stats['edges_created'] = 0
-        stats['co_activation_pairs'] = 0
+        # co_activations was extracted above even when creation is gated —
+        # report the actual pair count so monitoring reflects graph activity.
+        stats['co_activation_pairs'] = len(co_activations)
 
     # Store surprise for next-step causal detection (always runs — cheap)
     with torch.no_grad():

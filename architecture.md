@@ -884,6 +884,21 @@ Prevents orphaned high-precision children of corrected parents. Only causally-ob
 
 Learned `EdgeProposer` evaluates candidate pairs from co-activation (Hebbian) + causal observation counts. Creates edges with learned weights and CoED direction angles. Runs when edge_fill < 90%.
 
+#### Edge Lifecycle: Ba-Hinton Fast Weights
+
+Edges have a full create → reinforce → decay → prune lifecycle, implementing Ba, Hinton, Mnih, Leibo, Ionescu (NeurIPS 2016) "Using Fast Weights to Attend to the Recent Past" on the belief factor graph:
+
+`edge_weight_t = (1 − hebbian_decay) · edge_weight_{t-1} + hebbian_lr · 1[co-activated]`
+
+Four mechanisms, all driven by learned MetaParams (`hebbian_decay`, `hebbian_lr`, `initial_edge_weight`) — no constants:
+
+1. **Create** — `hebbian.py:_create_edge`, called by `EdgeProposer` when `edge_fill < 90%`. New edges start at `initial_edge_weight`.
+2. **Reinforce** — `hebbian.py:reinforce_existing_edges`, called unconditionally from `pass2.py` section 3 on every step where beliefs co-activate. `edge_weight[eidx] += hebbian_lr` for the matched edge. Runs even when the creation gate is closed — this is what separates used from dormant edges once the graph saturates.
+3. **Decay** — `hebbian.py:decay_edge_weights`, called unconditionally at the top of pass2 section 1 (before the zero-weight sweep). `edge_weight *= (1 − hebbian_decay)` for all active edges. Unused edges geometrically approach zero.
+4. **Prune** — the existing zero-weight sweep at `pass2.py:207`: `edge_active & (edge_weights.abs() < EPSILON)` → `deallocate_edge`. No separate pruning logic needed; decay → sweep closes the loop.
+
+Steady-state: for an edge co-activated with probability `p` per step, `w* = p · hebbian_lr / hebbian_decay`. At default inits (`hebbian_lr ≈ 0.05`, `hebbian_decay ≈ 0.01`), a constantly-firing edge plateaus near `w ≈ 5`, a rarely-firing edge (`p=0.1`) at `w ≈ 0.5`, and a dormant edge halves every ~70 steps until sweep. The 0.9 fill gate on creation combined with this decay mechanism maintains graph plasticity across arbitrarily long training runs: without decay, the graph freezes at 90% fill permanently (observed in smoke before this fix: edges stuck at 972/1024 across all phase-2+ steps).
+
 ## Refinement Loops (Latent Chain-of-Thought)
 
 Unlike text-based CoT, refinement loops reason in latent space:
@@ -1633,7 +1648,7 @@ memoria/cognition/
   surprise.py        — Prediction error × precision, MESU-modulated Kalman gain
   belief_update.py   — Slot allocation, eviction
   consolidation.py   — Soft merge (cosine > threshold), hard cleanup, L0→L1 promotion
-  hebbian.py         — Co-activation extraction for edge candidates
+  hebbian.py         — Co-activation extraction, Ba-Hinton edge decay + reinforcement (create/reinforce/decay/prune lifecycle)
   meta_learning.py   — Beta computation, running statistics
   telos_module.py    — TelosModule: RND surprise, goal generation, status transitions
   sleep.py           — SleepGate (learned strengthen/maintain/forget) + NeuroDream (offline BP)
