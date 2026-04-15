@@ -318,6 +318,30 @@ class CognitiveController(nn.Module):
                 dim=0,
             )
 
+        # Decouple the GRU's saved-for-backward tensors from the ring-buffer
+        # storage. Without this, the non-wrap path above aliases
+        # `self.history_actions[:n_valid]` (a view via AsStridedBackward) as
+        # the GRU input. cuDNN's GRU backward saves the input for grad_weight
+        # computation — that save references the underlying buffer storage,
+        # not a snapshot. Every subsequent `_commit_history_entry` does an
+        # in-place `history_actions[slot] = ...` that bumps the buffer's
+        # version counter. When `controller_loss.backward()` runs ~100 steps
+        # later (outside `allow_mutation_on_saved_tensors`, which only
+        # protects the in-loop backward), PyTorch sees version N+100 where
+        # it expected version N and raises:
+        #   "variables needed for gradient computation modified by inplace
+        #    operation: [torch.cuda.FloatTensor [64, 1]], version 103 vs 102"
+        # where [64, 1] is the GRU's hidden-state workspace (hidden=64).
+        # Cloning here gives the GRU independent storage — buffer mutations
+        # can no longer reach the saved-for-backward tensor.
+        #
+        # Detach is also explicit: buffers are non-trainable data, we do not
+        # want any accidental autograd path from the GRU input back to a
+        # buffer. history_proj/history_gru remain trainable via their own
+        # weights, which are Parameters of this module.
+        actions = actions.detach().clone()
+        outcomes = outcomes.detach().clone()
+
         # [1, T, NUM_ACTIONS + OUTCOME_DIM]
         seq = torch.cat([actions, outcomes], dim=-1).unsqueeze(0).to(device)
         _, h_n = self.history_gru(seq)
