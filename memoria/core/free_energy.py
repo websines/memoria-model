@@ -205,8 +205,19 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
 
     active_indices = active.nonzero(as_tuple=False).squeeze(-1)
     active_radii = radii[active_indices]
-    # Clamp kappa > 0 for numerical stability in digamma
-    kappa = active_radii.clamp(min=1e-4)
+    # Clamp kappa for numerical stability (digamma lower bound) AND for bounded
+    # entropy upper bound. power_spherical_entropy(kappa, D) → -∞ as kappa → ∞.
+    # Without a ceiling, the Bethe (d-1)·H sum (see line ~287) becomes an
+    # unbounded reward for concentrating beliefs further, creating a runaway
+    # feedback where the optimizer drives radii → ∞ and fe → -∞ (observed in
+    # smoke: fe=-601k at step 40, grads=inf). Ceiling = per-belief share of the
+    # learned homeostatic total-precision budget: each belief gets at most its
+    # fair share before homeostatic_scaling would pull it back anyway.
+    n_active_for_ceiling = max(int(active.sum().item()), 1)
+    kappa_ceiling = (
+        state.meta_params.homeostatic_target / n_active_for_ceiling
+    ).clamp(min=1.0)
+    kappa = active_radii.clamp(min=1e-4).clamp(max=kappa_ceiling)
     H_per_var = power_spherical_entropy(kappa, D)  # [N_active]
 
     # --- Compute degree d_i for each active belief ---
@@ -276,15 +287,30 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
         telos_energy = torch.tensor(0.0, device=device)
 
     # --- Bethe free energy ---
-    # F_B = Σ_a U_a + Σ_i (d_i - 1) × H_i
-    # Note: (d_i - 1) can be negative for isolated beliefs (d_i=0 → weight=-1),
-    # which means isolated beliefs' entropy is SUBTRACTED (they increase uncertainty,
-    # reducing free energy — encouraging exploration of unconnected beliefs).
+    # F_B = Σ_a U_a - Σ_i (d_i - 1) × H_i
+    #
+    # Sign convention: Power Spherical differential entropy is SIGNED —
+    # positive at the uniform limit (kappa → 0) and going to -∞ as kappa → ∞
+    # (see power_spherical_entropy docstring: "monotonically decreasing with
+    # kappa"). Standard-textbook Bethe uses H ≥ 0 as "uncertainty" with the
+    # + (d-1)H convention: the two sign conventions are equivalent.
+    #
+    # Using + (d-1)H with a signed, unbounded-below H (the previous code) is
+    # NOT equivalent: it creates a reward for driving H → -∞ (beliefs
+    # concentrating), which is what was observed in smoke — fe went to -601k
+    # at step 40, grads went to inf. Subtracting flips the incentive: a more
+    # concentrated belief (more negative H) now INCREASES F, which is the
+    # correct variational-inference direction (concentrated beliefs must be
+    # well-justified by the energy term, otherwise F grows).
+    #
+    # Isolated beliefs (d_i=0) get counting_correction = -1 → they still
+    # receive a small entropy credit under the subtraction convention, so
+    # exploration of unconnected beliefs is still encouraged (just bounded).
     counting_correction = degree - 1.0
     total_entropy = (counting_correction * H_per_var).sum()
 
     full_energy = total_energy + telos_energy
-    free_energy = full_energy + total_entropy  # F = E + (d-1)*H (sign convention)
+    free_energy = full_energy - total_entropy  # F = E - (d-1)*H
 
     # β: exploration/exploitation balance
     H_raw = H_per_var.sum()
