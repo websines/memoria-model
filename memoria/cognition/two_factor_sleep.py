@@ -40,7 +40,12 @@ def homeostatic_scaling(
     Returns:
         dict with {actual_total, target_total, scale_applied}
     """
-    stats = {'actual_total': 0.0, 'target_total': target.item(), 'scale_applied': 1.0}
+    stats = {
+        'actual_total': 0.0,
+        'target_total': target.item(),
+        'scale_applied': 1.0,
+        'beliefs_eroded': 0,
+    }
 
     active_mask = state.get_active_mask()
     if not active_mask.any():
@@ -66,13 +71,28 @@ def homeostatic_scaling(
     scale = scale.clamp(min=0.5, max=2.0)
     stats['scale_applied'] = scale.item()
 
-    # Apply scaling to all active, non-immutable beliefs
+    # Apply scaling to all active, non-immutable beliefs.
+    # Track beliefs that were active before scaling but fall below EPSILON
+    # after — these disappear from num_active_beliefs() silently without any
+    # explicit deallocation counter. Surfacing this as `beliefs_eroded` closes
+    # the audit gap where active_beliefs drifts down (2721→2584 observed) while
+    # pass2/beliefs_cleaned stays at 0.
+    scale_val = scale.item()
+    eroded = 0
     with torch.no_grad():
-        for idx_t in active_idx:
+        for local_i, idx_t in enumerate(active_idx):
             idx = idx_t.item()
-            if not state.immutable_beliefs[idx]:
-                state.beliefs.data[idx] *= scale
+            if state.immutable_beliefs[idx]:
+                continue
+            pre_radius = radii[local_i].item()
+            state.beliefs.data[idx] *= scale
+            post_radius = pre_radius * scale_val
+            # EPSILON is state.py's active-threshold (1e-10). Crossing it means
+            # the belief drops out of num_active_beliefs() on the next query.
+            if pre_radius >= EPSILON and post_radius < EPSILON:
+                eroded += 1
 
+    stats['beliefs_eroded'] = eroded
     return stats
 
 

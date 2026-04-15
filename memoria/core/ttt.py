@@ -110,42 +110,80 @@ class InPlaceTTT(nn.Module):
         # in-place ops (copy_/sub_/mul_/clamp_) bypass autograd's version
         # counter entirely, and DDP never syncs them (each rank adapts
         # independently — see architecture.md § Multi-GPU Training).
+        #
+        # Dtype is fixed at fp32 regardless of model mixed-precision. Reason:
+        # the Titans decay gate applies `mul_(alpha)` with alpha ≈ 0.6–0.9
+        # every ttt_step. In bf16 (≈3 decimal digits of precision, smallest
+        # normal ≈ 6e-5), values of magnitude ~1e-8 flush to exact 0.0 after
+        # ~10 decays. That silently kills TTT: delta becomes zero, forward
+        # `hidden + 0` is a no-op, and the rollback gate accepts zero updates
+        # because loss is unchanged. Fp32 storage preserves magnitude down to
+        # ~1e-38, so multiplicative decay no longer underflows. Autocast still
+        # downcasts to bf16 for the matmul in apply_delta, so compute cost is
+        # unchanged — this only affects storage precision.
         self.delta_A = nn.ParameterDict()
         self.delta_B = nn.ParameterDict()
         for layer_idx in ttt_layers:
             key = str(layer_idx)
             self.delta_A[key] = nn.Parameter(
-                torch.randn(hidden_dim, rank) * init_std, requires_grad=False,
+                (torch.randn(hidden_dim, rank) * init_std).to(torch.float32),
+                requires_grad=False,
             )
             self.delta_B[key] = nn.Parameter(
-                torch.randn(rank, hidden_dim) * init_std, requires_grad=False,
+                (torch.randn(rank, hidden_dim) * init_std).to(torch.float32),
+                requires_grad=False,
             )
 
         # ── Meta-learned initialization (TTT-E2E, arXiv:2512.23675) ──
-        # Instead of always cold-starting deltas at zero, learn an initialization
-        # point that is optimal as a warm start. These ARE trained by the main
-        # optimizer (requires_grad=True), unlike the deltas themselves.
+        # Instead of always cold-starting deltas at zero, use an initialization
+        # point that serves as a warm start for reset_deltas().
+        #
+        # requires_grad=False: every call site (reset_deltas, apply_decay,
+        # ttt_step) runs inside torch.no_grad(). These parameters never appear
+        # in an autograd-tracked forward, so they cannot receive gradients.
+        # Under DDP with find_unused_parameters=True they still crash with
+        # "undefined gradient, but still allreduced" when the reducer bucket
+        # layout treats them as used (happens non-deterministically around
+        # step ~100 when TTT paths activate). Marking them non-trainable
+        # matches the actual semantics and eliminates the DDP hazard.
+        # If meta-learning the init is desired later, the call sites must be
+        # moved out of no_grad and the forward must flow through these params.
         self.init_A = nn.ParameterDict()
         self.init_B = nn.ParameterDict()
         for layer_idx in ttt_layers:
             key = str(layer_idx)
-            self.init_A[key] = nn.Parameter(torch.randn(hidden_dim, rank) * init_std)
-            self.init_B[key] = nn.Parameter(torch.randn(rank, hidden_dim) * init_std)
+            self.init_A[key] = nn.Parameter(
+                (torch.randn(hidden_dim, rank) * init_std).to(torch.float32),
+                requires_grad=False,
+            )
+            self.init_B[key] = nn.Parameter(
+                (torch.randn(rank, hidden_dim) * init_std).to(torch.float32),
+                requires_grad=False,
+            )
 
-        # Learnable step-size per layer (trained during training, fixed at inference)
-        # Controls how much each layer adapts per chunk
+        # Per-layer step-size. See init_A/init_B comment: every call site reads
+        # log_step_size[key] via `.exp().item()` inside no_grad, so it's never
+        # in the autograd graph. requires_grad=False honests the reality.
         self.log_step_size = nn.ParameterDict()
         for layer_idx in ttt_layers:
             key = str(layer_idx)
             # Init: log(0.001) ≈ -6.9 → step_size ≈ 0.001
-            self.log_step_size[key] = nn.Parameter(torch.tensor(-6.9))
+            self.log_step_size[key] = nn.Parameter(
+                torch.tensor(-6.9), requires_grad=False,
+            )
 
         # ── Titans-style learned adaptive decay gate (arXiv:2501.00663) ──
         # Decides how much of the previous delta to retain each step.
-        # The decay gate is the single largest contributor to Titans performance.
         # sigmoid(2.0) ≈ 0.88 — default: mostly preserve deltas.
+        #
+        # requires_grad=False on weight+bias: decay_gate is only called from
+        # apply_decay(), which is wrapped in `with torch.no_grad():`. It can
+        # never receive gradients, and leaving requires_grad=True trips DDP's
+        # reducer (same failure mode as init_A/init_B above).
         self.decay_gate = nn.Linear(hidden_dim, 1)
         nn.init.constant_(self.decay_gate.bias, 2.0)
+        self.decay_gate.weight.requires_grad_(False)
+        self.decay_gate.bias.requires_grad_(False)
         self._last_decay_alpha: float = 1.0
 
         # ── Surprise tracking (Titans-inspired, arXiv:2501.00663) ──
