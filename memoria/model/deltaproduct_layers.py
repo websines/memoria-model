@@ -342,11 +342,13 @@ class LogLinearDeltaProductBlock(nn.Module):
         # with otherwise healthy inputs in [-0.08, 0.15]. L2-normalizing both
         # q and k on the head dim bounds inner products to [-1, 1] so the
         # delta rule stays well-conditioned.
+        # F.normalize promotes bf16→fp32 internally; the FLA kernel asserts bf16
+        # so we cast back explicitly after normalizing.
         q = nn.functional.silu(q).view(B, T, H, K)
-        q = nn.functional.normalize(q, dim=-1, eps=1e-6)
+        q = nn.functional.normalize(q, dim=-1, eps=1e-6).to(_bf)
         # k: interleave n_h into time dim → [B, T*n_h, H, K]
         k = nn.functional.silu(k).view(B, T, H, K, n_h).permute(0, 1, 4, 2, 3).reshape(B, T * n_h, H, K)
-        k = nn.functional.normalize(k, dim=-1, eps=1e-6)
+        k = nn.functional.normalize(k, dim=-1, eps=1e-6).to(_bf)
         # v: interleave n_h into time dim → [B, T*n_h, H, V]
         v = nn.functional.silu(v).view(B, T, H, V, n_h).permute(0, 1, 4, 2, 3).reshape(B, T * n_h, H, V)
         # beta: interleave n_h into time dim → [B, T*n_h, H]
