@@ -350,6 +350,35 @@ def train(
     # Optimizer is NOT prepared: in scratch mode it's a _CombinedOptimizer (not an
     # Optimizer subclass), and bf16 mode doesn't need GradScaler wrapping.
     # Optimizer param refs remain valid because DDP reuses the same underlying params.
+    #
+    # DDP opt-out list: pass cognitive params that train rank-0-only or that
+    # conditionally enter the forward graph to PyTorch DDP's official ignore
+    # mechanism (_ddp_params_and_buffers_to_ignore). Source: torch/nn/parallel/
+    # distributed.py:2326 `_set_params_and_buffers_to_ignore_for_model`, the
+    # documented workaround for rank-asymmetric training (used by TRL, Megatron,
+    # OpenRLHF). Must be set BEFORE accelerator.prepare wraps in DDP.
+    #
+    # Why: the whole `state.controller` trains on rank 0 only (trajectories are
+    # collected under is_main gates in pass2). Every cognitive submodule in
+    # `state` (telos, sleep_gate, hypothesis_gen, ...) is either rank-0-only or
+    # conditionally used. Letting DDP manage them triggers "undefined gradient
+    # still allreduced" whenever the forward-graph topology differs across
+    # iterations or ranks. Putting them on the ignore list is the clean fix
+    # that supersedes the no_sync wrapper + _ddp_ground zero-coefficient
+    # touches piled on earlier.
+    from torch.nn.parallel import DistributedDataParallel as _DDP
+    _ignore_fqns = []
+    for _name, _ in model.named_parameters():
+        if _name.startswith("state."):
+            _ignore_fqns.append(_name)
+    for _name, _ in model.named_buffers():
+        if _name.startswith("state."):
+            _ignore_fqns.append(_name)
+    _DDP._set_params_and_buffers_to_ignore_for_model(model, _ignore_fqns)
+    if is_main:
+        print(f"  DDP opt-out: {len(_ignore_fqns)} cognitive params/buffers "
+              f"ignored (rank-local training)")
+
     model = accelerator.prepare(model)
     base_model = accelerator.unwrap_model(model)
 
@@ -1044,35 +1073,14 @@ def train(
                 print(f"\n  [belief advantage] step {step}: {belief_advantage:.4f} (ema: {belief_advantage_ema:.4f})")
 
         # Controller REINFORCE loss (train at same interval as belief advantage).
-        #
-        # CRITICAL: gate on rank 0 only (controller trajectories are only
-        # collected on rank 0; pass2 runs is_main-only at line 751), BUT the
-        # backward MUST run inside model.no_sync() because the controller is
-        # a submodule of the DDP-wrapped model. Without no_sync, rank 0's
-        # backward fires DDP allreduce hooks on controller params; rank 1
-        # never participates in that allreduce. The two ranks' reducer
-        # states desync, and the NEXT main backward (step N+1) crashes with
-        # "Encountered gradient which is undefined, but still allreduced by
-        # DDP reducer" — which is PyTorch's generic message for "one rank's
-        # reducer is out of sync with another's".
-        #
-        # Reproduced at step ~100 (first compute_loss fire at belief_eval_
-        # interval=100). no_sync() keeps the autograd backward local: hooks
-        # fire, controller params get grad populated, optimizer.step() on
-        # rank 0 updates them. Rank 1's controller params stay at their old
-        # values — that's intentional since the trajectory was collected
-        # only on rank 0. The divergence is bounded to controller params
-        # and is corrected periodically when the main optimizer syncs
-        # (which it won't for controller params since they're rank-0-only
-        # trained anyway; this is a per-rank local controller by design).
+        # Rank-0-only: trajectories are collected only on rank 0 (pass2 is
+        # is_main-gated). This no longer needs no_sync because controller params
+        # are in _ddp_params_and_buffers_to_ignore — DDP doesn't manage them at
+        # all, so a rank-0-only backward cannot desync the reducer.
         if is_main and step > 0 and step % belief_eval_interval == 0:
             controller_loss = base_model.state.controller.compute_loss()
             if controller_loss.item() > 0:
-                with model.no_sync() if has_no_sync else nullcontext():
-                    controller_loss.backward()
-                # Step immediately so REINFORCE grads don't bleed into next step's
-                # supervised loss. Only controller params have grads here (others are
-                # None after zero_grad above), so only controller params get updated.
+                controller_loss.backward()
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 

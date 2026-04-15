@@ -1322,49 +1322,17 @@ class MemoriaModel(nn.Module):
                 tc = self.config.training
                 dsa_kl_w = tc.dsa_kl_weight if alpha == 0.0 else tc.dsa_kl_weight_after
 
-            # ── DDP participation for conditionally-used state parameters ──
-            # Every trainable Parameter under CognitiveState only enters the
-            # autograd graph when its specific code path fires. With DDP +
-            # find_unused_params, intermittent usage trips the reducer at
-            # step ~100–120 (first hard consolidation). Fix: ground every
-            # trainable state Parameter with a zero-coefficient touch so DDP
-            # always sees a defined gradient.
-            #
-            # EXCEPTION: the cognitive controller's parameters are trained by
-            # their own dedicated REINFORCE backward (see train.py:995). They
-            # must NOT be grounded here because:
-            #   1. Grounding pulls them into the main loss graph, which gives
-            #      them zero-tensor gradients (not None) on main backward.
-            #   2. optimizer.step() then runs AdamW on those zero grads. AdamW
-            #      with weight_decay > 0 always does `p.data.mul_(1 - lr * wd)`
-            #      even with zero grad → the controller weights get mutated
-            #      every step via weight decay alone.
-            #   3. get_actions() saves forward graphs referencing those same
-            #      weights (specifically `value_head[2].weight.T`, a shape
-            #      [64, 1] view via AsStridedBackward0). 100 steps later when
-            #      controller_loss.backward() walks back through the saved
-            #      graphs, PyTorch finds version N+100 instead of N and
-            #      raises "variables needed for gradient computation modified
-            #      by inplace operation".
-            # The controller is correctly handled by find_unused_parameters
-            # (it's not used by the main loss, so DDP just skips it).
-            _ddp_ground = torch.zeros((), device=idx.device)
-            _controller_params = (
-                set(id(p) for p in self.state.controller.parameters())
-                if hasattr(self.state, 'controller') else set()
-            )
-            for _p in self.state.parameters():
-                if _p.requires_grad and id(_p) not in _controller_params:
-                    _ddp_ground = _ddp_ground + _p.sum() * 0.0
-
             # Alpha gating: phase 1 = token only, phase 2-3 = all terms.
             # Draft + DSA KL are NOT alpha-gated — they train from step 0.
             # Self-correction loss is NOT alpha-gated — it trains from step 0.
+            # Note: the _ddp_ground zero-coefficient touches that used to sit here
+            # are gone — all state params are now on _ddp_params_and_buffers_to_ignore
+            # (see train.py near accelerator.prepare), so DDP never expects a grad
+            # for them and doesn't need artificial grounding.
             result['loss'] = (L_token_w + alpha * L_fe_w + alpha * L_aux_w
                               + w_draft * loss_draft
                               + w_draft * loss_self_correct
-                              + dsa_kl_w * loss_dsa_kl
-                              + _ddp_ground)
+                              + dsa_kl_w * loss_dsa_kl)
 
             result['log_sigma_token'] = self.log_sigma['token'].item()
             result['log_sigma_fe'] = self.log_sigma['fe'].item()
