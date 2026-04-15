@@ -1323,26 +1323,38 @@ class MemoriaModel(nn.Module):
                 dsa_kl_w = tc.dsa_kl_weight if alpha == 0.0 else tc.dsa_kl_weight_after
 
             # ── DDP participation for conditionally-used state parameters ──
-            # Every trainable Parameter under CognitiveState — beliefs, edges,
-            # goal_embeddings, plus all submodule params (telos, sleep_gate,
-            # message_passing, hypothesis_gen, meta_params, running_stats) —
-            # only enters the autograd graph when its specific code path fires
-            # (active beliefs exist, active edges exist, consolidation runs,
-            # hypothesis generation runs, etc.). With DDP + find_unused_params,
-            # a Parameter that flips between "used" and "unused" across
-            # iterations trips the reducer with:
-            #   "Encountered gradient which is undefined, but still allreduced"
-            # Observed consistently at step ~100–120 when hard consolidation
-            # first fires and activates modules that were dormant before.
+            # Every trainable Parameter under CognitiveState only enters the
+            # autograd graph when its specific code path fires. With DDP +
+            # find_unused_params, intermittent usage trips the reducer at
+            # step ~100–120 (first hard consolidation). Fix: ground every
+            # trainable state Parameter with a zero-coefficient touch so DDP
+            # always sees a defined gradient.
             #
-            # Whitelisting is fragile (every new cognitive module needs adding
-            # here). Instead, ground every trainable state Parameter once via
-            # a generic zero-coefficient touch. Cost: one extra `.sum()` per
-            # param per step, summed into a single scalar — total ~tens of
-            # reductions, negligible vs the transformer forward.
+            # EXCEPTION: the cognitive controller's parameters are trained by
+            # their own dedicated REINFORCE backward (see train.py:995). They
+            # must NOT be grounded here because:
+            #   1. Grounding pulls them into the main loss graph, which gives
+            #      them zero-tensor gradients (not None) on main backward.
+            #   2. optimizer.step() then runs AdamW on those zero grads. AdamW
+            #      with weight_decay > 0 always does `p.data.mul_(1 - lr * wd)`
+            #      even with zero grad → the controller weights get mutated
+            #      every step via weight decay alone.
+            #   3. get_actions() saves forward graphs referencing those same
+            #      weights (specifically `value_head[2].weight.T`, a shape
+            #      [64, 1] view via AsStridedBackward0). 100 steps later when
+            #      controller_loss.backward() walks back through the saved
+            #      graphs, PyTorch finds version N+100 instead of N and
+            #      raises "variables needed for gradient computation modified
+            #      by inplace operation".
+            # The controller is correctly handled by find_unused_parameters
+            # (it's not used by the main loss, so DDP just skips it).
             _ddp_ground = torch.zeros((), device=idx.device)
+            _controller_params = (
+                set(id(p) for p in self.state.controller.parameters())
+                if hasattr(self.state, 'controller') else set()
+            )
             for _p in self.state.parameters():
-                if _p.requires_grad:
+                if _p.requires_grad and id(_p) not in _controller_params:
                     _ddp_ground = _ddp_ground + _p.sum() * 0.0
 
             # Alpha gating: phase 1 = token only, phase 2-3 = all terms.

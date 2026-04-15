@@ -395,14 +395,17 @@ class PretrainedMemoriaModel(nn.Module):
                         result['loss_surprise'] = result['loss_surprise'] + p.sum() * 0.0
 
             # DDP participation for conditionally-used state parameters —
-            # see memoria_model.py for full rationale. Grounds every trainable
-            # Parameter under state (beliefs, edges, goals, plus all cognition
-            # submodules) with a zero-coefficient touch so DDP's reducer never
-            # sees an undefined gradient when consolidation/autoresearch paths
-            # intermittently activate their modules.
+            # see memoria_model.py for full rationale, including why the
+            # cognitive controller must be EXCLUDED (its weights are mutated
+            # every step via AdamW weight-decay if grounded, which invalidates
+            # the controller's saved REINFORCE trajectory graphs).
             _ddp_ground = torch.zeros((), device=idx.device)
+            _controller_params = (
+                set(id(p) for p in self.state.controller.parameters())
+                if hasattr(self.state, 'controller') else set()
+            )
             for _p in self.state.parameters():
-                if _p.requires_grad:
+                if _p.requires_grad and id(_p) not in _controller_params:
                     _ddp_ground = _ddp_ground + _p.sum() * 0.0
 
             result['loss'] = (
