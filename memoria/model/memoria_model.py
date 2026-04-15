@@ -1322,13 +1322,39 @@ class MemoriaModel(nn.Module):
                 tc = self.config.training
                 dsa_kl_w = tc.dsa_kl_weight if alpha == 0.0 else tc.dsa_kl_weight_after
 
+            # ── DDP participation for conditionally-used state parameters ──
+            # state.beliefs / edge_weights / edge_relations are trainable Parameters
+            # but only enter the autograd graph when active beliefs/edges exist
+            # (see free_energy.py, message_passing.py, read_path.py — all gated on
+            # `active_mask.any()` or `edge_active.any()`). With DDP + find_unused
+            # _parameters=True, a Parameter that is "used" on some iterations and
+            # "unused" on others can trip the reducer with:
+            #   "Encountered gradient which is undefined, but still allreduced"
+            # when the used/unused decision diverges between ranks or between the
+            # iteration DDP recorded buckets and the current backward. Observed
+            # consistently at step ~100–120 when hard consolidation first fires
+            # and mutates `state.beliefs.data` in-place (two_factor_sleep.py),
+            # invalidating DDP's cached bucket view.
+            #
+            # Fix matches the existing pattern for goal_embeddings above: a
+            # zero-coefficient touch keeps each Parameter unconditionally in the
+            # autograd graph every step, so DDP always sees a defined gradient
+            # (zero is defined; None is not). Cost: three extra `.sum()` reductions
+            # over ~10M elements — negligible next to the transformer forward.
+            _ddp_ground = (
+                self.state.beliefs.sum() * 0.0
+                + self.state.edge_weights.sum() * 0.0
+                + self.state.edge_relations.sum() * 0.0
+            )
+
             # Alpha gating: phase 1 = token only, phase 2-3 = all terms.
             # Draft + DSA KL are NOT alpha-gated — they train from step 0.
             # Self-correction loss is NOT alpha-gated — it trains from step 0.
             result['loss'] = (L_token_w + alpha * L_fe_w + alpha * L_aux_w
                               + w_draft * loss_draft
                               + w_draft * loss_self_correct
-                              + dsa_kl_w * loss_dsa_kl)
+                              + dsa_kl_w * loss_dsa_kl
+                              + _ddp_ground)
 
             result['log_sigma_token'] = self.log_sigma['token'].item()
             result['log_sigma_fe'] = self.log_sigma['fe'].item()

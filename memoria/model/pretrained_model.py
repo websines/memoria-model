@@ -394,11 +394,24 @@ class PretrainedMemoriaModel(nn.Module):
                     if p.requires_grad:
                         result['loss_surprise'] = result['loss_surprise'] + p.sum() * 0.0
 
+            # DDP participation for conditionally-used state parameters —
+            # see memoria_model.py for full rationale. state.beliefs /
+            # edge_weights / edge_relations are only in the autograd graph
+            # when active beliefs/edges exist; without this zero-coefficient
+            # touch, DDP's reducer trips on undefined gradients around step
+            # ~100 when consolidation first mutates state.beliefs.data in-place.
+            _ddp_ground = (
+                self.state.beliefs.sum() * 0.0
+                + self.state.edge_weights.sum() * 0.0
+                + self.state.edge_relations.sum() * 0.0
+            )
+
             result['loss'] = (
                 result['loss_token']
                 + alpha * loss_fe
                 + alpha * 0.1 * loss_utility
                 + alpha * 0.1 * result['loss_surprise']
+                + _ddp_ground
             )
         else:
             logits = lm_head(hidden)
