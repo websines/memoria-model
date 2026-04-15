@@ -625,6 +625,25 @@ def train(
                 with sync_ctx, torch.autograd.graph.allow_mutation_on_saved_tensors():
                     result = model(input_ids, targets=labels, alpha=alpha)
                     loss = result['loss'] / grad_accum
+                    # On the step just before the recurring DDP crash (~step 100),
+                    # dump the set of parameters whose gradients DDP will mark as
+                    # undefined. Fires once per rank to avoid log flooding.
+                    if (
+                        os.environ.get("MEMORIA_DDP_DEBUG", "0") == "1"
+                        and step == 100
+                        and micro_step == 0
+                    ):
+                        try:
+                            from torch.distributed.utils import _get_unused_params
+                            unused = _get_unused_params(model, loss)
+                            print(
+                                f"\n[DDP debug] rank={rank} step={step}: "
+                                f"{len(unused)} unused params:"
+                            )
+                            for name, _ in unused:
+                                print(f"  - {name}")
+                        except Exception as _dbg_exc:
+                            print(f"[DDP debug] get_unused_params failed: {_dbg_exc}")
                     accelerator.backward(loss)
             except nan_debug.Tripped as e:
                 dump_path = Path(f"nan_repro_step{step}_rank{rank}.pt")
