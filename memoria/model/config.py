@@ -550,8 +550,8 @@ def full_config() -> MemoriaConfig:
             relation_dim=64,
         ),
         training=TrainingConfig(
-            total_batch_size=2**17,    # 128K bytes/step
-            device_batch_size=1,       # 1 seq/GPU at peak context
+            total_batch_size=2**20,    # 1M bytes/step (4x previous)
+            device_batch_size=2,       # 2 seq/GPU (fits in 24GB VRAM)
 
             phase1_steps=2000,
             phase2_steps=3000,
