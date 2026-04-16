@@ -553,9 +553,9 @@ def full_config() -> MemoriaConfig:
             total_batch_size=2**20,    # 1M bytes/step (4x previous)
             device_batch_size=2,       # 2 seq/GPU (fits in 24GB VRAM)
 
-            phase1_steps=2000,
-            phase2_steps=3000,
-            alpha_warmup_steps=1000,
+            phase1_steps=5000,
+            phase2_steps=8000,
+            alpha_warmup_steps=3000,
             alpha_max=0.1,
 
             # SkyLadder: 512 → 128K bytes, exponential (more time at cheap short ctx)
