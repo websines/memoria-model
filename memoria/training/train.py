@@ -658,8 +658,8 @@ def train(
                 input_ids, labels = prefetcher.next_batch()
                 # SkyLadder: truncate to current context length
                 if ctx_len < input_ids.shape[1]:
-                    input_ids = input_ids[:, :ctx_len]
-                    labels = labels[:, :ctx_len]
+                    input_ids = input_ids[:, :ctx_len].contiguous()
+                    labels = labels[:, :ctx_len].contiguous()
             else:
                 input_ids = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
                 labels = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
