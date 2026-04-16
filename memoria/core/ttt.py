@@ -243,19 +243,26 @@ class InPlaceTTT(nn.Module):
         Reference: Titans (Google, arXiv:2501.00663) — learned decay is the
         single largest contributor to Titans performance.
         """
-        with torch.no_grad():
-            pooled = hidden.mean(dim=(0, 1))  # [D]
-            alpha = torch.sigmoid(self.decay_gate(pooled))  # scalar in (0, 1)
-            if layer_key is not None:
-                if layer_key in self.delta_A:
-                    self.delta_A[layer_key].mul_(alpha)
-                    self.delta_B[layer_key].mul_(alpha)
-            else:
-                for key in self.delta_A:
-                    self.delta_A[key].mul_(alpha)
-                    self.delta_B[key].mul_(alpha)
-            self._last_decay_alpha = alpha.item()
-        return alpha.item()
+        # Titans-style LEARNED decay requires gradients to flow through the
+        # gate → delta → forward → loss path. But TTT deltas have
+        # requires_grad=False (DDP compatibility) and apply_decay runs under
+        # no_grad, so the gate can never learn. With random Xavier weights,
+        # the gate output sigmoid(W @ pooled + bias) is chaotic noise —
+        # wandb shows alpha ranging 0.2–1.0 with wild swings, collapsing
+        # deltas to zero within ~50 steps.
+        #
+        # Without a learnable gate, decay is disabled (alpha=1.0, identity).
+        # The rollback mechanism in ttt_step already protects against bad
+        # delta accumulation: if loss_after > loss_before, the update is
+        # reverted. This provides the quality gate that decay was intended
+        # to supply, without the unlearnable noise.
+        #
+        # To re-enable Titans decay properly: move delta application into
+        # the autograd graph (requires_grad=True on deltas), compute the
+        # gate inside the forward pass (not under no_grad), and let the
+        # main loss gradient train the gate weights.
+        self._last_decay_alpha = 1.0
+        return 1.0
 
     # ── Surprise gating ───────────────────────────────────────────────────────
 

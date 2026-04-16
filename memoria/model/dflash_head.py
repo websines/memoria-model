@@ -597,7 +597,14 @@ class DFlashDraftHead(nn.Module):
             )
 
         if oput_weight is not None and oput_w > 0:
-            total_loss = loss_teacher + oput_weight * loss_self_correct
+            # Detach oput_weight: the gradient d(L)/d(w) = loss_self_correct
+            # is structurally always positive (CE > 0 × softplus' > 0), so
+            # gradient descent monotonically decreases the weight to zero.
+            # Detaching breaks this degenerate gradient while preserving the
+            # forward-pass scaling. The weight still adapts via the MetaParam
+            # optimizer group (cognitive_meta_lr) responding to the overall
+            # loss landscape, just not through the direct d(w*L)/dw path.
+            total_loss = loss_teacher + oput_weight.detach() * loss_self_correct
         else:
             total_loss = loss_teacher
         return total_loss, loss_self_correct

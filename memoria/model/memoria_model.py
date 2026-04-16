@@ -1329,9 +1329,11 @@ class MemoriaModel(nn.Module):
             # are gone — all state params are now on _ddp_params_and_buffers_to_ignore
             # (see train.py near accelerator.prepare), so DDP never expects a grad
             # for them and doesn't need artificial grounding.
+            # loss_draft already contains oput_weight * loss_self_correct
+            # internally (via compute_draft_loss). Adding loss_self_correct
+            # again here would double-count it.
             result['loss'] = (L_token_w + alpha * L_fe_w + alpha * L_aux_w
                               + w_draft * loss_draft
-                              + w_draft * loss_self_correct
                               + dsa_kl_w * loss_dsa_kl)
 
             result['log_sigma_token'] = self.log_sigma['token'].item()
