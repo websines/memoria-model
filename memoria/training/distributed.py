@@ -151,16 +151,66 @@ def broadcast_state(state, rank: int, world_size: int):
     dist.all_reduce(content_max, op=dist.ReduceOp.MAX)
     dist.all_reduce(content_min, op=dist.ReduceOp.MIN)
     if content_max.item() != content_min.item():
+        # Identify which specific tensors contain NaN/Inf for debugging.
+        nan_tensors = []
+        with torch.no_grad():
+            for name, buf in sorted(state.named_buffers()):
+                if buf is not None and not torch.isfinite(buf).all():
+                    n_bad = (~torch.isfinite(buf)).sum().item()
+                    nan_tensors.append(f"buffer:{name}[{tuple(buf.shape)}] ({n_bad} bad)")
+            for name, param in sorted(state.named_parameters()):
+                if param is not None and not torch.isfinite(param.data).all():
+                    n_bad = (~torch.isfinite(param.data)).sum().item()
+                    nan_tensors.append(f"param:{name}[{tuple(param.data.shape)}] ({n_bad} bad)")
         raise RuntimeError(
             f"[broadcast_state] Content drift detected on rank {rank} AFTER "
             f"broadcast: content_fingerprint min={content_min.item():.6e} "
-            f"max={content_max.item():.6e}. This means a rank mutated state "
-            f"after the broadcast without re-syncing, OR dist.broadcast did "
-            f"not produce bit-identical data (e.g., an async op wasn't "
-            f"awaited). Check for rank-conditional state writes between "
+            f"max={content_max.item():.6e}. "
+            f"Non-finite tensors: {nan_tensors if nan_tensors else 'none (drift is real, not NaN)'}. "
+            f"Check for rank-conditional state writes between "
             f"broadcast_state() calls — those must either happen on all ranks "
             f"or be followed by an explicit re-broadcast."
         )
+
+
+def sanitize_state_nan(state, step: int = -1) -> list[str]:
+    """Replace NaN/Inf in all state buffers and parameters with zeros.
+
+    Called after pass2 (rank 0 only) to prevent NaN from propagating through
+    broadcast_state → all ranks on the next step. Returns the names of
+    tensors that were sanitized so the caller can log them.
+
+    Why zeros: a zeroed belief is "inactive" (radius < EPSILON), a zeroed
+    edge weight is dead (collected on next sweep), and a zeroed buffer is
+    neutral. This is always safer than keeping NaN, which would cascade
+    into every downstream computation.
+    """
+    sanitized = []
+    with torch.no_grad():
+        for name, buf in state.named_buffers():
+            if buf is None:
+                continue
+            mask = ~torch.isfinite(buf)
+            if mask.any():
+                n_bad = mask.sum().item()
+                buf[mask] = 0.0
+                sanitized.append(f"buffer:{name} ({n_bad} values)")
+        for name, param in state.named_parameters():
+            if param is None:
+                continue
+            mask = ~torch.isfinite(param.data)
+            if mask.any():
+                n_bad = mask.sum().item()
+                param.data[mask] = 0.0
+                sanitized.append(f"param:{name} ({n_bad} values)")
+    if sanitized and step >= 0:
+        import sys
+        print(
+            f"\n  WARNING: NaN/Inf sanitized in cognitive state at step {step}: "
+            f"{sanitized}",
+            file=sys.stderr,
+        )
+    return sanitized
 
 
 def sync_ranks(world_size: int):

@@ -322,6 +322,30 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
+    # 17b. Strategy bank + selector + evolver (LSR refinement loop strategies).
+    # strategy_bank is an nn.Parameter used in forward (perturbation injection).
+    # strategy_selector/evolver have learned weights for selection/generation.
+    # Without optimizer registration, their .grad accumulates unboundedly
+    # because zero_grad only touches params it owns — a latent NaN source.
+    if model.state._strategy_bank_initialized:
+        strat_params = [model.state.strategy_bank]
+        if model.state.strategy_selector is not None:
+            strat_params.extend(
+                p for p in model.state.strategy_selector.parameters() if p.requires_grad
+            )
+        if model.state.strategy_evolver is not None:
+            strat_params.extend(
+                p for p in model.state.strategy_evolver.parameters() if p.requires_grad
+            )
+        if strat_params:
+            param_groups.append({
+                'params': strat_params,
+                'lr': tc.interface_lr * 0.1,  # slow — strategies evolve via pass2, not gradient
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
+            })
+
     # 18a. BLT byte encoder (byte embedding, N-gram conv, local DeltaProduct, pooling)
     if hasattr(model, 'blt_enabled') and model.blt_enabled:
         enc_params = [p for p in model.byte_encoder.parameters() if p.requires_grad]

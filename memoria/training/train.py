@@ -38,6 +38,7 @@ from .optimizer import setup_optimizer
 from .schedule import get_lr_multiplier, get_alpha, get_context_length
 from .distributed import (
     broadcast_state, gather_candidates, gather_read_indices, sync_ranks,
+    sanitize_state_nan,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
 from ..cognition.meta_learning import compute_beta  # noqa: F401 — used transitively via pass2
@@ -606,6 +607,9 @@ def train(
         if is_main:
             print("NaN tripwire: installed (MEMORIA_DEBUG_NAN=1)")
 
+    # Pre-compute optimizer param set for orphan gradient cleanup (invariant across steps)
+    _optimizer_param_ids = {id(p) for g in optimizer.param_groups for p in g['params']}
+
     for step in range(start_step, max_steps):
         t0 = time.time()
 
@@ -756,6 +760,15 @@ def train(
 
         optimizer.zero_grad(set_to_none=True)
 
+        # Clear orphan gradients: parameters with requires_grad=True that
+        # are NOT in any optimizer group. Without this, their .grad
+        # accumulates unboundedly across steps — a latent source of NaN
+        # when the accumulated gradient overflows and contaminates autograd
+        # internals (e.g., allow_mutation_on_saved_tensors cloning).
+        for p in base_model.parameters():
+            if p.requires_grad and id(p) not in _optimizer_param_ids and p.grad is not None:
+                p.grad = None
+
         # Fast fail
         if total_loss > 100:
             if is_main:
@@ -810,6 +823,16 @@ def train(
                 'beta': 1.0, 'active_beliefs': 0, 'active_edges': 0,
                 'active_goals': 0, 'total_surprise': 0.0,
             }
+
+        # Sanitize NaN/Inf in cognitive state before broadcast.
+        # pass2 writes to hundreds of buffers/parameters across submodules
+        # (beliefs, edges, variances, controller history, strategy fitness, ...).
+        # A NaN in any single tensor makes the content fingerprint NaN, which
+        # triggers a "content drift" RuntimeError in broadcast_state on the
+        # NEXT step. Sanitizing here prevents the crash and logs which tensor
+        # was affected so the root cause can be tracked down.
+        if is_main:
+            sanitize_state_nan(base_model.state, step=step)
 
         sync_ranks(world_size)
 
