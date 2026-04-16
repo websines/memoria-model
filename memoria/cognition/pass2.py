@@ -538,37 +538,34 @@ def run_pass2(
             shifted = apply_belief_shift(state, mp_result['messages'], mp_result['precisions'])
             stats['beliefs_shifted'] = len(shifted)
 
-    # ── 9c. E1: Two-factor sleep consolidation ──
-    # Runs during sleep cycle: homeostatic precision normalization +
-    # conflict scanning + replay candidate identification.
-    if (consolidation_timer >= sleep_interval
-            and state.num_active_beliefs() > 0):
-        tfs_stats = run_two_factor_sleep(state, current_step)
-        stats['two_factor_sleep'] = tfs_stats
+    # ── 9c-f. Periodic sleep subsystems (E1-E4) ──
+    # These are expensive with large states (8K beliefs, 17K edges).
+    # Stagger them across consecutive consolidation windows so they don't
+    # all fire on the same step. Each subsystem runs once per 4 windows
+    # (one per window in round-robin). The consolidation_timer is an int
+    # counting sequence boundaries since last hard consolidation.
+    # window_id = consolidation_timer // sleep_interval counts how many
+    # windows have elapsed; (window_id % 4) selects which subsystem runs.
+    if consolidation_timer >= sleep_interval and state.num_active_beliefs() > 0:
+        window_id = int(consolidation_timer // max(sleep_interval, 1))
+        slot = window_id % 4
 
-    # ── 9d. E2: Self-verification pass ──
-    # Runs during sleep: causal consistency check, weakest-link precision
-    # reduction, conflict-aware supersession.
-    if (consolidation_timer >= sleep_interval
-            and state.num_active_beliefs() > 2
-            and state.num_active_edges() > 0):
-        sv_stats = run_self_verification(state)
-        stats['self_verification'] = sv_stats
-
-    # ── 9e. E3: Empirical precision recalibration ──
-    # Runs during sleep: decay overconfident beliefs toward empirical precision.
-    if (consolidation_timer >= sleep_interval
-            and state.num_active_beliefs() > 0):
-        recal_stats = run_precision_recalibration(state)
-        stats['precision_recalibration'] = recal_stats
-
-    # ── 9f. E4: Interleaved replay ──
-    # Runs during sleep: cross-temporal contradiction detection between
-    # recent high-surprise and old high-precision beliefs.
-    if (consolidation_timer >= sleep_interval
-            and state.num_active_beliefs() >= 4):
-        replay_stats = run_interleaved_replay(state)
-        stats['interleaved_replay'] = replay_stats
+        if slot == 0:
+            # E1: Two-factor sleep consolidation
+            tfs_stats = run_two_factor_sleep(state, current_step)
+            stats['two_factor_sleep'] = tfs_stats
+        elif slot == 1 and state.num_active_edges() > 0:
+            # E2: Self-verification pass
+            sv_stats = run_self_verification(state)
+            stats['self_verification'] = sv_stats
+        elif slot == 2:
+            # E3: Empirical precision recalibration
+            recal_stats = run_precision_recalibration(state)
+            stats['precision_recalibration'] = recal_stats
+        elif slot == 3 and state.num_active_beliefs() >= 4:
+            # E4: Interleaved replay
+            replay_stats = run_interleaved_replay(state)
+            stats['interleaved_replay'] = replay_stats
 
     # ── 10. Planning step (B1-B4) ──
     # Run at sequence boundaries when there are active goals and beliefs.

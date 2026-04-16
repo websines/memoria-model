@@ -155,13 +155,20 @@ class RunningStats(nn.Module):
     def hard_consolidation_interval(self) -> int:
         """Steps between full (hard) consolidation passes.
 
-        Scales down from 50 as fill ratio rises, reaching a floor of 20
-        when the state is almost full.
+        Scales with fill ratio: less frequent when sparse (state is healthy),
+        more frequent near capacity (needs cleanup). Floor of 200 prevents
+        the sleep/verification/recalibration/replay operations from stacking
+        up every 20 steps with a dense state — at 8K beliefs and 17K edges,
+        each operation takes seconds and running ALL of them every 20 steps
+        causes 30+ minute pass2 hangs that timeout DDP barriers.
+
+        200-step floor = ~1-2 consolidation passes per training phase
+        transition, which is sufficient for state hygiene.
         """
         fill = self.belief_fill_ratio.item()
-        # Linear scale: 50 at fill=0 → 20 at fill=1
-        interval = int(50 - 30 * fill)
-        return max(interval, 20)
+        # Linear scale: 500 at fill=0 → 200 at fill=1
+        interval = int(500 - 300 * fill)
+        return max(interval, 200)
 
     @property
     def max_candidates(self) -> int:
