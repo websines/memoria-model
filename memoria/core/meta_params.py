@@ -384,6 +384,21 @@ class MetaParams(nn.Module):
         # Mapped to actual threshold: (value - 0.5) * 2 → range (-1, 1) centered at 0
         self._strategy_promotion_threshold = nn.Parameter(torch.tensor(-2.197225))
 
+        # ── Edge Proposal Adaptive Threshold ──
+        # edge_proposal.py — target acceptance rate for proportional controller.
+        # sigmoid(-0.405465) ≈ 0.4 → accept ~40% of candidates
+        self._edge_proposal_target_accept = nn.Parameter(torch.tensor(-0.405465))
+        # edge_proposal.py — proportional controller gain.
+        # sigmoid(-2.197225) ≈ 0.1 → matches (1 - ema_decay) for stable control
+        self._edge_proposal_gain = nn.Parameter(torch.tensor(-2.197225))
+
+        # ── A1b: Autoresearch viable goal filter ──
+        # Minimum goal_success_ema for a goal to receive hypothesis generation.
+        # Goals below this threshold are skipped (unless untested). Replaces
+        # the former hardcoded 0.2 in run_autoresearch_step.
+        # sigmoid(-1.386) ≈ 0.2 → default 20% success rate minimum
+        self._viable_goal_min_success = nn.Parameter(torch.tensor(-1.386294))
+
         # ── F1: Predictive Refinement (MoR + SCORE) ──
         # Contraction rate: SCORE-style step-size decay per loop iteration.
         # dt(l) = (1 - contraction_rate)^l → later loops contribute smaller deltas.
@@ -542,6 +557,13 @@ class MetaParams(nn.Module):
         to the hypothesis itself.
         """
         return F.softplus(self._provisional_min_reads)
+
+    # ── A1b: Autoresearch viable goal filter ──
+
+    @property
+    def viable_goal_min_success(self) -> torch.Tensor:
+        """Min goal_success_ema to receive hypothesis generation. Range: (0, 1)."""
+        return torch.sigmoid(self._viable_goal_min_success)
 
     # ── A2: MESU Precision Variance ──
 
@@ -896,6 +918,18 @@ class MetaParams(nn.Module):
     def strategy_promotion_threshold(self) -> torch.Tensor:
         """Min fitness for strategy survival. Range: (-1, 1). Centered at 0."""
         return (torch.sigmoid(self._strategy_promotion_threshold) - 0.5) * 2.0
+
+    # ── Edge Proposal Adaptive Threshold ──
+
+    @property
+    def edge_proposal_target_accept(self) -> torch.Tensor:
+        """Target acceptance rate for edge proposal controller. Range: (0, 1)."""
+        return torch.sigmoid(self._edge_proposal_target_accept)
+
+    @property
+    def edge_proposal_gain(self) -> torch.Tensor:
+        """Proportional controller gain for edge proposal threshold. Range: (0, 1)."""
+        return torch.sigmoid(self._edge_proposal_gain)
 
     # ── F1: Predictive Refinement ──
 

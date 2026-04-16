@@ -189,7 +189,11 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
         })
 
     # 6. Cognitive state continuous params (beliefs, edge_weights, edge_relations)
-    # Slow LR + weight decay replaces: radius clamp, edge death thresholds, sequence boundary decay
+    # NO weight decay: beliefs are memory entries, not network weights.
+    # Their lifecycle (creation, consolidation, eviction, sleep-cycle
+    # homeostatic scaling) is managed entirely by pass 2. Weight decay
+    # uniformly shrinks radii every step, preventing beliefs from ever
+    # building precision — the opposite of what a memory system needs.
     cognitive_params = [p for p in [model.state.beliefs, model.state.edge_weights, model.state.edge_relations] if p.requires_grad]
     if cognitive_params:
         param_groups.append({
@@ -197,7 +201,7 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
             'lr': tc.belief_lr,
             'betas': (0.9, 0.999),
             'eps': 1e-8,
-            'weight_decay': tc.weight_decay,
+            'weight_decay': 0.0,
         })
 
     # 7. Cognitive meta-parameters (learned thresholds replacing magic numbers)
@@ -526,7 +530,7 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
         },
     ]
 
-    # Cognitive state (beliefs, edges, relations)
+    # Cognitive state (beliefs, edges, relations) -- no weight decay (see group 6 comment)
     cognitive_params = [p for p in [model.state.beliefs, model.state.edge_weights, model.state.edge_relations] if p.requires_grad]
     if cognitive_params:
         param_groups.append({
@@ -534,7 +538,7 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
             'lr': tc.belief_lr,
             'betas': (0.9, 0.999),
             'eps': 1e-8,
-            'weight_decay': tc.weight_decay,
+            'weight_decay': 0.0,
         })
 
     # Cognitive meta-parameters

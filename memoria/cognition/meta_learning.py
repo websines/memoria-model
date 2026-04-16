@@ -19,24 +19,29 @@ import torch
 from torch import Tensor
 
 from ..core.state import CognitiveState
-from ..core.free_energy import compute_free_energy
+from ..core.free_energy import compute_free_energy, compute_bethe_free_energy
 from ..core.polar import EPSILON
 
 
 def compute_beta(state: CognitiveState, temperature: float = 5.0) -> float:
-    """Compute β from current state (already done inside compute_free_energy).
+    """Compute beta from current state using Bethe free energy.
 
-    This is a convenience wrapper that returns just β.
-    β is also written to state.meta[0] as a side effect.
+    Uses compute_bethe_free_energy which computes beta from the proper
+    KL-to-uniform entropy measure (non-negative, zero at kappa=0).
+    The legacy compute_free_energy used raw Power Spherical entropy
+    whose sign inverts at low kappa, causing beta to saturate at 1.0
+    (perpetual exploration) when belief radii are small.
+
+    beta is written to state.meta[0] as a side effect.
 
     Args:
         state: cognitive state
         temperature: for energy computation
 
     Returns:
-        β ∈ [0, 1]
+        beta in [0, 1]
     """
-    result = compute_free_energy(state, temperature)
+    result = compute_bethe_free_energy(state, temperature)
     return result['beta'].item()
 
 

@@ -266,6 +266,8 @@ def run_pass2(
             if sr.should_reconsolidate and not sr.is_new:
                 reconsolidated_indices.append(sr.slot)
 
+    stats['belief_reconsolidations'] = len(reconsolidated_indices)
+
     # ── 2b-i. A2: MESU — update precision variance for matched beliefs ──
     # Observations reduce uncertainty about a belief's precision.
     # High gain → large variance reduction. Windowed posterior prevents
@@ -361,7 +363,15 @@ def run_pass2(
                     n_created += 1
             stats['edges_proposed'] = len(all_candidate_pairs)
             stats['edges_created'] = n_created
-            state.edge_proposal.update_ada_threshold(state.num_active_edges(), len(all_candidate_pairs))
+            stats['edges_accepted'] = len(accepted_edges)
+            state.edge_proposal.update_ada_threshold(
+                state.num_active_edges(), len(all_candidate_pairs),
+                n_accepted=len(accepted_edges),
+                target_accept=state.meta_params.edge_proposal_target_accept.item(),
+                gain=state.meta_params.edge_proposal_gain.item(),
+            )
+            stats['edge_proposal_threshold'] = state.edge_proposal.proposal_threshold.item()
+            stats['edge_accept_ema'] = state.edge_proposal.acceptance_ema.item()
         stats['co_activation_pairs'] = len(co_activations)
     else:
         stats['edges_proposed'] = 0

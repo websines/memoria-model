@@ -117,15 +117,18 @@ class WritePath(nn.Module):
         self.obs_proj = nn.Linear(hidden_dim, belief_dim, bias=False)
 
         # Write gate: learned binary decision "is this worth storing?"
-        # Initialized with negative bias so gate starts mostly closed (~12% open),
-        # preventing state flooding before the model learns what's useful.
+        # Bias = 0.0 (maximum-entropy initialization).
+        # sigmoid(0) = 0.5: the uniform prior over {write, don't write}.
+        # Zero is the unique non-arbitrary init for a learned binary gate --
+        # any nonzero value encodes an unjustified prior on write frequency.
+        # The network learns to discriminate via gradients from the
+        # free-energy objective; no handcrafted gate rate is needed.
         self.write_gate = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 4),
             nn.ReLU(),
             nn.Linear(hidden_dim // 4, 1),
         )
-        # Init gate bias negative so sigmoid starts near 0
-        nn.init.constant_(self.write_gate[-1].bias, -2.0)
+        nn.init.constant_(self.write_gate[-1].bias, 0.0)
 
         # Precision estimator (only used when gate is open)
         self.precision_head = nn.Sequential(

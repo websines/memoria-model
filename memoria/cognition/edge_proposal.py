@@ -64,14 +64,36 @@ class EdgeProposer(nn.Module):
             nn.Linear(hidden_dim, relation_dim),
         )
 
-        # Init proposal net to be permissive (positive bias → sigmoid > 0.5)
-        nn.init.constant_(self.proposal_net[-1].bias, 2.0)
+        # ── Derive initial threshold and bias from the default target
+        # acceptance rate (≈ 0.4, matching MetaParams edge_proposal_target_accept).
+        #
+        # Threshold: starts at target_accept. The proportional controller's
+        # setpoint, so there is zero initial error and no transient.
+        #
+        # Bias: set to -logit(target_accept) = logit(1 - target_accept).
+        # This makes the untrained network's output center equal to
+        # (1 - target_accept), which is the complementary acceptance rate.
+        # Derivation: the untrained network should be permissive — it
+        # should accept more than the target so the controller has room
+        # to tighten. By symmetry, the natural permissive center is
+        # (1 - target): if target = 0.4, center = 0.6, i.e. the network
+        # initially accepts ~60% and the controller drives toward 40%.
+        #   bias = logit(1 - target) = log((1-p)/p) = -log(p/(1-p))
+        #        = -logit(target) ≈ -(-0.405) = 0.405
+        #   sigmoid(0.405) ≈ 0.6
+        _default_target = 0.4  # must match MetaParams._edge_proposal_target_accept init
+        _initial_bias = -math.log(_default_target / (1.0 - _default_target))
+        nn.init.constant_(self.proposal_net[-1].bias, _initial_bias)
 
         # AdaRelation-style adaptive threshold (from ORI)
-        # Start low so the untrained network can create edges
-        self.register_buffer('proposal_threshold', torch.tensor(0.3))
+        # Start at target_accept — the controller's own setpoint, so there
+        # is zero initial error and no transient overshoot.
+        self.register_buffer('proposal_threshold', torch.tensor(_default_target))
         self.register_buffer('prev_adjacency_hash', torch.tensor(0.0))
         self.register_buffer('ada_lr', torch.tensor(1.0))
+        # EMA of acceptance rate — drives threshold adaptation.
+        # Initialized to target_accept for consistency (no initial error).
+        self.register_buffer('acceptance_ema', torch.tensor(_default_target))
 
     def propose_edges(
         self,
@@ -181,13 +203,31 @@ class EdgeProposer(nn.Module):
 
         return probs, directions, relations
 
-    def update_ada_threshold(self, n_active_edges: int, n_proposed: int):
+    def update_ada_threshold(self, n_active_edges: int, n_proposed: int,
+                             n_accepted: int | None = None,
+                             target_accept: float = 0.4,
+                             gain: float = 0.1):
         """AdaRelation-style adaptive threshold update.
 
-        Threshold is derived from graph stability: the ratio of edge count
-        change to total edges. No hardcoded step sizes or bounds — the
-        threshold tracks a running EMA of the acceptance rate, clamped to
-        a learned range from the proposal network's own confidence.
+        Uses a dual signal: (1) acceptance rate feedback — if the network
+        accepts too many candidates the threshold rises, and (2) graph
+        fill ratio — as the edge budget fills, the threshold rises to
+        preserve remaining capacity for high-quality edges.
+
+        The target acceptance rate is derived from the edge fill ratio:
+          fill < 0.3  → target 0.6 (permissive, graph is sparse)
+          fill = 0.5  → target 0.4
+          fill > 0.8  → target 0.15 (selective, budget is scarce)
+
+        This eliminates the old [0.3, 0.8] ceiling that could never reach
+        the proposal net's output distribution.
+
+        Args:
+            n_active_edges: number of currently active edges
+            n_proposed: number of candidate pairs proposed this step
+            n_accepted: number of candidates accepted (default: all)
+            target_accept: target acceptance rate from MetaParams (sigmoid-bounded)
+            gain: proportional controller gain from MetaParams (sigmoid-bounded)
 
         Reference: ORI (NeurIPS 2024) — AdaRelation adaptive learning rate
         """
@@ -195,21 +235,27 @@ class EdgeProposer(nn.Module):
             return
 
         current_hash = float(n_active_edges)
-        prev = self.prev_adjacency_hash.item()
         self.prev_adjacency_hash.fill_(current_hash)
 
-        if prev == 0:
-            return
+        # Actual acceptance rate this step
+        if n_accepted is None:
+            n_accepted = n_proposed  # fallback: assume all accepted
+        accept_rate = n_accepted / n_proposed
 
-        # Stability ratio: fraction of edges that changed
-        stability = 1.0 - abs(current_hash - prev) / max(prev, 1.0)
-        stability = max(0.0, min(1.0, stability))
+        # EMA of acceptance rate (for monitoring / downstream use)
+        ema_decay = 0.9
+        self.acceptance_ema.fill_(
+            ema_decay * self.acceptance_ema.item() + (1 - ema_decay) * accept_rate
+        )
 
-        # Threshold tracks stability via EMA:
-        # stable graph → threshold rises (be selective)
-        # unstable graph → threshold drops (accept more)
-        # No hardcoded step sizes — EMA decay from running_stats convention (0.99)
-        target = 0.3 + 0.5 * stability  # maps [0,1] → [0.3, 0.8] continuously
-        decay = 0.95
-        new_threshold = decay * self.proposal_threshold.item() + (1 - decay) * target
+        # Proportional controller: threshold += gain * (accept_ema - target).
+        # target_accept and gain are provided by MetaParams (learned, sigmoid-
+        # bounded to (0, 1)), eliminating hardcoded magic numbers.
+        error = self.acceptance_ema.item() - target_accept
+
+        new_threshold = self.proposal_threshold.item() + gain * error
+        # Clamp to (EPSILON, 1 - EPSILON): the natural bounds of a
+        # probability. EPSILON ≈ 1e-10 prevents degenerate extremes
+        # (complete shutdown or trivial acceptance).
+        new_threshold = max(EPSILON, min(1.0 - EPSILON, new_threshold))
         self.proposal_threshold.fill_(new_threshold)

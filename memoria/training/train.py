@@ -434,6 +434,20 @@ def train(
         optimizer.load_state_dict(checkpoint['optimizer_state'])
         start_step = checkpoint['step']
         samples_consumed = checkpoint.get('samples_consumed', 0)
+        # Guard against TTT dead fixed point from old checkpoints.
+        # Pre-Kaiming checkpoints stored zero-initialized deltas. At A=B=0,
+        # grad_A ∝ h @ B.T = 0 and grad_B ∝ A.T @ ... = 0, so TTT is
+        # permanently stuck. Re-inject Kaiming noise for any zero deltas.
+        if hasattr(base_model, 'ttt'):
+            with torch.no_grad():
+                _ttt = base_model.ttt
+                _init_std = (2.0 / (_ttt.hidden_dim * _ttt.rank)) ** 0.5
+                for key in _ttt.delta_A:
+                    if _ttt.delta_A[key].norm() < 1e-8:
+                        _ttt.delta_A[key].normal_(0, _init_std)
+                        _ttt.delta_B[key].normal_(0, _init_std)
+                        if is_main:
+                            print(f"  TTT: re-initialized zero delta for layer {key}")
         if is_main:
             print(f"Resumed from step {start_step}")
 

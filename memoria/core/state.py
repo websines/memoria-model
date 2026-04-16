@@ -975,7 +975,7 @@ class CognitiveState(nn.Module):
             if 'edge_direction' in state:
                 self.edge_direction.data.copy_(state['edge_direction'])
             if 'edge_proposal' in state:
-                self.edge_proposal.load_state_dict(state['edge_proposal'])
+                self.edge_proposal.load_state_dict(state['edge_proposal'], strict=False)
             if 'controller' in state:
                 self.controller.load_state_dict(state['controller'])
             if 'sleep_gate' in state:

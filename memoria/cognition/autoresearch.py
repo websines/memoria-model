@@ -45,7 +45,7 @@ class HypothesisGenerator(nn.Module):
     network learns to use them.
     """
 
-    # Feature dimensions for the shared input to net/precision/gate.
+    # Feature dimensions for the shared input to net/precision.
     # Layout: [goal_embed, belief_summary, failure_summary, progress, beta, failure_count_norm]
     # Old layout was [goal_embed, belief_summary, progress, beta].
     # The failure_summary and failure_count_norm columns are new and are
@@ -74,15 +74,11 @@ class HypothesisGenerator(nn.Module):
             nn.Softplus(),
         )
 
-        # Gate: should we even generate a hypothesis for this goal?
-        # Starts mostly closed (bias=-1.0 → sigmoid ≈ 0.27).
-        # Prevents flooding the state with bad hypotheses early in training.
-        self.generate_gate = nn.Sequential(
-            nn.Linear(in_dim, belief_dim // 4),
-            nn.ReLU(),
-            nn.Linear(belief_dim // 4, 1),
-        )
-        nn.init.constant_(self.generate_gate[-1].bias, -1.0)
+        # Gate removed: hypothesis_gen runs under no_grad so a learned gate
+        # could never update. The viable mask in run_autoresearch_step
+        # (goal_success_ema > viable_goal_min_success MetaParam) already
+        # does content-aware filtering. All goals that pass the viable
+        # filter get hypotheses generated — no redundant gating.
 
         # Zero-init the failure-conditioning columns of the first linear in each
         # head. Input layout is:
@@ -96,7 +92,7 @@ class HypothesisGenerator(nn.Module):
         # t=0; the network learns to use them as training progresses.
         # (Same pattern as GoalRouter zero-init in the read path.)
         with torch.no_grad():
-            for head in (self.hypothesis_net, self.precision_head, self.generate_gate):
+            for head in (self.hypothesis_net, self.precision_head):
                 first_linear = head[0]
                 first_linear.weight[:, belief_dim * 2 : belief_dim * 3].zero_()
                 first_linear.weight[:, belief_dim * 3 + 2].zero_()
@@ -128,9 +124,9 @@ class HypothesisGenerator(nn.Module):
                 failed buffer (capped at the buffer size). None → zeros.
 
         Returns:
-            hypotheses: [K, D] candidate belief vectors (K <= G, gated)
-            precisions: [K] precision for each hypothesis
-            goal_indices: [K] which goal generated each hypothesis
+            hypotheses: [G, D] candidate belief vectors
+            precisions: [G] precision for each hypothesis
+            goal_indices: [G] index of each goal (identity mapping)
         """
         G = goal_embeddings.shape[0]
         device = goal_embeddings.device
@@ -171,26 +167,20 @@ class HypothesisGenerator(nn.Module):
             failure_count_norm,  # [G, 1] — new
         ], dim=-1)  # [G, 3D+3]
 
-        # Gate: should we generate for this goal?
-        gate_logits = self.generate_gate(features).squeeze(-1)  # [G]
-        gate = torch.sigmoid(gate_logits)
-
-        # Only generate for goals where gate > 0.5
-        generate_mask = gate > 0.5
-        if not generate_mask.any():
-            return (torch.zeros(0, self.belief_dim, device=device),
-                    torch.zeros(0, device=device),
-                    torch.zeros(0, dtype=torch.long, device=device))
-
-        selected_features = features[generate_mask]
-        selected_indices = generate_mask.nonzero(as_tuple=False).squeeze(-1)
+        # No gate: all goals that pass the viable filter in
+        # run_autoresearch_step get hypotheses generated. The viable mask
+        # (goal_success_ema > viable_goal_min_success) already does
+        # content-aware filtering; a learned gate here was dead code
+        # because hypothesis_gen runs under no_grad.
+        selected_features = features
+        selected_indices = torch.arange(G, device=device)
 
         # Generate hypothesis direction
-        raw_hypothesis = self.hypothesis_net(selected_features)  # [K, D]
+        raw_hypothesis = self.hypothesis_net(selected_features)  # [G, D]
         hypothesis_dir = F.normalize(raw_hypothesis, dim=-1, eps=EPSILON)
 
         # Generate precision (low = tentative, learns to calibrate)
-        precision = self.precision_head(selected_features).squeeze(-1)  # [K]
+        precision = self.precision_head(selected_features).squeeze(-1)  # [G]
 
         # Scale hypothesis by precision
         hypotheses = hypothesis_dir * precision.unsqueeze(-1)
@@ -446,8 +436,10 @@ def run_autoresearch_step(
 
     # Apply priority boost from hypothesis success history
     _boosts = tracker.goal_priority_boost(goal_indices)  # noqa: F841 — reserved for future goal priority modulation
-    # Skip goals with very low success rate (< 0.2 EMA) — don't waste slots
-    viable = tracker.goal_success_ema[goal_indices] > 0.2
+    # Skip goals with very low success rate — don't waste slots.
+    # Threshold is a learnable MetaParam (viable_goal_min_success, default 0.2).
+    viable_threshold = state.meta_params.viable_goal_min_success.item()
+    viable = tracker.goal_success_ema[goal_indices] > viable_threshold
     # But always try goals that haven't been tested yet (count == 0)
     untested = tracker.hypothesis_count[goal_indices] == 0
     viable = viable | untested

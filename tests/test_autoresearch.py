@@ -56,10 +56,10 @@ def test_hypothesis_generator_shapes(state):
 
     hypotheses, precisions, indices = gen(goals, progress, beliefs, active_mask, beta=0.5)
 
-    # Some may be gated out, but shapes should be consistent
-    assert hypotheses.shape[1] == state.config.belief_dim
-    assert len(precisions) == hypotheses.shape[0]
-    assert len(indices) == hypotheses.shape[0]
+    # No gate — all goals get hypotheses generated
+    assert hypotheses.shape == (3, state.config.belief_dim)
+    assert len(precisions) == 3
+    assert len(indices) == 3
 
 
 def test_hypothesis_generator_empty_goals(state):
@@ -121,10 +121,6 @@ def test_run_autoresearch_step_generates_hypotheses(state):
     """Full autoresearch step generates provisional beliefs from goals."""
     setup_state_with_goals(state)
 
-    # Force the generate gate open for testing
-    with torch.no_grad():
-        state.hypothesis_gen.generate_gate[-1].bias.fill_(5.0)
-
     n_before = state.num_active_beliefs()
     stats = run_autoresearch_step(
         state, state.hypothesis_gen, state.hypothesis_tracker,
@@ -154,10 +150,6 @@ def test_autoresearch_no_goals(state):
 def test_full_autoresearch_cycle(state):
     """Full cycle: generate hypothesis → evaluate → track outcome."""
     setup_state_with_goals(state)
-
-    # Force gate open
-    with torch.no_grad():
-        state.hypothesis_gen.generate_gate[-1].bias.fill_(5.0)
 
     # Step 1: Generate hypotheses
     stats = run_autoresearch_step(
@@ -358,10 +350,6 @@ def test_hypothesis_generator_failure_conditioning_zero_init(state):
     for p in gen.parameters():
         p.requires_grad_(False)
 
-    # Force gate open so `generate_mask` is all-True and output is deterministic.
-    with torch.no_grad():
-        gen.generate_gate[-1].bias.fill_(5.0)
-
     goals = torch.randn(3, state.config.belief_dim)
     progress = torch.tensor([0.1, 0.5, 0.9])
     # Populate some active beliefs so belief_summary has signal.
@@ -396,7 +384,6 @@ def test_hypothesis_generator_failure_conditioning_used_after_training(state):
     for p in gen.parameters():
         p.requires_grad_(False)
     with torch.no_grad():
-        gen.generate_gate[-1].bias.fill_(5.0)
         # Simulate training having learned to use the failure columns:
         # give the hypothesis_net first linear non-zero weights on the
         # failure_summary slice (indices 2D..3D).

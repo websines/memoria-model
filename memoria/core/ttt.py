@@ -403,6 +403,20 @@ class InPlaceTTT(nn.Module):
         D = self.hidden_dim
         h = hidden_pre_delta  # [B, T, D]
 
+        # ── Dead fixed-point escape ──
+        # When A=0 and B=0, gradients are exactly zero:
+        #   grad_A = grad.T @ (h @ B.T) = 0   (B=0 kills the projection)
+        #   grad_B = A.T @ (grad.T @ h) = 0   (A=0 kills the projection)
+        # This is a stable fixed point: the system cannot bootstrap.
+        # Re-inject Kaiming-scaled noise to make the zero fixed point
+        # unstable — any perturbation lets gradients flow again.
+        # init_std = sqrt(2 / (D * R)) is the Kaiming derivation for
+        # fan_in = D * R (the product A @ B has effective fan D * R).
+        if A.norm() < 1e-8 and B.norm() < 1e-8:
+            _init_std = (2.0 / (D * self.rank)) ** 0.5
+            A.normal_(0, _init_std)
+            B.normal_(0, _init_std)
+
         # ── Snapshot deltas for rollback (BEFORE decay) ──
         A_snapshot = A.detach().clone()
         B_snapshot = B.detach().clone()
