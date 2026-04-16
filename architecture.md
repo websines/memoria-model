@@ -580,7 +580,7 @@ Hopfield-style content-addressable retrieval with goal modulation:
 Precision-gated observation buffering:
 
 1. **Observation projection**: `hidden [B, T, H] → obs [B, T, D]`
-2. **Write gate**: learned sigmoid, biased closed (-2.0 init → ~12% open) — prevents state flooding
+2. **Write gate**: learned sigmoid, neutral init (0.0 → ~50% open) — learns selective gating during training
 3. **Precision head**: softplus — learned observation confidence
 4. **Batch matching**: one matmul `[N_obs, N_active]` cosine similarity against all active beliefs
 5. **WriteCandidate**: `{belief_vector, matched_slot, similarity, source_position, source_layer}`
@@ -611,10 +611,10 @@ All losses are computed inside `forward()` so the logits tensor `[B, T, vocab_si
 _uw(L, s) = L / (2·exp(2s)) + s
 L_aux = w_util·L_utility + w_surp·L_surprise + w_halt·L_halt + L_ponder + 0.01·L_jac
 L_total = _uw(L_token, σ_token) + α·_uw(L_fe, σ_fe) + α·_uw(L_aux, σ_aux)
-        + w_draft·L_draft + w_draft·L_self_correct + w_dsa_kl·L_dsa_kl
+        + w_draft·L_draft + w_dsa_kl·L_dsa_kl
 ```
 
-Draft and DSA KL losses are NOT alpha-gated — they train from step 0.
+`L_draft` already includes `oput_weight.detach() × L_self_correct` internally (via `compute_draft_loss`); `oput_weight` is detached to prevent the structurally-positive gradient `d(w·L)/dw` from monotonically driving the weight to zero. Draft and DSA KL losses are NOT alpha-gated — they train from step 0.
 
 **Pretrained mode** uses fixed weights:
 
@@ -654,7 +654,7 @@ F_B = Σ_factors U_f + Σ_beliefs (d_i − 1) · H_i
 β = H / (|E| + H + ε)
 ```
 
-High entropy (uncertain beliefs) → high β → more exploration. Low entropy (confident beliefs) → low β → more exploitation. β modulates Pass 2 operations (allocation rates, consolidation thresholds).
+where H is the Bethe entropy (KL divergence to uniform on the sphere, from `compute_bethe_free_energy`): `H(κ) = H_PS(0, D) − H_PS(κ, D) ≥ 0`. This is non-negative and zero at κ=0, unlike the raw Power Spherical entropy which inverts sign at low κ and caused β to saturate at 1.0 (perpetual exploration) when belief radii were small. High entropy (uncertain beliefs) → high β → more exploration. Low entropy (confident beliefs) → low β → more exploitation. β modulates Pass 2 operations (allocation rates, consolidation thresholds).
 
 ## Optimizer Configuration
 
@@ -676,7 +676,7 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 7 | Cognitive meta-parameters | 0.001 | Learned thresholds |
 | 8 | Telos module | 0.01 | Goal generation, progress, transitions |
 | 9 | Goal embeddings | 0.0001 | Slow like beliefs + 0.5× weight decay |
-| 10 | TTT module (init_A/B, log_step_size, decay_gate) | 0.01 | Meta-learned TTT initialization |
+| 10 | TTT module (init_A/B, log_step_size) | 0.01 | Meta-learned TTT initialization (decay_gate frozen, not in optimizer) |
 | 11 | Edge proposal network | 0.01 | Learned edge creation |
 | 12 | Edge directions (CoED) | 0.001 | 10× belief_lr — structural, not content |
 | 13 | Cognitive controller (SEAL-style) | 0.001 | 0.1× interface_lr — should be stable |
@@ -797,8 +797,8 @@ Goal system driven by RND (Random Network Distillation) surprise:
 Internalized Karpathy autoresearch loop, extended with Meta-Harness-style
 failure conditioning (arXiv:2603.28052):
 
-1. **HypothesisGenerator**: active goals → candidate beliefs (hypotheses) in goal direction. Input features are `[goal_embed, belief_summary, failure_summary, progress, beta, failure_count_norm]`. `failure_summary` is the per-goal mean of recently-failed angles retrieved from `HypothesisTracker`. The failure-conditioning weight columns of the first linear in each head (hypothesis_net, precision_head, generate_gate) are zero-initialized — a freshly-built generator behaves identically to the pre-#2 version; as training progresses it learns to push away from directions that failed for the same goal.
-2. **Generate gate**: learned, biased closed (-1.0) — prevents flooding state with bad hypotheses
+1. **HypothesisGenerator**: active goals → candidate beliefs (hypotheses) in goal direction. Input features are `[goal_embed, belief_summary, failure_summary, progress, beta, failure_count_norm]`. `failure_summary` is the per-goal mean of recently-failed angles retrieved from `HypothesisTracker`. The failure-conditioning weight columns of the first linear in each head (hypothesis_net, precision_head) are zero-initialized — a freshly-built generator behaves identically to the pre-#2 version; as training progresses it learns to push away from directions that failed for the same goal.
+2. **Viable goal filter**: `goal_success_ema > viable_goal_min_success` (learned MetaParam, sigmoid, init σ⁻¹(0.2)) — prevents flooding state with bad hypotheses. Replaced the learned generate_gate, which could never train (hypothesis_gen runs under no_grad).
 3. **Provisional allocation**: hypotheses enter as L0 beliefs with `provisional=True`
 4. **Evaluation (search/eval split)**: after the learned window (`provisional_eval_window` MetaParam), check three criteria:
    - Did global FE decrease by at least `provisional_fe_threshold` fraction?
@@ -1369,11 +1369,12 @@ TTT is the self-improvement mechanism. During BOTH training and inference:
 | Feature | Source | Description |
 |---------|--------|-------------|
 | Meta-learned initialization | TTT-E2E (arXiv:2512.23675) | Deltas start from learned warm point, not zero |
-| Titans-style decay gate | Titans (arXiv:2501.00663) | Per-layer learned adaptive forgetting. Decay applied only to the current layer's deltas (not all layers). |
+| Titans-style decay gate (disabled) | Titans (arXiv:2501.00663) | DISABLED (α=1.0 always). Gate has requires_grad=False (runs under no_grad), cannot learn — random Xavier weights produce chaotic α ∈ [0.2, 1.0] that kills deltas within ~50 steps. Loss rollback provides quality gating instead. To re-enable: move gate into forward-pass autograd graph. |
 | Large-chunk accumulation | LaCT (arXiv:2505.23884) | Per-layer accumulation counters; accumulate gradients over multiple chunks before stepping |
 | Multi-step inner loop | DeltaProduct (arXiv:2502.10297) | N smaller steps per chunk for expressiveness |
 | Surprise gating | Titans-inspired | Adaptive thresholds (mean ± 2σ) filter OOD and boring inputs |
-| Loss rollback | Quality protection | Snapshot deltas BEFORE decay; revert if loss increased (restores pre-decay state) |
+| Loss rollback | Quality protection | Snapshot deltas before update; revert if loss increased. Primary quality gate now that decay is disabled. |
+| Dead fixed-point escape | Numerical safety | When ‖A‖ + ‖B‖ < ε, re-inject Kaiming noise (std = √(2/DR)). Prevents permanent TTT death from zero-initialized checkpoint resume. |
 | Belief TTT | Memoria-specific | Update belief vectors using write path observation errors at inference |
 
 ### Read-Only Forward Passes (`update_state=False`)
