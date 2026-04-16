@@ -270,6 +270,7 @@ class CognitiveState(nn.Module):
             max_goals=config.max_goals,
             belief_dim=config.belief_dim,
             failed_buffer_depth=config.failed_buffer_depth,
+            max_beliefs=config.max_beliefs,
         )
 
         # ── LSR Strategy Bank (learned reasoning-mode perturbations) ──

@@ -204,7 +204,7 @@ class HypothesisTracker(nn.Module):
     """
 
     def __init__(self, max_goals: int, belief_dim: int,
-                 failed_buffer_depth: int):
+                 failed_buffer_depth: int, max_beliefs: int = 8192):
         super().__init__()
         self.max_goals = max_goals
         self.belief_dim = belief_dim
@@ -218,10 +218,13 @@ class HypothesisTracker(nn.Module):
         # EMA of per-goal success rate (smoothed signal)
         self.register_buffer('goal_success_ema', torch.full((max_goals,), 0.5))
 
-        # Belief → goal mapping: which goal generated which provisional belief
-        # -1 = not a hypothesis belief
-        self.register_buffer('belief_source_goal', torch.full((1,), -1, dtype=torch.long))
-        self._belief_source_goal_size = 0
+        # Belief → goal mapping: which goal generated which provisional belief.
+        # -1 = not a hypothesis belief.
+        # Allocated at full max_beliefs size to avoid lazy resizing inside
+        # rank-0-only pass2 code, which would cause DDP structural mismatch
+        # (rank 1 keeps shape (1,) while rank 0 grows to (max_beliefs,)).
+        self.register_buffer('belief_source_goal', torch.full((max_beliefs,), -1, dtype=torch.long))
+        self._belief_source_goal_size = max_beliefs
 
         # ── Failed-hypothesis log (Meta-Harness, arXiv:2603.28052) ──
         # Per-goal ring buffer of evicted belief angles. Newest write at
