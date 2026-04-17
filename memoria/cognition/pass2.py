@@ -598,6 +598,167 @@ def run_pass2(
         sp_stats = run_structural_plasticity(state, state.structural_plasticity)
         stats['structural_plasticity'] = sp_stats
 
+    # ── 13. C2: Learned belief update (MetaLearned update function) ──
+    # Blend hand-coded belief update with a learned neural update,
+    # gated by meta_params.update_fn_gate ∈ (0,1). Starts near 0 so the
+    # hand-coded rule dominates until the learned function proves itself
+    # via the SGM safety gate.
+    if (hasattr(state, 'learned_update') and state.learned_update is not None
+            and updated_indices):
+        gate = torch.sigmoid(state.meta_params.update_fn_gate).item()
+        if gate > EPSILON:
+            with torch.no_grad():
+                idx_t = torch.tensor(updated_indices, device=state.beliefs.device, dtype=torch.long)
+                beliefs_batch = state.beliefs.data[idx_t]
+                precisions = beliefs_batch.norm(dim=-1)
+                errors = torch.tensor(surprise_values, device=state.beliefs.device)
+                # Edge context: mean of connected beliefs (or zeros if no edges)
+                edge_context = torch.zeros_like(beliefs_batch)
+                if state.num_active_edges() > 0:
+                    for i, bi in enumerate(updated_indices):
+                        # Find edges touching this belief
+                        src_m = (state.edge_src == bi) & state.edge_active
+                        tgt_m = (state.edge_tgt == bi) & state.edge_active
+                        neigh = []
+                        if src_m.any():
+                            neigh.append(state.beliefs.data[state.edge_tgt[src_m]])
+                        if tgt_m.any():
+                            neigh.append(state.beliefs.data[state.edge_src[tgt_m]])
+                        if neigh:
+                            edge_context[i] = torch.cat(neigh, dim=0).mean(dim=0)
+                # Observation = belief itself as baseline (no separate obs signal in pass2)
+                observation = beliefs_batch
+                delta_learned, prec_scale_learned, _merge = state.learned_update(
+                    beliefs_batch, observation, precisions, errors, edge_context,
+                )
+                # Gated blend: new = old + gate * delta
+                state.beliefs.data[idx_t] = beliefs_batch + gate * delta_learned
+                # Precision scaling applied to radius
+                new_radii = precisions * (1.0 + gate * (prec_scale_learned - 1.0))
+                # Renormalize to new radius
+                angles = torch.nn.functional.normalize(state.beliefs.data[idx_t], dim=-1, eps=EPSILON)
+                state.beliefs.data[idx_t] = angles * new_radii.unsqueeze(-1)
+            stats['learned_update_gate'] = gate
+            stats['learned_update_applied'] = len(updated_indices)
+        else:
+            stats['learned_update_applied'] = 0
+
+    # ── 14. D1: Daemon anomaly detection ──
+    # Classify whether the current step's mean surprise is anomalous. Anomaly
+    # signals feed downstream triggers (consolidation, search, exploration).
+    if hasattr(state, 'daemon') and state.daemon is not None:
+        with torch.no_grad():
+            mean_surp = stats.get('total_surprise', 0.0) / max(stats.get('num_candidates', 1), 1)
+            # Construct prediction_error vector: active belief mean scaled by mean surprise.
+            active_mask = state.get_active_mask()
+            if active_mask.any():
+                pred_err = state.beliefs.data[active_mask].mean(dim=0) * mean_surp
+            else:
+                pred_err = torch.zeros(state.config.belief_dim, device=state.beliefs.device)
+            is_anomaly = state.daemon.detect_anomaly(pred_err, state)
+            should_consol = state.daemon.should_consolidate(state)
+        stats['daemon_anomaly'] = bool(is_anomaly)
+        stats['daemon_should_consolidate'] = bool(should_consol)
+        # Update daemon state's idle counter — any candidates this step = non-idle
+        state.daemon.daemon_state.idle_steps = (
+            state.daemon.daemon_state.idle_steps + 1 if len(candidates) == 0 else 0
+        )
+
+    # ── 15. D3: Curiosity-driven exploration ──
+    # Compute actor + critic curiosity; if combined > threshold, generate
+    # exploration goals from high-uncertainty belief regions and allocate
+    # them into empty goal slots.
+    if hasattr(state, 'curiosity') and state.curiosity is not None:
+        from ..agency.curiosity import run_curiosity_step
+        with torch.no_grad():
+            cur_stats = run_curiosity_step(state, state.curiosity)
+            goals_out = cur_stats.get('goals_generated', 0)
+            if goals_out > 0:
+                # Allocate exploration goals into empty goal slots
+                active_mask = state.get_active_mask()
+                exp_goals, exp_priors = state.curiosity.generate_exploration_goals(
+                    state,
+                    state.meta_params.curiosity_threshold,
+                    state.meta_params.curiosity_weight,
+                )
+                n_alloc = 0
+                for i in range(exp_goals.shape[0]):
+                    best_status = state.goal_status_logits.argmax(dim=-1)
+                    empty = (best_status == 0).nonzero(as_tuple=False)
+                    if len(empty) == 0:
+                        break
+                    slot = empty[0].item()
+                    state.goal_embeddings.data[slot] = exp_goals[i]
+                    init_logit = 1.0 / max(state.telos.gumbel_tau.item(), 0.1)
+                    state.goal_status_logits.data[slot].zero_()
+                    state.goal_status_logits.data[slot, 1] = init_logit
+                    state.goal_metadata.data[slot, 6] = float(current_step)
+                    n_alloc += 1
+                cur_stats['exploration_goals_allocated'] = n_alloc
+        stats['curiosity'] = cur_stats
+
+    # ── 16. D2: Action selection (EFE-based policy) ──
+    # Score every action by its Expected Free Energy. The chosen action type
+    # is a cognitive decision (not an externally-visible action during
+    # training); it biases which pass-2 operations run more aggressively
+    # next step and feeds the daemon loop with a recommended action.
+    if hasattr(state, 'action_selector') and state.action_selector is not None:
+        with torch.no_grad():
+            action_idx, action_info = state.action_selector.select_action(
+                state,
+                state.meta_params.action_temperature,
+                state.meta_params.action_risk_aversion,
+            )
+        stats['action_selected'] = action_info['action_type'].name
+        stats['action_efe'] = action_info['efe_score']
+        stats['action_pragmatic'] = action_info['pragmatic']
+        stats['action_epistemic'] = action_info['epistemic']
+        stats['action_risk'] = action_info['risk']
+
+    # ── 17. D4: Skill crystallization ──
+    # Record any successful high-advantage step's belief mean as a pattern,
+    # then periodically crystallize recurring patterns into the skill bank.
+    if (hasattr(state, 'skill_bank') and state.skill_bank is not None
+            and state.skill_detector is not None and state.skill_composer is not None):
+        from ..agency.skills import run_skill_step
+        with torch.no_grad():
+            # Reward signal: positive belief_advantage = successful step.
+            # Pass this into the detector as the pattern reward.
+            active_mask = state.get_active_mask()
+            if belief_advantage > 0 and active_mask.any():
+                pattern = state.beliefs.data[active_mask].mean(dim=0)
+                state.skill_detector.record_pattern(pattern, float(belief_advantage))
+            # Periodic crystallization — tied to consolidation timer to avoid
+            # per-step cluster-scan overhead.
+            if is_sequence_boundary:
+                skill_stats = run_skill_step(
+                    state, state.skill_bank, state.skill_detector,
+                    state.skill_composer, current_step,
+                )
+                stats['skills'] = skill_stats
+
+    # ── 18. C4: Adaptive depth — halt probabilities for belief recursion ──
+    # Compute halting probabilities for updated beliefs. The result drives
+    # the number of refinement iterations on NEXT step (stored in meta for
+    # cross-step reading); this step computes a "ponder cost" log.
+    if (hasattr(state, 'adaptive_depth') and state.adaptive_depth is not None
+            and updated_indices):
+        with torch.no_grad():
+            idx_t = torch.tensor(updated_indices, device=state.beliefs.device, dtype=torch.long)
+            beliefs_act = state.beliefs.data[idx_t]
+            uncertainties = state.belief_precision_var[idx_t]
+            # Accumulated change this step ≈ surprise magnitude
+            acc_change = torch.tensor(surprise_values, device=state.beliefs.device)
+            halt_probs = state.adaptive_depth.compute_halt_probs(
+                beliefs_act, uncertainties, iteration=0,
+                accumulated_change=acc_change,
+                halt_bias=state.meta_params.recursion_halt_bias,
+            )
+            # Mean halt probability — high means beliefs want to stop refining
+            stats['adaptive_depth_mean_halt'] = halt_probs.mean().item()
+            # Ponder signal: (1 - halt) = "more compute requested"
+            stats['adaptive_depth_ponder'] = (1.0 - halt_probs).mean().item()
+
     stats['active_beliefs'] = state.num_active_beliefs()
     stats['active_edges'] = state.num_active_edges()
 

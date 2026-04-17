@@ -85,10 +85,15 @@ class Muon(torch.optim.Optimizer):
                 if update.ndim >= 2:
                     original_shape = update.shape
                     update_2d = update.view(update.shape[0], -1) if update.ndim > 2 else update
+                    # Capture flattened dims before orthogonalization so the
+                    # aspect-ratio scale below uses (H, W*K*...) for ndim>2
+                    # tensors — not original_shape[0]/original_shape[-1], which
+                    # would drop all middle dims from the width.
+                    flat_rows, flat_cols = update_2d.shape
                     update_2d = _newton_schulz(update_2d, ns_steps)
                     update = update_2d.view(original_shape)
-                    # Scale: larger matrices get proportionally larger updates
-                    update *= max(1, update.shape[0] / update.shape[-1]) ** 0.5
+                    # Muon paper §3.2 — RMS-norm scaling by flattened aspect ratio
+                    update *= max(1, flat_rows / flat_cols) ** 0.5
 
                 p.add_(update, alpha=-lr)
 
@@ -449,6 +454,15 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
                 'weight_decay': 0.0,
             })
 
+    # 24-33. Cognitive subsystems (C1–D4). These modules have standard nn.Linear
+    # parameters that need SGD updates — without a group, their .grad is zeroed
+    # each step by the orphan-grad cleanup in train.py and they never learn.
+    # LR selection follows the existing convention:
+    #   - fast-adaptation nets (match forward path latency) → interface_lr
+    #   - slow meta/structural controllers (shouldn't oscillate) → interface_lr * 0.1
+    #   - content embedding banks → belief_lr (same as goal_embeddings)
+    _add_cognitive_subsystem_groups(param_groups, model, tc, betas)
+
     # AdamW for non-matrix params
     adamw_optimizer = torch.optim.AdamW(param_groups) if param_groups else None
 
@@ -462,7 +476,128 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     for group in optimizer.param_groups:
         group['initial_lr'] = group['lr']
 
+    _assert_optimizer_covers_model(optimizer, model)
+
     return optimizer
+
+
+def _add_cognitive_subsystem_groups(param_groups: list, model: nn.Module, tc, betas) -> None:
+    """Register the 10 cognitive subsystems (C1–D4) with the optimizer.
+
+    Each is guarded by hasattr so models instantiated without a subsystem
+    (future config variants) still produce a valid optimizer.
+    """
+    # Fast-adaptation networks — operate inside the forward path, should track
+    # model LR so their updates arrive on the same timescale as the backbone.
+    fast_subsystems = [
+        ('srwm',             'state.srwm'),
+        ('adaptive_depth',   'state.adaptive_depth'),
+        ('daemon',           'state.daemon'),
+        ('curiosity',        'state.curiosity'),
+        ('action_selector',  'state.action_selector'),
+        ('skill_composer',   'state.skill_composer'),
+        ('skill_detector',   'state.skill_detector'),
+    ]
+    for attr, _label in fast_subsystems:
+        if hasattr(model.state, attr):
+            mod = getattr(model.state, attr)
+            ps = [p for p in mod.parameters() if p.requires_grad]
+            if ps:
+                param_groups.append({
+                    'params': ps,
+                    'lr': tc.interface_lr,
+                    'betas': betas,
+                    'eps': 1e-8,
+                    'weight_decay': 0.0,
+                })
+
+    # Slow meta / structural controllers — decide consolidation and learned
+    # update rules. Oscillation here is destabilizing (they modulate the
+    # training signal for every other subsystem), so 10× slower than fast nets
+    # — same convention used for controller and sleep_gate.
+    slow_subsystems = [
+        ('learned_update',          'state.learned_update'),
+        ('structural_plasticity',   'state.structural_plasticity'),
+    ]
+    for attr, _label in slow_subsystems:
+        if hasattr(model.state, attr):
+            mod = getattr(model.state, attr)
+            ps = [p for p in mod.parameters() if p.requires_grad]
+            if ps:
+                param_groups.append({
+                    'params': ps,
+                    'lr': tc.interface_lr * 0.1,
+                    'betas': betas,
+                    'eps': 1e-8,
+                    'weight_decay': 0.0,
+                })
+
+    # Skill embedding bank — a learnable content store, same pattern as
+    # goal_embeddings: belief_lr + half weight decay.
+    if hasattr(model.state, 'skill_bank'):
+        sb = model.state.skill_bank
+        sb_params = [p for p in sb.parameters() if p.requires_grad]
+        if sb_params:
+            param_groups.append({
+                'params': sb_params,
+                'lr': tc.belief_lr,
+                'betas': (0.9, 0.999),
+                'eps': 1e-8,
+                'weight_decay': tc.weight_decay * 0.5,
+            })
+
+
+def _assert_optimizer_covers_model(optimizer, model: nn.Module) -> None:
+    """Verify every trainable parameter is in exactly one optimizer group.
+
+    Two classes of silent training bugs this catches:
+    1. Duplicate registration (HARD ERROR) — a param in two groups gets a
+       double update per step with inconsistent LR/beta. Never intentional.
+    2. Missing registration (WARNING) — a trainable param that no group
+       owns. orphan-grad cleanup zeros its .grad every step so it never
+       moves, but gradients still accumulate in the forward/backward path.
+       Usually either:
+         - the module needs to be added to setup_optimizer(), or
+         - the module is pass2-only updated and should have requires_grad=False.
+       Downgraded to a warning because the correct fix is a modeling
+       decision, not something this function can safely automate.
+    """
+    import sys
+    seen: dict[int, str] = {}
+    name_by_id = {id(p): n for n, p in model.named_parameters()}
+    for g in optimizer.param_groups:
+        for p in g['params']:
+            pid = id(p)
+            if pid in seen:
+                raise RuntimeError(
+                    f"Optimizer: parameter {name_by_id.get(pid, '<unknown>')} "
+                    f"(shape {tuple(p.shape)}) registered in multiple groups — "
+                    f"would be double-updated per step."
+                )
+            seen[pid] = name_by_id.get(pid, '<unknown>')
+    missing = [n for n, p in model.named_parameters()
+               if p.requires_grad and id(p) not in seen]
+    if missing:
+        # Cluster by top-level module so the report is scannable.
+        from collections import defaultdict
+        by_subsystem: dict[str, list[str]] = defaultdict(list)
+        for n in missing:
+            parts = n.split('.')
+            key = '.'.join(parts[:2]) if len(parts) >= 2 else parts[0]
+            by_subsystem[key].append(n)
+        print(
+            f"\n[optimizer] WARNING: {len(missing)} trainable param(s) not in "
+            f"any optimizer group — their .grad will be zeroed each step but "
+            f"they will never be updated. Subsystems:",
+            file=sys.stderr,
+        )
+        for k in sorted(by_subsystem):
+            print(f"  - {k}: {len(by_subsystem[k])} params", file=sys.stderr)
+        print(
+            "  Fix: add to setup_optimizer() (train via SGD) OR set "
+            "requires_grad=False (pass2-only updates).\n",
+            file=sys.stderr,
+        )
 
 
 class _CombinedOptimizer:
@@ -663,8 +798,13 @@ def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torc
                 'weight_decay': 0.0,
             })
 
+    # Cognitive subsystems (C1–D4) — see scratch-mode comment.
+    _add_cognitive_subsystem_groups(param_groups, model, tc, betas)
+
     optimizer = torch.optim.AdamW(param_groups)
     for group in optimizer.param_groups:
         group['initial_lr'] = group['lr']
+
+    _assert_optimizer_covers_model(optimizer, model)
 
     return optimizer

@@ -74,6 +74,12 @@ Memoria is a self-modifying architecture: the system changes its own compute gra
 | 10 | Parallel goal pursuit | Per-head goal routing in read path (MoH-style); different heads pursue different goals simultaneously | `read_path.py:GoalRouter` |
 | 11 | BLT byte encoding | Learned byte→patch compression replaces fixed tokenizer; N-gram conv replaces EngramCache hash tables | `blt.py:ByteEncoder` |
 | 12 | LSR strategy bank | Learned reasoning-mode perturbations in refinement loops; goal-conditioned selection, fitness-driven evolution, failed-strategy conditioning | `strategy_bank.py`, `memoria_model.py` |
+| 13 | Learned belief update (C2) | Neural update rule blended with hand-coded MESU via `update_fn_gate` ∈ (0,1); starts near 0, opens as the NN proves itself | `learned_update.py` |
+| 14 | Adaptive computation depth (C4) | Per-belief ACT halt network produces ponder signal used to size next-step refinement depth | `adaptive_depth.py` |
+| 15 | Daemon anomaly loop (D1) | Per-step anomaly classification from prediction error; idle/consolidation triggers for the sleep pipeline | `agency/daemon.py` |
+| 16 | Curiosity-driven exploration (D3) | Actor (output-entropy) + critic (EFE variance) curiosity; when > threshold, generates exploration goals into empty goal slots | `agency/curiosity.py` |
+| 17 | EFE-based action selection (D2) | Gumbel-Softmax over per-action (pragmatic, epistemic, risk) heads; logged every step as cognitive policy signal | `agency/action_selection.py` |
+| 18 | Skill crystallization (D4) | Pattern detector records high-reward belief snapshots; greedy clustering crystallizes recurrent patterns into a skill bank; low-utility pruning | `agency/skills.py` |
 
 **The recursive autoresearch loop.** These mechanisms don't operate independently — they form a closed loop of self-directed architectural modification:
 
@@ -691,10 +697,33 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 | 21 | Working memory prefix | 0.5 | Learnable scratchpad tokens (scalar LR) |
 | 22 | Refinement probe + gate | 0.01 / 0.5 | Halt decision (interface LR) + lifeline/loop encoding (scalar LR) |
 | 23 | Engram cache | 0.01 | N-gram hash tables, value projection, gate norms |
+| 24 | SRWM (C1) | 0.01 | Self-referential fast-weight matrix projections |
+| 25 | Adaptive depth (C4) | 0.01 | Halt net (ACT halting probe) |
+| 26 | Daemon (D1) | 0.01 | Anomaly net + event priority net |
+| 27 | Curiosity (D3) | 0.01 | Actor + critic + goal generator |
+| 28 | Action selector (D2) | 0.01 | State encoder + per-action EFE heads + action embeddings |
+| 29 | Skill composer (D4) | 0.01 | Compatibility gate |
+| 30 | Skill detector (D4) | 0.01 | Pattern encoder |
+| 31 | Learned update (C2) | 0.001 | 0.1× interface_lr — meta-learner, must be stable |
+| 32 | Structural plasticity (C3) | 0.001 | 0.1× interface_lr — split/prune nets |
+| 33 | Skill bank (D4) | 0.0001 | belief_lr + 0.5× weight_decay (content embedding bank, like goal_embeddings) |
 | — | GoalRouter (PARL per-head routing) | 0.01 | Included in group 5 (interface params) |
 | M | 2D matrix params (attention, MLP) | 0.04 | **Muon optimizer** (separate from AdamW) |
 
 Gradient clipping (`clip_grad_norm_`) is applied only to AdamW params. Muon's Newton-Schulz orthogonalization produces unit-spectral-norm updates, making pre-clip counterproductive.
+
+### Optimizer Coverage Guarantee
+
+`_assert_optimizer_covers_model(optimizer, model)` runs after every `setup_optimizer` call and enforces two invariants:
+
+1. **No parameter in two groups (HARD ERROR).** Double-registered params get two updates per step with inconsistent LR/beta state, which silently corrupts training. The check walks all group param lists and errors on the first duplicate by name.
+2. **No trainable parameter missing from any group (WARNING).** Missing params have their `.grad` zeroed every step by the orphan-grad cleanup in `train.py`, so they never move. The check prints a subsystem-grouped warning naming each orphaned module — the fix is either to add the module to `setup_optimizer()` (train via SGD) or set `requires_grad=False` (pass2-only updates).
+
+The second check is a warning (not error) because the correct fix is a modeling decision that varies per subsystem. Current coverage: **100% of trainable params across all 31 scratch-mode groups** — no orphans.
+
+### Muon Newton-Schulz Scaling (ndim > 2)
+
+The Muon optimizer's matrix-scale factor for `update.ndim > 2` tensors uses the flattened dimensions captured *before* the orthogonalization reshape. Without this, a `(H, W, K)` tensor would scale by `(H / K)^0.5` instead of the correct `(H / (W·K))^0.5`, silently mis-scaling updates for any non-2D weight that lands in the Muon group (e.g. batched attention projections, conv kernels used as linear-equivalents). The fix: capture `flat_rows, flat_cols = update_2d.shape` right after the `view(H, -1)` reshape, apply Newton-Schulz, then scale by `max(1, flat_rows / flat_cols)^0.5`. Muon paper §3.2, RMS-norm scaling.
 
 ## LR and Alpha Scheduling
 
@@ -778,6 +807,12 @@ Pass 2 runs once per step after `optimizer.step()` and `detach_state()`. All mod
 | 10 | **Planning** | At sequence boundaries | Preference/epistemic priors, causal rollouts, optional MCTS. |
 | 11 | **SRWM update** | If SRWM exists | Self-referential fast-weight matrix for meta-parameter modulation. |
 | 12 | **Structural plasticity** | At sequence boundaries | Split polysemantic beliefs, prune dead ones. |
+| 13 | **Learned belief update (C2)** | If updated beliefs + `update_fn_gate` > ε | Blend hand-coded MESU with `LearnedUpdateFunction` output — new = old + gate·delta. Gate is a learned MetaParam. |
+| 14 | **Daemon anomaly detection (D1)** | If daemon exists | `daemon.detect_anomaly(pred_err, state)` + `should_consolidate()` logged; updates idle-step counter that gates background consolidation. |
+| 15 | **Curiosity-driven exploration (D3)** | If curiosity exists | `run_curiosity_step`: compute actor + critic curiosity; if combined > threshold, `generate_exploration_goals` allocates into empty goal slots. |
+| 16 | **Action selection (D2)** | If action_selector exists | `ActionSelector.select_action(state)` — per-action EFE heads (pragmatic, epistemic, risk) → Gumbel-Softmax. Logged as cognitive policy signal. |
+| 17 | **Skill crystallization (D4)** | If skill bank exists | `skill_detector.record_pattern(belief_mean, belief_advantage)` every step; at sequence boundaries, `run_skill_step` greedy-clusters the buffer and allocates new skills. Low-utility skills pruned. |
+| 18 | **Adaptive depth probe (C4)** | If updated beliefs | `AdaptiveDepth.compute_halt_probs` over updated beliefs → per-belief halting probability (`adaptive_depth_mean_halt`) and ponder signal (`adaptive_depth_ponder`) logged for next-step refinement depth control. |
 
 ### Cognitive Subsystems (Pass 2 Detail)
 
@@ -879,6 +914,89 @@ Prevents orphaned high-precision children of corrected parents. Only causally-ob
 - **Split**: polysemantic beliefs (high activation entropy) → two children at angle ± perturbation, each with radius/√2 (energy conservation)
 - **Prune**: low frequency + low radius + learned prune_net decision → deallocate
 - **Growth pressure**: fill_ratio × (1 + surprise) — tracks capacity need
+
+#### Learned Belief Update (C2)
+
+`LearnedUpdateFunction` is a small MLP that maps `(belief, observation, precision, prediction_error, edge_context)` → `(delta_belief, precision_scale, merge_signal)`. It replaces the hand-coded Kalman-gain update rule with a learned function that can represent arbitrary update dynamics.
+
+**Gated blend** (`update_fn_gate`, learned sigmoid MetaParam, init ≈ 0.1):
+```
+new_belief = old_belief + gate · delta_learned
+new_radius = old_radius · (1 + gate · (precision_scale - 1))
+```
+
+Starts near 0 (hand-coded dominates) and learns to open as the NN proves itself via the SGM safety gate. Zero-init `delta_head` means the learned update starts as a no-op — safe by construction.
+
+**Integration**: pass2 section 13, runs on every `updated_indices` belief. Edge context is computed as the mean of connected beliefs (per-belief) to give the net a structural view. Runs under `torch.no_grad()` — gradient training of the net requires routing its outputs back into a loss (future work).
+
+Reference: ACL — Metalearning Continual Learning Algorithms (arXiv:2312.00276); OPEN (arXiv:2407.07082).
+
+#### Adaptive Computation Depth (C4)
+
+`AdaptiveDepth.halt_net` computes per-belief halting probabilities from `(belief, uncertainty, iteration_encoding, accumulated_change)`. Output ∈ (0, 1) per belief; the ponder signal `(1 - halt)` measures how much additional compute each belief is requesting.
+
+**Integration**: pass2 section 18. Per-belief halt probabilities and their mean (`adaptive_depth_mean_halt`, `adaptive_depth_ponder`) are logged. The ponder signal is available as a cross-step feature that the next step's refinement loops can read to size their iteration count. This complements the forward-path `RefinementRouter` (per-position gating) — AdaptiveDepth operates at the belief-store level, RefinementRouter at the hidden-state level.
+
+**ACT mathematics**: Each belief accumulates halting probability across iterations (Graves 2016). Once accumulated ≥ 1 − halt_threshold, the belief "halts" and its contribution is fixed at that iteration's output. Remaining probability drives the ponder cost (learned via `recursion_depth_penalty` MetaParam).
+
+Reference: Mixture-of-Recursions (arXiv:2507.10524); Adaptive Computation Time (Graves 2016); Universal Transformers.
+
+#### Daemon Loop (D1)
+
+`DaemonLoop` implements the Active Inference cycle: PERCEIVE → UPDATE → PLAN → ACT → OBSERVE → CONSOLIDATE. In training, the daemon's role is simplified to two functions:
+
+1. **Anomaly classification** — `detect_anomaly(prediction_error, state)` feeds a `[direction, magnitude, β]` feature vector through `anomaly_net` → sigmoid probability. Anomalies trigger downstream `ActionType.SEARCH` or escalated consolidation.
+2. **Consolidation gating** — `should_consolidate(state)` returns True when idle for > `idle_consolidation_interval` steps OR when `β > 0.8 AND no active goals` OR when belief fill > 90%. This is the signal the sleep pipeline reads to decide whether to run.
+
+**Persistent state** — `DaemonState` tracks idle steps, total actions, event history, and a pending-event queue. In training, `idle_steps` increments when no write candidates arrive and resets when they do; this approximates the "agent is being prompted vs sitting quiet" distinction that matters at deployment.
+
+**Event priority scoring** — `priority_net` (4-dim event features → softplus priority) is wired but dormant during training because no external event source exists; it activates at deployment when user messages and tool results arrive as `Event` objects.
+
+Reference: From Pixels to Planning (Friston, arXiv:2407.20292); Autonomous Deep Agent (arXiv:2502.07056); MAP Modular Planner (Nature Comms 2025).
+
+#### Curiosity Module (D3)
+
+Two curiosity signals, combined into a single exploration drive:
+
+1. **Actor-side curiosity** — `actor_net(mean_active_belief)` → expected output entropy (softplus). High = model is in novel territory, output distribution is uncertain.
+2. **Critic-side curiosity** — `critic_net(mean_belief, efe_var, efe_range, efe_mean, n_actions)` → variance of EFE across candidate actions. High = model is uncertain about *what to do*.
+
+Both are normalized by running EMA (decay 0.95) so the threshold is stable across training. Combined signal: `curiosity_weight · (actor + critic) / 2`.
+
+**Exploration goal generation** — when combined > `curiosity_threshold`, `generate_exploration_goals` picks the top-K highest-variance beliefs and feeds `(belief, variance, curiosity)` through `goal_generator` → K goal embeddings. Priorities are proportional to variance, scaled by curiosity weight. The goals are allocated into empty goal slots using the same machinery as `Telos.generate_goals`, giving the system a second source of goals driven by intrinsic uncertainty rather than surprise.
+
+**Integration**: pass2 section 15. `run_curiosity_step` is called every step; exploration goals are only allocated when curiosity fires.
+
+Reference: CDE (arXiv:2509.09675); IMAGINE (arXiv:2505.17621); CD-RLHF (arXiv:2501.11463).
+
+#### Action Selector (D2)
+
+`ActionSelector` scores each of 6 cognitive actions — `{RESPOND, TOOL_CALL, SEARCH, WAIT, EXPLORE, CONSOLIDATE}` — by predicting its Expected Free Energy components via per-action heads:
+```
+EFE(a) = -pragmatic(a) + w_epistemic · epistemic(a) + w_risk · action_risk_aversion · risk(a)
+```
+
+Actions with lower EFE are better (free energy is minimized). Selection uses Gumbel-Softmax with temperature from MetaParams. Each action has a learnable 64-dim `action_embedding` that combines with the state encoding before feeding the per-action EFE head.
+
+**State features** (belief_dim + 8): mean active belief vector concatenated with fill ratios, β, surprise, mean precision variance, provisional presence, and consolidation timer. This gives the selector a full "situation report" on each decision.
+
+**Integration**: pass2 section 16. Runs every step; the selected action type is logged alongside its EFE components (pragmatic, epistemic, risk) and the full distribution over actions. During training the selection is a learned policy signal — it doesn't drive external behavior because there's no external action surface, but the EFE components provide a dense supervisory signal about the cognitive state's reasoning posture.
+
+Reference: CDE (arXiv:2509.09675); Deep Active Inference for Long Horizons (arXiv:2505.19867).
+
+#### Skill Crystallization (D4)
+
+Three coordinated modules implementing procedural memory as composable belief-space patterns:
+
+1. **`SkillDetector`** — circular buffer of 256 recent successful patterns + greedy clustering. When the detector finds `≥ detection_threshold` patterns within `similarity_threshold` cosine distance, their weighted centroid (weighted by reward) becomes a candidate skill.
+2. **`SkillBank`** — `[max_skills, belief_dim]` parameter bank with per-skill utility tracking (EMA of FE improvement), use count, and creation/last-used timestamps. Low-utility skills are pruned when `utility < prune_threshold AND use_count > 10 AND age > 100`.
+3. **`SkillComposer`** — learned compatibility gate (sigmoid MLP over concatenated skill pair) gates pairwise additive composition: `composed = skill_a + compat · skill_b`. Sequential composition reduces any skill list to a single vector.
+
+**Integration**: pass2 section 17. The reward signal for pattern recording is `belief_advantage` (positive = step was successful). Crystallization runs at sequence boundaries. The composer is wired but dormant during training — composition requires a downstream consumer (future work: skill-blended goals).
+
+**Why skills are distinct from beliefs.** Beliefs are *what is*, skills are *what worked*. Beliefs live in the read path (retrieved by content similarity); skills live in the action loop (selected by utility). Skills survive consolidation that prunes the beliefs they originated from — the procedural abstraction outlives the specific episodes that trained it.
+
+Reference: SkillRL (arXiv:2602.08234); AutoSkill (arXiv:2603.01145); DUSDi disentangled skills (arXiv:2410.11251).
 
 #### Edge Proposal
 
@@ -1045,7 +1163,11 @@ Design principle: **~45% of training data genuinely requires persistent cross-co
 
 ### Data Loading
 
-Synchronous loading on rank 0, broadcast to other ranks. Background prefetcher was removed due to fsspec async HTTP client crashes in background threads. GPU idles ~50-100ms between steps for cached data. Stream resumption on checkpoint reload uses HuggingFace `skip()` for O(1) seek past consumed data. Dead curated sources re-roll from alive sources (not redirected to FineWeb).
+Rank 0 fetches a **global batch of size `device_batch_size × world_size`** via a subprocess-based `DataPrefetcher` (subprocess, not thread — fsspec's async HTTP client crashes in background threads). The batch is truncated to `min(ctx_len, sequence_len)` (SkyLadder) and then `torch.distributed.scatter` distributes distinct `device_batch_size` slices to each rank. This is **real data parallelism**: each GPU sees a different data slice, DDP's gradient averaging reduces variance across the world, and the effective batch reported at startup (`grad_accum × device_batch_size × world_size`) matches what actually trains.
+
+A prior implementation broadcast rank 0's small batch to all ranks — all GPUs saw identical data, DDP's all-reduce operated on identical gradients, and the effective batch was silently smaller than reported by a factor of `world_size`. The scatter path fixes this while keeping rank 0 as the only process that talks to HuggingFace (avoiding N concurrent fsspec asyncio loops).
+
+GPU idles ~50-100ms between steps for cached data. Stream resumption on checkpoint reload uses HuggingFace `skip()` for O(1) seek past consumed data. Dead curated sources re-roll from alive sources (not redirected to FineWeb).
 
 #### Infinite-generator invariant
 
@@ -1071,6 +1193,7 @@ Uses HuggingFace Accelerate with `find_unused_parameters=True` (cognitive state 
 | Component | Sync Mechanism |
 |-----------|---------------|
 | Transformer + interface params | DDP gradient averaging (automatic) |
+| Input data (rank 0 → per-rank slice) | `torch.distributed.scatter` on `input_ids` and `labels`. Rank 0 fetches a global batch (`device_batch_size × world_size`), truncates to `T = min(ctx_len, sequence_len)`, chunks along batch dim, and scatters. Non-main ranks pre-allocate `[device_batch_size, T]` receive buffers. Determinism across ranks is preserved because `T` is derived from shared config + the per-step `ctx_len`, which all ranks compute identically from `get_context_length(step, total_steps, config, sequence_len)`. |
 | Cognitive state (beliefs, edges, goals, all buffers + params + all submodule state) | `broadcast_state()` in `training/distributed.py` — recursively walks ALL `state.named_buffers()` and `state.named_parameters()` in sorted order from rank 0 every step. Two fingerprint checks bracket the broadcast: (1) **structural** — `all_reduce(MAX/MIN)` over a SHA-256 hash of `(name, shape, dtype)` per tensor, runs BEFORE any broadcast so cross-rank structural drift raises a clear error instead of hanging mid-broadcast; (2) **content** — `all_reduce(MAX/MIN)` over a float64 sum of every tensor, runs AFTER the broadcast so any future code path that mutates state between syncs on only some ranks is caught at the next step instead of silently training rank-divergent behaviour. Bracketed by `dist.barrier()` on both sides. At small-config this syncs ~300 tensors per step (a prior top-level-only implementation missed ~270 tensors inside submodules like `state.telos`, `state.controller`, `state.safety_gate`, `state.srwm`, which drifted silently and contributed to NCCL BROADCAST watchdog timeouts). |
 | Data stream priming (rank 0, pre-warmup) | Rank 0 calls `next(data_stream)` **once before DDP warmup**, prepending the result back via `itertools.chain([first], data_stream)` so no data is wasted. The first `next()` triggers lazy HF stream construction, FineWeb file resolution, and fills a 131 072-byte packing buffer — seconds to minutes of pure-Python network I/O on rank 0. If this work ran inside the training loop, rank 1 would already be blocked at `torch.distributed.broadcast(input_ids, src=0)` and its NCCL watchdog would count the rank-0 stall as a collective timeout. Priming here means rank 1 is idle in pure Python (no NCCL op pending) during the stall and only enqueues its first collective at the subsequent DDP warmup barrier, where the 30-minute timeout above gives a safety margin. Diagnosed from a run where rank 1 hit a watchdog on a `BROADCAST NumelIn=512` — 512 being the `skyladder_start` context length, which unambiguously identified the step-0 data broadcast (not a state sync) as the stuck collective. |
 | DDP compile warmup | Before the real training loop starts, `training/train.py` runs a single dummy forward+backward (with `update_state=False`) on every rank inside explicit `torch.distributed.barrier()` bookends. Purpose: force `torch.compile` to trace and compile on all ranks in lockstep so the first real training step has a warm reducer and no first-compile skew. First-compile skew is a classic NCCL-timeout cause: one rank hits the compile cache and races ahead while another is still compiling, and their subsequent collective sequences desync. |
@@ -1558,6 +1681,12 @@ At 1M tokens with W=128K, D=128: ~38 MB MLA KV vs ~3 GB uncompressed.
 | Belief advantage | belief_advantage (with-state vs without-state loss delta) |
 | Provisional beliefs | provisional_count, promoted, evicted |
 | Autoresearch | hypotheses_generated, success_rate |
+| Learned update (C2) | learned_update_gate, learned_update_applied |
+| Adaptive depth (C4) | adaptive_depth_mean_halt, adaptive_depth_ponder |
+| Daemon (D1) | daemon_anomaly, daemon_should_consolidate |
+| Curiosity (D3) | actor_curiosity, critic_curiosity, combined_curiosity, exploration_goals_allocated |
+| Action selector (D2) | action_selected, action_efe, action_pragmatic, action_epistemic, action_risk |
+| Skill bank (D4) | skills_detected, skills_crystallized, skills_pruned, total_active_skills |
 
 ### Alerts
 
@@ -1609,8 +1738,8 @@ model.state.load_state_cognitive(torch.load("user_state.pt"))
 
 ```
 memoria/training/
-  train.py          — Main training loop, DataPrefetcher, checkpoint, hub push
-  optimizer.py      — Muon + AdamW setup, 18 parameter groups, _CombinedOptimizer
+  train.py          — Main training loop, DataPrefetcher (global batch fetch + scatter), checkpoint, sync hub push on final step
+  optimizer.py      — Muon + AdamW setup, 31 parameter groups (scratch) incl. all 10 cognitive subsystems, _CombinedOptimizer, coverage assert (duplicate=error, missing=warning), ndim>2 Newton-Schulz scaling fix
   schedule.py       — LR (WSD) + alpha (KL annealing) + context length (SkyLadder) schedules
   distributed.py    — Cognitive state broadcast/gather for multi-GPU
   cognitive_seed.py  — Cross-run belief transfer via content matching
@@ -1645,7 +1774,7 @@ memoria/core/
   meta_params.py     — 72 learned MetaParams replacing hardcoded constants (sigmoid/softplus constrained, incl. huber_delta, PARL, DFlash streak/entropy)
 
 memoria/cognition/
-  pass2.py           — Pass 2 orchestrator (12 structural operations)
+  pass2.py           — Pass 2 orchestrator (19 structural operations incl. newly wired C2/C4 and D1-D4 subsystems)
   surprise.py        — Prediction error × precision, MESU-modulated Kalman gain
   belief_update.py   — Slot allocation, eviction
   consolidation.py   — Soft merge (cosine > threshold), hard cleanup, L0→L1 promotion
@@ -1659,6 +1788,14 @@ memoria/cognition/
   cascade_revision.py — BFS precision decay through causal edges after reconsolidation
   cognitive_controller.py — SEAL-style RL policy (PPO + SAC entropy), 5 continuous actions
   structural_plasticity.py — Polysemantic splitting (activation entropy), dead belief pruning
+  learned_update.py  — C2: LearnedUpdateFunction (meta-learned belief update blended with hand-coded MESU via update_fn_gate)
+  adaptive_depth.py  — C4: AdaptiveDepth halt net + ACTController (per-belief halting probabilities, ponder signal)
+
+memoria/agency/
+  daemon.py          — D1: DaemonLoop (perceive/update/plan/act/observe/consolidate), anomaly detection, idle-driven consolidation
+  action_selection.py — D2: ActionSelector (EFE-based per-action policy, Gumbel-Softmax over RESPOND/TOOL_CALL/SEARCH/WAIT/EXPLORE/CONSOLIDATE)
+  curiosity.py       — D3: CuriosityModule (actor + critic curiosity, exploration goal generation)
+  skills.py          — D4: SkillBank + SkillDetector + SkillComposer (procedural memory as composable belief-space patterns)
 
 memoria/data/
   curated.py         — Multi-tier dataset mix (45% state-essential)

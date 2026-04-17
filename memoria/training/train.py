@@ -41,7 +41,6 @@ from .distributed import (
     sanitize_state_nan,
 )
 from ..interface.write_path import pack_candidates, unpack_candidates
-from ..cognition.meta_learning import compute_beta  # noqa: F401 — used transitively via pass2
 from .cognitive_seed import save_cognitive_seed
 from . import nan_debug
 
@@ -534,8 +533,14 @@ def train(
     # The worker process creates its own curated_stream and puts batches onto a
     # multiprocessing.Queue, overlapping data loading with GPU compute.
     if is_main:
+        # In DDP, rank 0 fetches a full global batch (device_batch_size * world_size)
+        # and scatters distinct slices to each rank — true data parallelism.
+        # Previously we broadcast a rank-0-sized batch to all ranks (every GPU
+        # saw identical data), which made DDP's gradient averaging an all-reduce
+        # of identical tensors and silently shrank the effective batch by
+        # world_size× relative to what grad_accum accounting reports.
         prefetcher = DataPrefetcher(
-            batch_size=tc.device_batch_size,
+            batch_size=tc.device_batch_size * world_size,
             device=device,
             seq_len=config.transformer.sequence_len,
             synthetic_data=synthetic_data if synthetic_data else None,
@@ -543,7 +548,8 @@ def train(
             skip_documents=skip_docs,
             prefetch_count=3,
         )
-        print("Data stream ready (process-based prefetcher, queue depth 3)")
+        print(f"Data stream ready (process-based prefetcher, queue depth 3, "
+              f"global batch {tc.device_batch_size * world_size})")
     else:
         prefetcher = None
 
@@ -678,22 +684,34 @@ def train(
             if step == 0 and is_main:
                 print(f"\r  micro-batch {micro_step+1}/{grad_accum}...", end="", flush=True)
 
-            # Rank 0 fetches pre-loaded batches from the prefetcher process,
-            # other ranks allocate empty tensors to receive the broadcast.
+            # Rank 0 fetches a global batch ([device_batch_size * world_size, T])
+            # and scatters distinct slices to each rank. Other ranks allocate
+            # receive buffers of their per-rank shape.
+            # T is deterministic across ranks: prefetcher always yields
+            # sequence_len-long sequences, SkyLadder truncates to ctx_len,
+            # so T = min(ctx_len, sequence_len) on every rank.
+            T_local = min(ctx_len, config.transformer.sequence_len)
             if is_main:
                 input_ids, labels = prefetcher.next_batch()
-                # SkyLadder: truncate to current context length
-                if ctx_len < input_ids.shape[1]:
-                    input_ids = input_ids[:, :ctx_len].contiguous()
-                    labels = labels[:, :ctx_len].contiguous()
-            else:
-                input_ids = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
-                labels = torch.zeros(tc.device_batch_size, ctx_len, dtype=torch.long, device=device)
+                if T_local < input_ids.shape[1]:
+                    input_ids = input_ids[:, :T_local].contiguous()
+                    labels = labels[:, :T_local].contiguous()
 
-            # Broadcast data from rank 0 to all ranks
             if world_size > 1:
-                torch.distributed.broadcast(input_ids, src=0)
-                torch.distributed.broadcast(labels, src=0)
+                local_ids = torch.empty(
+                    tc.device_batch_size, T_local,
+                    dtype=torch.long, device=device,
+                )
+                local_labels = torch.empty_like(local_ids)
+                if is_main:
+                    ids_chunks = [c.contiguous() for c in input_ids.chunk(world_size, dim=0)]
+                    labels_chunks = [c.contiguous() for c in labels.chunk(world_size, dim=0)]
+                    torch.distributed.scatter(local_ids, ids_chunks, src=0)
+                    torch.distributed.scatter(local_labels, labels_chunks, src=0)
+                else:
+                    torch.distributed.scatter(local_ids, src=0)
+                    torch.distributed.scatter(local_labels, src=0)
+                input_ids, labels = local_ids, local_labels
 
             # DDP no_sync for all but last micro-step
             is_last_micro = (micro_step == grad_accum - 1)
@@ -1153,6 +1171,9 @@ def train(
         # Save cognitive seed for next run
         save_cognitive_seed(base_model.state, ckpt_path / "cognitive_seed.pt")
         if push_to_hub:
+            # Final push runs synchronously — the daemon thread used for
+            # periodic pushes gets killed when the main process exits, which
+            # can truncate the last upload.
             _push_to_hub_async(base_model, step, ckpt_path, hf_repo, hf_token, is_final=True)
 
     if log_to_wandb:
@@ -1216,7 +1237,12 @@ def save_checkpoint(model, optimizer, step: int, path: Path,
 
 
 def _push_to_hub_async(model, step: int, ckpt_path: Path, repo_id: str, token: str, is_final: bool = False):
-    """Push checkpoint to HuggingFace Hub in a background thread."""
+    """Push checkpoint to HuggingFace Hub.
+
+    Periodic pushes run in a daemon thread (overlapped with training).
+    Final push runs synchronously — the daemon thread would be killed at
+    process exit, truncating the upload.
+    """
     # Snapshot state summary on main thread before spawning — avoids racing
     # with pass 2 which concurrently mutates model.state
     summary = {
@@ -1260,5 +1286,8 @@ def _push_to_hub_async(model, step: int, ckpt_path: Path, repo_id: str, token: s
         except Exception as e:
             print(f"\n  WARNING: Hub push failed: {e}")
 
-    thread = threading.Thread(target=_upload, daemon=True)
-    thread.start()
+    if is_final:
+        _upload()
+    else:
+        thread = threading.Thread(target=_upload, daemon=True)
+        thread.start()
