@@ -179,6 +179,31 @@ def _load_env():
         pass
 
 
+def _patch_rmsnorm_autocast():
+    """Make nn.RMSNorm cast its fp32 weight to the input's bf16 dtype inside forward.
+
+    Accelerate bf16 autocast casts activations but leaves nn.RMSNorm.weight in fp32
+    (optimizer state lives there). F.rms_norm's fused kernel requires matching
+    dtypes — otherwise it falls off to an unfused path and prints
+    "Cannot dispatch to fused implementation" every forward. Patch the forward
+    method once per process so the weight is cast on the fly without touching
+    the stored fp32 param.
+    """
+    import torch.nn as _nn
+    import torch.nn.functional as _F
+    if getattr(_nn.RMSNorm, "_memoria_autocast_patched", False):
+        return
+
+    def _forward_autocast(self, x):
+        w = self.weight
+        if w is not None and w.dtype != x.dtype:
+            w = w.to(x.dtype)
+        return _F.rms_norm(x, self.normalized_shape, w, self.eps)
+
+    _nn.RMSNorm.forward = _forward_autocast
+    _nn.RMSNorm._memoria_autocast_patched = True
+
+
 def _configure_hf_hub():
     """Configure HF Hub for rate-limit survival.
 
@@ -250,6 +275,7 @@ def train(
     """
     _load_env()
     _configure_hf_hub()
+    _patch_rmsnorm_autocast()
     tc = config.training
 
     # ── Accelerate setup ──
@@ -1042,6 +1068,13 @@ def train(
                     eval_batch = next(eval_data_stream)
                     eval_ids = eval_batch['input_ids'].unsqueeze(0).to(device)
                     eval_labels = eval_batch['labels'].unsqueeze(0).to(device)
+                    # Truncate to the current SkyLadder context length — the
+                    # eval stream yields full sequence_len sequences regardless
+                    # of training progress, so without this the probe explodes
+                    # DSA's sparse gather the moment alpha > 0 (see _run_eval).
+                    if ctx_len > 0 and ctx_len < eval_ids.shape[1]:
+                        eval_ids = eval_ids[:, :ctx_len].contiguous()
+                        eval_labels = eval_labels[:, :ctx_len].contiguous()
                     # update_state=False makes both passes truly read-only so
                     # the "without" baseline isn't measured on state that the
                     # "with" pass just mutated. Without this gate, the
@@ -1084,7 +1117,7 @@ def train(
 
         # Periodic eval
         if is_main and step > 0 and step % tc.eval_interval == 0:
-            eval_ppl = _run_eval(base_model, eval_data_stream, device)
+            eval_ppl = _run_eval(base_model, eval_data_stream, device, ctx_len)
             print(f"\n  [eval] step {step}: perplexity = {eval_ppl:.2f}")
             if log_to_wandb:
                 wandb.log({'eval_perplexity': eval_ppl, 'step': step})
@@ -1130,7 +1163,7 @@ def train(
     return base_model
 
 
-def _run_eval(model, eval_stream, device, n_batches: int = 20) -> float:
+def _run_eval(model, eval_stream, device, ctx_len: int, n_batches: int = 20) -> float:
     """Quick eval: compute perplexity on held-out FineWeb samples.
 
     Uses a persistent eval stream so each call evaluates on fresh data
@@ -1140,6 +1173,11 @@ def _run_eval(model, eval_stream, device, n_batches: int = 20) -> float:
     TTT/belief updates would contaminate the cognitive state every eval step
     AND the reported perplexity would reflect the model's state mid-mutation
     rather than its actual "current" state at this training step.
+
+    ctx_len: truncate each sample to this many positions. Must match the
+    current SkyLadder context length — otherwise eval runs at full
+    sequence_len while training is still at short context, and DSA's
+    sparse-KV gather explodes (B × T × top_k × H × D — scales with T).
     """
     model.eval()
     total_loss = 0.0
@@ -1148,6 +1186,9 @@ def _run_eval(model, eval_stream, device, n_batches: int = 20) -> float:
             batch = next(eval_stream)
             input_ids = batch['input_ids'].unsqueeze(0).to(device)
             labels = batch['labels'].unsqueeze(0).to(device)
+            if ctx_len > 0 and ctx_len < input_ids.shape[1]:
+                input_ids = input_ids[:, :ctx_len].contiguous()
+                labels = labels[:, :ctx_len].contiguous()
             result = model(input_ids, targets=labels, alpha=0.0, update_state=False)
             total_loss += result['loss_token'].item()
     model.train()
