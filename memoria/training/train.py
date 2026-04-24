@@ -34,7 +34,7 @@ from ..data.tokenizer import get_tokenizer
 from ..data.curated import curated_stream
 from ..data.streaming import stream_fineweb_edu
 from ..data.synthetic import generate_all_synthetic
-from .optimizer import setup_optimizer
+from .optimizer import setup_optimizer, assert_gradient_reachability
 from .schedule import get_lr_multiplier, get_alpha, get_context_length
 from .distributed import (
     broadcast_state, gather_candidates, gather_read_indices, sync_ranks,
@@ -626,14 +626,28 @@ def train(
             )
             dummy_labels = torch.zeros_like(dummy_ids)
             # update_state=False keeps the warmup read-only (no TTT / belief
-            # mutation), so we don't need the allow_mutation context manager
-            # and we don't contaminate the initial cognitive state.
-            with torch.autograd.graph.allow_mutation_on_saved_tensors():
-                warmup_result = model(
-                    dummy_ids, targets=dummy_labels, alpha=0.0, update_state=False,
+            # mutation), so we don't need the allow_mutation_on_saved_tensors
+            # context manager — there are no in-place mutations on saved
+            # tensors when state writes are gated off.
+            warmup_result = model(
+                dummy_ids, targets=dummy_labels, alpha=0.0, update_state=False,
+            )
+            warmup_loss = warmup_result['loss']
+            accelerator.backward(warmup_loss)
+            # Gradient-reachability audit: every optimizer param should have
+            # a non-None .grad after this warmup backward. If any are still
+            # None, their forward call site runs under torch.no_grad() and
+            # they will never train. Must run BEFORE zero_grad().
+            if is_main:
+                _reach = assert_gradient_reachability(
+                    optimizer, base_model, post_backward=True,
                 )
-                warmup_loss = warmup_result['loss']
-                accelerator.backward(warmup_loss)
+                n_unreach = len(_reach['unreachable'])
+                n_reach = len(_reach['reachable'])
+                print(
+                    f"DDP warmup: gradient reachability — "
+                    f"{n_reach} reachable, {n_unreach} unreachable"
+                )
             optimizer.zero_grad(set_to_none=True)
             del warmup_result, warmup_loss, dummy_ids, dummy_labels
             if is_main:
@@ -679,6 +693,11 @@ def train(
         total_loss_fe = 0.0
         last_jac_loss = 0.0
         last_deq_steps = 0
+
+        # Per-microbatch NaN tracking — the loop-level NaN scan only sees the
+        # LAST micro-batch's result dict, so earlier-microbatch component NaNs
+        # go undetected unless we track them here as they occur.
+        micro_nan_components: set[str] = set()
 
         for micro_step in range(grad_accum):
             if step == 0 and is_main:
@@ -758,19 +777,23 @@ def train(
             all_candidates.extend(result['candidates'])
             all_read_indices.extend(result.get('read_indices', []))
 
+            # Per-microbatch NaN detection — polluted components must be
+            # recorded here (before the next micro-batch overwrites `result`).
+            # Previously the post-loop scan only saw the last micro-batch's
+            # dict and missed NaNs produced earlier in the accumulation window.
+            for _lname in ('loss_token', 'loss_fe', 'loss_fe_proxy',
+                           'loss_fe_bethe', 'loss_surprise', 'loss_halt',
+                           'loss_jac'):
+                _v = result.get(_lname)
+                if _v is not None and isinstance(_v, torch.Tensor):
+                    if torch.isnan(_v).any() or torch.isinf(_v).any():
+                        micro_nan_components.add(_lname)
+
         if step == 0 and is_main:
             print(f"\r  Step 0 complete.{' ' * 30}", flush=True)
 
-        # NaN/Inf detection BEFORE optimizer step — skip step to avoid
-        # contaminating optimizer momentum/variance with NaN gradients
-        nan_components = []
-        for lname in ['loss_token', 'loss_fe', 'loss_fe_proxy', 'loss_fe_bethe',
-                      'loss_surprise', 'loss_halt', 'loss_jac']:
-            val = result.get(lname)
-            if val is not None and isinstance(val, torch.Tensor):
-                if torch.isnan(val).any() or torch.isinf(val).any():
-                    nan_components.append(lname)
-                    result[lname] = torch.tensor(0.0, device=val.device)
+        # Aggregate per-microbatch NaN flags + total-loss check.
+        nan_components = sorted(micro_nan_components)
         skip_step = len(nan_components) > 0 or math.isnan(total_loss)
         if nan_components and is_main:
             print(f"\n  WARNING: NaN/Inf in {nan_components} at step {step}, skipping optimizer step")
@@ -882,6 +905,62 @@ def train(
                 'active_goals': 0, 'total_surprise': 0.0,
             }
 
+        # ── Pass-2 side-loss backward ──
+        # During pass2, each previously-frozen cognitive subsystem records
+        # (prediction, target) pairs under autograd. state.compute_pass2_side_loss()
+        # aggregates them into a single scalar loss whose backward trains:
+        #   daemon.anomaly_net (BCE vs observed surprise threshold)
+        #   curiosity.actor_net/critic_net (MSE vs observed entropy/variance)
+        #   edge_proposal.proposal_net (BCE vs observed edge survival)
+        #   action_selector.state_encoder/efe_heads/action_embeddings (MSE vs Δ(FE))
+        #   structural_plasticity.split_net/prune_net (REINFORCE vs FE delta)
+        #   hypothesis_gen.hypothesis_net/precision_head (BCE vs promoted flag)
+        #   srwm.key_proj/value_proj/query_proj/output_proj (MSE vs surprise-delta sign)
+        #
+        # Rank-0-only, like the controller backward: all these parameters
+        # are in the DDP ignore list (_ignore_fqns), so a rank-0 backward
+        # does not desync the DDP reducer. Clips and skips on non-finite
+        # gradients following the controller pattern.
+        if is_main:
+            side_loss = base_model.state.compute_pass2_side_loss()
+            if (torch.is_tensor(side_loss)
+                    and side_loss.requires_grad
+                    and torch.isfinite(side_loss)
+                    and side_loss.item() != 0.0):
+                side_loss.backward()
+                if tc.grad_clip_norm > 0:
+                    _side_params = [
+                        p for n, p in base_model.state.named_parameters()
+                        if p.grad is not None
+                    ]
+                    if _side_params:
+                        _snorm = torch.nn.utils.clip_grad_norm_(
+                            _side_params, tc.grad_clip_norm,
+                        )
+                        if not torch.isfinite(_snorm):
+                            for _p in _side_params:
+                                _p.grad = None
+                            if log_to_wandb:
+                                import wandb
+                                wandb.log({
+                                    'pass2_side/nonfinite_grad_skipped': 1,
+                                    'step': step,
+                                })
+                        else:
+                            optimizer.step()
+                            if log_to_wandb:
+                                import wandb
+                                wandb.log({
+                                    'pass2_side/loss': float(side_loss.item()),
+                                    'pass2_side/grad_norm': float(_snorm.item()),
+                                    'step': step,
+                                })
+                    else:
+                        optimizer.step()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
         # Sanitize NaN/Inf in cognitive state before broadcast.
         # pass2 writes to hundreds of buffers/parameters across submodules
         # (beliefs, edges, variances, controller history, strategy fitness, ...).
@@ -894,8 +973,13 @@ def train(
 
         sync_ranks(world_size)
 
-        # Track data consumption for checkpoint resume
-        samples_consumed += grad_accum * tc.device_batch_size
+        # Track data consumption for checkpoint resume.
+        # Rank 0's prefetcher produces GLOBAL batches of size
+        # device_batch_size * world_size per micro-step (train.py:543). The
+        # consumption counter must include that world_size factor or DDP
+        # resume will re-read (world_size - 1)/world_size of the window
+        # already trained on.
+        samples_consumed += grad_accum * tc.device_batch_size * world_size
 
         # Timing
         t1 = time.time()
@@ -1070,47 +1154,64 @@ def train(
                     wait_duration=300,
                 )
 
-        # Belief advantage evaluation: with-state vs without-state loss delta
-        # Measures whether the cognitive state is actually helping predictions.
-        # Averaged over 8 held-out samples to reduce variance — this signal drives
-        # the controller's REINFORCE reward, so noise here propagates everywhere.
-        # Runs at eval_interval / 5 (derived from config, not hardcoded)
+        # Belief (state) advantage evaluation: true with-state vs without-state.
+        #
+        # Correctness requirement: the baseline must genuinely not use the
+        # cognitive state. Previously this compared α=α vs α=0 but kept state
+        # interfaces wired in both passes, so it actually measured the
+        # contribution of the L_fe auxiliary loss weighting — NOT whether
+        # retrieved beliefs helped next-token prediction. That invalid signal
+        # then flowed into the controller's PPO reward.
+        #
+        # Fix: pass bypass_state=True to forward() in the baseline pass. This
+        # skips every interface call, every refinement loop, and every TTT
+        # delta application, so the baseline is the raw transformer.
+        #
+        # Also batched: 8 samples stacked into one forward pass instead of 8
+        # serial batch=1 forwards — typically the single most expensive step
+        # in the training loop when it fired.
         belief_eval_interval = max(1, tc.eval_interval // 5)
         n_belief_eval_samples = 8
         if is_main and step > 0 and step % belief_eval_interval == 0 and alpha > 0:
             base_model.eval()
             with torch.no_grad():
-                total_with = 0.0
-                total_without = 0.0
+                # Collect a batch
+                eval_ids_list: list[torch.Tensor] = []
+                eval_labels_list: list[torch.Tensor] = []
                 for _ in range(n_belief_eval_samples):
                     eval_batch = next(eval_data_stream)
-                    eval_ids = eval_batch['input_ids'].unsqueeze(0).to(device)
-                    eval_labels = eval_batch['labels'].unsqueeze(0).to(device)
-                    # Truncate to the current SkyLadder context length — the
-                    # eval stream yields full sequence_len sequences regardless
-                    # of training progress, so without this the probe explodes
-                    # DSA's sparse gather the moment alpha > 0 (see _run_eval).
-                    if ctx_len > 0 and ctx_len < eval_ids.shape[1]:
-                        eval_ids = eval_ids[:, :ctx_len].contiguous()
-                        eval_labels = eval_labels[:, :ctx_len].contiguous()
-                    # update_state=False makes both passes truly read-only so
-                    # the "without" baseline isn't measured on state that the
-                    # "with" pass just mutated. Without this gate, the
-                    # belief-advantage signal is definitionally invalid.
-                    result_with = base_model(
-                        eval_ids, targets=eval_labels, alpha=alpha, update_state=False,
-                    )
-                    total_with += result_with['loss_token'].item()
-                    result_without = base_model(
-                        eval_ids, targets=eval_labels, alpha=0.0, update_state=False,
-                    )
-                    total_without += result_without['loss_token'].item()
-                loss_with = total_with / n_belief_eval_samples
-                loss_without = total_without / n_belief_eval_samples
+                    eval_ids_list.append(eval_batch['input_ids'].to(device))
+                    eval_labels_list.append(eval_batch['labels'].to(device))
+                eval_ids = torch.stack(eval_ids_list, dim=0)
+                eval_labels = torch.stack(eval_labels_list, dim=0)
+                # Truncate to the current SkyLadder context length — the
+                # eval stream yields full sequence_len sequences regardless
+                # of training progress, so without this the probe explodes
+                # DSA's sparse gather the moment alpha > 0 (see _run_eval).
+                if ctx_len > 0 and ctx_len < eval_ids.shape[1]:
+                    eval_ids = eval_ids[:, :ctx_len].contiguous()
+                    eval_labels = eval_labels[:, :ctx_len].contiguous()
+                # With state: full cognitive stack active, but read-only.
+                result_with = base_model(
+                    eval_ids, targets=eval_labels, alpha=alpha, update_state=False,
+                )
+                # Without state: bypass interfaces, refinement, and TTT entirely.
+                result_without = base_model(
+                    eval_ids, targets=eval_labels, alpha=0.0, update_state=False,
+                    bypass_state=True,
+                )
+                loss_with = result_with['loss_token'].item()
+                loss_without = result_without['loss_token'].item()
             base_model.train()
-            belief_advantage = loss_without - loss_with  # positive = beliefs help
-            ba_decay = 0.95  # EMA decay — matches controller's reward_ema_decay convention
-            belief_advantage_ema = ba_decay * belief_advantage_ema + (1 - ba_decay) * belief_advantage
+            belief_advantage = loss_without - loss_with  # positive = state helps
+            # EMA decay sourced from controller's reward_ema_decay (MetaParam-
+            # derived). Accessing it here keeps the two EMAs consistent without
+            # introducing a second magic number.
+            ba_decay = float(base_model.state.controller.reward_ema_decay)
+            belief_advantage_ema = (
+                ba_decay * belief_advantage_ema
+                + (1 - ba_decay) * belief_advantage
+            )
             if log_to_wandb:
                 import wandb
                 wandb.log({
@@ -1126,11 +1227,48 @@ def train(
         # is_main-gated). This no longer needs no_sync because controller params
         # are in _ddp_params_and_buffers_to_ignore — DDP doesn't manage them at
         # all, so a rank-0-only backward cannot desync the reducer.
+        #
+        # Gating on `!= 0.0` (not `> 0`) because PPO+value+entropy losses are
+        # signed — negative losses are legitimate policy updates in the
+        # descent direction. Also gate on finiteness to avoid poisoning
+        # optimizer momentum when reward normalization degenerates (e.g.,
+        # constant rewards → std≈0 → normalized advantages blow up).
+        #
+        # Gradient clipping: REINFORCE/PPO have heavy-tailed gradients when
+        # an outlier reward propagates through the log-prob term. The main
+        # step's clip_grad_norm_ happened before this backward, so we clip
+        # again scoped to the controller's own parameters.
         if is_main and step > 0 and step % belief_eval_interval == 0:
             controller_loss = base_model.state.controller.compute_loss()
-            if controller_loss.item() > 0:
+            if (controller_loss.item() != 0.0
+                    and torch.isfinite(controller_loss)):
                 controller_loss.backward()
-                optimizer.step()
+                if tc.grad_clip_norm > 0:
+                    _ctrl_params = [
+                        p for p in base_model.state.controller.parameters()
+                        if p.grad is not None
+                    ]
+                    if _ctrl_params:
+                        _cnorm = torch.nn.utils.clip_grad_norm_(
+                            _ctrl_params, tc.grad_clip_norm,
+                        )
+                        if not torch.isfinite(_cnorm):
+                            # Non-finite gradient → skip controller step and
+                            # zero its grads so the next backward starts clean.
+                            for _p in _ctrl_params:
+                                _p.grad = None
+                            if log_to_wandb:
+                                import wandb
+                                wandb.log({
+                                    'controller/nonfinite_grad_skipped': 1,
+                                    'step': step,
+                                })
+                        else:
+                            optimizer.step()
+                    else:
+                        optimizer.step()
+                else:
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
         # Periodic eval
@@ -1199,21 +1337,33 @@ def _run_eval(model, eval_stream, device, ctx_len: int, n_batches: int = 20) -> 
     current SkyLadder context length — otherwise eval runs at full
     sequence_len while training is still at short context, and DSA's
     sparse-KV gather explodes (B × T × top_k × H × D — scales with T).
+
+    n_batches samples are stacked into one forward pass instead of being run
+    serially at batch=1, which is a measurable fraction of step time on long
+    context. Loss is averaged across the batch automatically by chunked_CE.
+    The 20.0 overflow cap below is the maximum log-perplexity reported
+    (exp(20) ≈ 485M — any larger number is almost certainly NaN pollution,
+    not a meaningful measurement).
     """
     model.eval()
-    total_loss = 0.0
     with torch.no_grad():
+        ids_list: list[torch.Tensor] = []
+        labels_list: list[torch.Tensor] = []
         for _ in range(n_batches):
             batch = next(eval_stream)
-            input_ids = batch['input_ids'].unsqueeze(0).to(device)
-            labels = batch['labels'].unsqueeze(0).to(device)
-            if ctx_len > 0 and ctx_len < input_ids.shape[1]:
-                input_ids = input_ids[:, :ctx_len].contiguous()
-                labels = labels[:, :ctx_len].contiguous()
-            result = model(input_ids, targets=labels, alpha=0.0, update_state=False)
-            total_loss += result['loss_token'].item()
+            ids_list.append(batch['input_ids'].to(device))
+            labels_list.append(batch['labels'].to(device))
+        input_ids = torch.stack(ids_list, dim=0)
+        labels = torch.stack(labels_list, dim=0)
+        if ctx_len > 0 and ctx_len < input_ids.shape[1]:
+            input_ids = input_ids[:, :ctx_len].contiguous()
+            labels = labels[:, :ctx_len].contiguous()
+        result = model(input_ids, targets=labels, alpha=0.0, update_state=False)
+        mean_loss = result['loss_token'].item()
     model.train()
-    return math.exp(min(total_loss / n_batches, 20.0))  # cap to avoid overflow
+    # Log-ppl overflow cap: exp(20) ≈ 485M. Anything beyond that is noise, not
+    # a meaningful metric — cap to keep the wandb axis readable.
+    return math.exp(min(mean_loss, 20.0))
 
 
 def save_checkpoint(model, optimizer, step: int, path: Path,
@@ -1244,13 +1394,15 @@ def _push_to_hub_async(model, step: int, ckpt_path: Path, repo_id: str, token: s
     process exit, truncating the upload.
     """
     # Snapshot state summary on main thread before spawning — avoids racing
-    # with pass 2 which concurrently mutates model.state
+    # with pass 2 which concurrently mutates model.state. state.beta is a
+    # property-backed .item() view over state.meta[0]; safe to call here
+    # because we're still on the main thread.
     summary = {
         'step': step,
         'active_beliefs': model.state.num_active_beliefs(),
         'active_edges': model.state.num_active_edges(),
         'active_goals': model.state.num_active_goals(),
-        'beta': model.state.beta,
+        'beta': float(model.state.beta),
     }
 
     def _upload():

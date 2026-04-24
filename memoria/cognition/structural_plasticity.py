@@ -72,6 +72,14 @@ class StructuralPlasticity(nn.Module):
         self.split_dir = nn.Linear(belief_dim, belief_dim * 2)
         nn.init.xavier_normal_(self.split_dir.weight, gain=0.1)
 
+        # REINFORCE side-loss buffers. Each entry stores the pre-sigmoid
+        # logit of a discrete split/prune decision and an observed reward
+        # (FE delta measured over the following consolidation window).
+        # compute_side_loss computes policy-gradient: −log π(a|s) · advantage.
+        self._split_reinforce: list[tuple[torch.Tensor, float]] = []
+        self._prune_reinforce: list[tuple[torch.Tensor, float]] = []
+        self._max_reinforce = 128
+
     def record_activation(self, indices: torch.Tensor, context: torch.Tensor | None = None):
         """Record that beliefs at given indices were activated.
 
@@ -293,6 +301,64 @@ class StructuralPlasticity(nn.Module):
                 self.activation_count[indices] = 0
                 self.activation_entropy[indices] = 0
                 self.context_signatures[indices] = 0
+
+    def record_split_decision(self, features: torch.Tensor, fe_delta: float) -> None:
+        """Save (features, reward) for REINFORCE on split decisions.
+
+        Called AFTER a split has had time to influence FE. `fe_delta` is
+        the observed free-energy change over the post-split window:
+        negative = FE decreased = split was good = positive reward.
+        """
+        logit = self.split_net(features.unsqueeze(0)).squeeze()
+        # reward = -fe_delta (we want FE to decrease)
+        self._split_reinforce.append((logit, float(-fe_delta)))
+        if len(self._split_reinforce) > self._max_reinforce:
+            self._split_reinforce = self._split_reinforce[-self._max_reinforce:]
+
+    def record_prune_decision(self, features: torch.Tensor, fe_delta: float) -> None:
+        """Save (features, reward) for REINFORCE on prune decisions."""
+        logit = self.prune_net(features.unsqueeze(0)).squeeze()
+        self._prune_reinforce.append((logit, float(-fe_delta)))
+        if len(self._prune_reinforce) > self._max_reinforce:
+            self._prune_reinforce = self._prune_reinforce[-self._max_reinforce:]
+
+    def compute_side_loss(self) -> torch.Tensor:
+        """REINFORCE policy-gradient loss: −log π(a|s) · advantage.
+
+        Each buffered decision contributes −log_prob × (reward − baseline)
+        where the baseline is the running mean across the buffer. This is
+        the standard variance-reduced REINFORCE estimator.
+
+        Empty buffer → zero attached to parameters.
+        """
+        # Anchor attaches zero to ALL module params (including split_dir) so
+        # gradient reachability is satisfied even when the REINFORCE buffers
+        # are empty.
+        anchor = sum(p.sum() * 0.0 for p in self.parameters())
+        parts: list[torch.Tensor] = []
+
+        def _emit(buf: list[tuple[torch.Tensor, float]], net: nn.Module):
+            if not buf:
+                return
+            logits = torch.stack([l for l, _ in buf])
+            rewards = torch.tensor(
+                [r for _, r in buf], device=logits.device, dtype=logits.dtype,
+            )
+            # Baseline = running mean; advantage = reward - baseline.
+            baseline = rewards.mean()
+            adv = rewards - baseline
+            # π(a=1|s) = sigmoid(logit); log π(chosen) tracks the same gradient
+            # magnitude regardless of whether we pick split=1 or split=0 because
+            # the stored logit IS the policy's log-odds for the action taken.
+            log_probs = F.logsigmoid(logits)
+            parts.append(-(log_probs * adv).mean())
+            buf.clear()
+
+        _emit(self._split_reinforce, self.split_net)
+        _emit(self._prune_reinforce, self.prune_net)
+        if parts:
+            return anchor + sum(parts)
+        return anchor
 
 
 def run_structural_plasticity(

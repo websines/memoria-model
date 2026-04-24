@@ -550,9 +550,11 @@ def _add_cognitive_subsystem_groups(param_groups: list, model: nn.Module, tc, be
 def _assert_optimizer_covers_model(optimizer, model: nn.Module) -> None:
     """Verify every trainable parameter is in exactly one optimizer group.
 
-    Two classes of silent training bugs this catches:
+    Three classes of silent training bugs this catches:
+
     1. Duplicate registration (HARD ERROR) — a param in two groups gets a
        double update per step with inconsistent LR/beta. Never intentional.
+
     2. Missing registration (WARNING) — a trainable param that no group
        owns. orphan-grad cleanup zeros its .grad every step so it never
        moves, but gradients still accumulate in the forward/backward path.
@@ -561,6 +563,13 @@ def _assert_optimizer_covers_model(optimizer, model: nn.Module) -> None:
          - the module is pass2-only updated and should have requires_grad=False.
        Downgraded to a warning because the correct fix is a modeling
        decision, not something this function can safely automate.
+
+    Note: a THIRD silent bug class — "param in optimizer but never reachable
+    under autograd because its forward runs under no_grad" — is NOT detected
+    here (it requires a live training step). The companion function
+    `assert_gradient_reachability()` detects it at startup by running a
+    synthetic forward under autograd and flagging any optimizer param whose
+    .grad stays None. Call that separately, after prepare() + warmup.
     """
     import sys
     seen: dict[int, str] = {}
@@ -598,6 +607,82 @@ def _assert_optimizer_covers_model(optimizer, model: nn.Module) -> None:
             "requires_grad=False (pass2-only updates).\n",
             file=sys.stderr,
         )
+
+
+def assert_gradient_reachability(
+    optimizer,
+    model: nn.Module,
+    post_backward: bool = True,
+) -> dict:
+    """Runtime check: every optimizer param saw a non-None .grad.
+
+    Call this AFTER the first real training backward pass. Any param that
+    was registered in a group but whose .grad is still None is unreachable
+    under autograd (usually because its forward call site is wrapped in
+    torch.no_grad()). Such params exist as dead weight — AdamW skips them,
+    they stay at their init values forever, and the subsystem they belong
+    to runs as a deterministic function of random init.
+
+    This is the third silent-bug class that `_assert_optimizer_covers_model`
+    does NOT catch because it requires a live step to detect.
+
+    Args:
+        optimizer: the configured optimizer (_CombinedOptimizer or AdamW)
+        model: the top-level model
+        post_backward: if True, assumes a backward just completed so .grad
+            has been set for reachable params. Call right before the
+            corresponding zero_grad().
+
+    Returns:
+        dict with keys:
+          'reachable':  list of (name, shape) for params with non-None .grad
+          'unreachable': list of (name, shape) for params with None .grad
+          'unreachable_by_subsystem': {top_level_module: count}
+    """
+    import sys
+    from collections import defaultdict
+
+    name_by_id = {id(p): n for n, p in model.named_parameters()}
+    reachable: list[tuple[str, tuple]] = []
+    unreachable: list[tuple[str, tuple]] = []
+    for g in optimizer.param_groups:
+        for p in g['params']:
+            pid = id(p)
+            name = name_by_id.get(pid, '<unknown>')
+            shape = tuple(p.shape)
+            if p.grad is None:
+                unreachable.append((name, shape))
+            else:
+                reachable.append((name, shape))
+
+    by_subsystem: dict[str, int] = defaultdict(int)
+    for name, _ in unreachable:
+        parts = name.split('.')
+        key = '.'.join(parts[:2]) if len(parts) >= 2 else parts[0]
+        by_subsystem[key] += 1
+
+    if unreachable and post_backward:
+        print(
+            f"\n[optimizer] WARNING: {len(unreachable)} optimizer param(s) "
+            f"have None grad after backward — forward call site likely runs "
+            f"under torch.no_grad(). These params will never update:",
+            file=sys.stderr,
+        )
+        for k in sorted(by_subsystem):
+            print(f"  - {k}: {by_subsystem[k]} params", file=sys.stderr)
+        print(
+            "  Fix options: (a) remove no_grad() if gradient path was intended, "
+            "(b) add a dedicated compute_loss() + backward for that module "
+            "(see CognitiveController pattern), or (c) set requires_grad=False "
+            "and remove the group to honestly document the module as frozen.\n",
+            file=sys.stderr,
+        )
+
+    return {
+        'reachable': reachable,
+        'unreachable': unreachable,
+        'unreachable_by_subsystem': dict(by_subsystem),
+    }
 
 
 class _CombinedOptimizer:

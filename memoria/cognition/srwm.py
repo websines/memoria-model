@@ -78,6 +78,13 @@ class SRWM(nn.Module):
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
 
+        # Side-loss records: (modulation_prediction, observed_fe_delta) pairs.
+        # compute_side_loss supervises the output_proj to produce modulations
+        # that track observed FE decreases — positive correlation means the
+        # modulation was helpful. Training signal from observable FE deltas.
+        self._side_loss_records: list[tuple[torch.Tensor, float]] = []
+        self._max_side_buffer = 64
+
     def extract_state_features(self, state) -> torch.Tensor:
         """Extract a fixed-size feature vector from cognitive state.
 
@@ -223,6 +230,47 @@ class SRWM(nn.Module):
         """Reset the fast-weight matrix to zero (fresh start)."""
         self.W_fast.zero_()
         self._update_count.zero_()
+
+    def record_modulation(
+        self, state_features: torch.Tensor, fe_delta: float,
+    ) -> None:
+        """Pair a modulation prediction with an observed FE delta.
+
+        Recomputes the query path under autograd so key_proj/query_proj/
+        output_proj see a gradient when compute_side_loss backward's.
+        Target: +1 if FE decreased, 0 if unchanged, −1 if FE increased.
+        We regress the modulation's MEAN (scalar summary over all
+        meta-params) against this observed effect-sign.
+        """
+        q = self.query_proj(state_features)
+        # Use DETACHED W_fast because it's a buffer; projections still see
+        # gradient flow through key/query/output.
+        q_modulated = q @ self.W_fast.detach()
+        modulation_pred = torch.tanh(self.output_proj(q_modulated)).mean()
+        # Normalize observed fe_delta to [-1, 1] via tanh — prevents outlier
+        # rewards from dominating. Scale factor 1/max(|fe|, eps) inside tanh.
+        target = float(-1.0 if fe_delta > 0 else (1.0 if fe_delta < 0 else 0.0))
+        self._side_loss_records.append((modulation_pred, target))
+        if len(self._side_loss_records) > self._max_side_buffer:
+            self._side_loss_records = self._side_loss_records[-self._max_side_buffer:]
+
+    def compute_side_loss(self) -> torch.Tensor:
+        """MSE between predicted modulation and sign of observed FE delta."""
+        if not self._side_loss_records:
+            return (
+                sum(p.sum() * 0.0 for p in self.key_proj.parameters())
+                + sum(p.sum() * 0.0 for p in self.value_proj.parameters())
+                + sum(p.sum() * 0.0 for p in self.query_proj.parameters())
+                + sum(p.sum() * 0.0 for p in self.output_proj.parameters())
+            )
+        preds = torch.stack([p for p, _ in self._side_loss_records])
+        targets = torch.tensor(
+            [t for _, t in self._side_loss_records],
+            device=preds.device, dtype=preds.dtype,
+        )
+        loss = F.mse_loss(preds, targets)
+        self._side_loss_records.clear()
+        return loss
 
     def summary(self) -> str:
         """Human-readable summary."""

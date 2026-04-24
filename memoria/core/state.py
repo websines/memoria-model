@@ -755,6 +755,90 @@ class CognitiveState(nn.Module):
     def match_threshold(self) -> float:
         return self.meta.data[5].item()
 
+    # ── Pass-2 Side Loss Aggregator ──────────────────────────────────────
+    # Collects the self-supervised prediction losses emitted by the previously
+    # frozen cognitive subsystems (daemon, curiosity, edge_proposal,
+    # action_selector, structural_plasticity, hypothesis_gen, srwm). Each
+    # subsystem maintains its own (prediction, target) buffer during pass2
+    # and exposes `compute_side_loss()` returning a differentiable scalar;
+    # this method sums them with MetaParam-weighted coefficients.
+    #
+    # Gradient safety: each subsystem's compute_side_loss MUST touch its own
+    # parameters via a zero-attached term when its buffer is empty, so the
+    # returned tensor is always attached to the autograd graph. Pass-2 runs
+    # on rank 0 only; these params are in the DDP ignore list, so a rank-0
+    # backward does not desync the reducer.
+
+    def compute_pass2_side_loss(self) -> torch.Tensor:
+        """Aggregate side losses from all trainable cognitive subsystems.
+
+        Returns a scalar tensor suitable for .backward() on rank 0. Every
+        registered subsystem contributes through its compute_side_loss()
+        method; subsystems without a loss method (or not initialized) are
+        simply skipped.
+
+        Weights are learned via MetaParams.*_loss_weight so the aggregate
+        coefficient on each term is adaptive — no hardcoded magic numbers.
+        """
+        device = self.beliefs.device
+        total = torch.zeros(1, device=device).squeeze()
+
+        mp = self.meta_params
+
+        # Daemon — BCE on anomaly-detection predictions.
+        if hasattr(self, 'daemon') and self.daemon is not None:
+            try:
+                total = total + mp.daemon_anomaly_loss_weight * self.daemon.compute_side_loss()
+            except AttributeError:
+                pass  # module pre-dates compute_side_loss — no-op, surfaced by reachability check
+
+        # Curiosity — MSE on actor/critic predictions.
+        if hasattr(self, 'curiosity') and self.curiosity is not None:
+            try:
+                total = total + self.curiosity.compute_side_loss(
+                    actor_weight=mp.curiosity_actor_loss_weight,
+                    critic_weight=mp.curiosity_critic_loss_weight,
+                )
+            except AttributeError:
+                pass
+
+        # Edge proposer — BCE on "will this edge survive decay/get reinforced?"
+        if hasattr(self, 'edge_proposal') and self.edge_proposal is not None:
+            try:
+                total = total + mp.edge_proposal_loss_weight * self.edge_proposal.compute_side_loss()
+            except AttributeError:
+                pass
+
+        # Action selector — MSE on predicted vs observed EFE components.
+        if hasattr(self, 'action_selector') and self.action_selector is not None:
+            try:
+                total = total + mp.action_selector_loss_weight * self.action_selector.compute_side_loss()
+            except AttributeError:
+                pass
+
+        # Structural plasticity — REINFORCE on split/prune decisions.
+        if hasattr(self, 'structural_plasticity') and self.structural_plasticity is not None:
+            try:
+                total = total + mp.plasticity_reinforce_weight * self.structural_plasticity.compute_side_loss()
+            except AttributeError:
+                pass
+
+        # Hypothesis generator — CE on promoted/evicted outcomes.
+        if hasattr(self, 'hypothesis_gen') and self.hypothesis_gen is not None:
+            try:
+                total = total + mp.hypothesis_gen_loss_weight * self.hypothesis_gen.compute_side_loss()
+            except AttributeError:
+                pass
+
+        # SRWM — stability regularizer on fast-weight matrix.
+        if hasattr(self, 'srwm') and self.srwm is not None:
+            try:
+                total = total + mp.srwm_loss_weight * self.srwm.compute_side_loss()
+            except AttributeError:
+                pass
+
+        return total
+
     # ── Serialization ──
 
     def state_dict_cognitive(self, compress: bool = True) -> dict:

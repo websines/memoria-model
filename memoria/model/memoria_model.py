@@ -497,6 +497,7 @@ class MemoriaModel(nn.Module):
         alpha: float = 0.0,
         update_state: bool = True,
         attn_mask: Tensor | None = None,
+        bypass_state: bool = False,
     ) -> dict:
         """Forward pass through transformer + state interfaces + loss computation.
 
@@ -524,10 +525,20 @@ class MemoriaModel(nn.Module):
                 "live self-improvement at both training and inference" property.
                 Set to False for measurement passes (eval, belief-advantage
                 probe) where mutation would contaminate the comparison.
+            bypass_state: if True, skip ALL state interface calls and all
+                refinement loops, giving a true "backbone-only" forward. This
+                is used for the state-advantage probe so the "without-state"
+                baseline is genuinely without state, instead of "with state
+                interfaces wired but α=0 for L_fe weighting" (which only
+                isolates the auxiliary loss, not the cognitive state itself).
+                Implies update_state=False — nothing to update when bypassed.
 
         Returns:
             dict with scalars + candidates (no large tensors to avoid DDP OOM)
         """
+        if bypass_state:
+            # Bypass implies read-only — nothing to mutate when state is skipped.
+            update_state = False
         # Gate write-path state mutations on update_state. Touches every
         # recursive write inside the read/write paths (e.g.,
         # `state.touch_beliefs` called from read_path.py), not just the
@@ -645,7 +656,11 @@ class MemoriaModel(nn.Module):
 
             # Insert state interface after designated blocks
             # Interface layers process ONLY real token positions (not working memory suffix)
-            if interface_idx < len(self.interfaces) and i == self.interface_positions[interface_idx]:
+            # bypass_state=True skips the interface entirely so we get a
+            # genuine backbone-only forward for advantage measurement.
+            if (not bypass_state
+                    and interface_idx < len(self.interfaces)
+                    and i == self.interface_positions[interface_idx]):
                 if M > 0:
                     x_tokens = x[:, :T, :]
                     x_tokens, candidates, utility_logits, read_indices, attn_w, retrieved, obs_v = \
@@ -667,8 +682,10 @@ class MemoriaModel(nn.Module):
                 ttt_ctx.record_utility(interface_idx, i, utility_logits)
                 interface_idx += 1
 
-            # In-Place TTT: apply persistent fast-weight delta
-            if self.ttt.is_ttt_layer(i):
+            # In-Place TTT: apply persistent fast-weight delta.
+            # TTT fast-weights are part of the cognitive stack; bypass them so
+            # the advantage baseline isolates the transformer+embeddings only.
+            if self.ttt.is_ttt_layer(i) and not bypass_state:
                 ttt_ctx.save_pre_delta(i, x)
                 x = self.ttt.apply_delta(layer_idx=i, hidden=x)
 
@@ -697,7 +714,9 @@ class MemoriaModel(nn.Module):
         mean_gate_value = 1.0  # tracking for diagnostics
         retrieval_skips = 0  # count of error-gated retrieval skips
         strategy_step_weights = None  # accumulated strategy selection weights
-        if self.max_refinement_loops > 0:
+        # Refinement loops re-query the cognitive state and apply TTT updates,
+        # so they are skipped under bypass_state for a clean backbone baseline.
+        if self.max_refinement_loops > 0 and not bypass_state:
             # Re-run the last interface_every blocks (the final "cycle").
             # For 12 layers, interface_every=4: re-run blocks [8, 9, 10, 11].
             n_upper = self.config.transformer.interface_every

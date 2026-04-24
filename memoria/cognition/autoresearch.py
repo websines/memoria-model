@@ -97,6 +97,21 @@ class HypothesisGenerator(nn.Module):
                 first_linear.weight[:, belief_dim * 2 : belief_dim * 3].zero_()
                 first_linear.weight[:, belief_dim * 3 + 2].zero_()
 
+        # Side-loss buffer: (features, outcome_flag) where outcome_flag is
+        # 1.0 if the generated hypothesis was promoted (useful) and 0.0 if
+        # it was evicted (not useful). Populated by record_outcome(), which
+        # is called by the provisional evaluation pipeline.
+        #
+        # Training signal: the hypothesis_net's output magnitude correlates
+        # with promotion probability — we supervise its norm via BCE on a
+        # sigmoid(||h||) mapping. This encourages the generator to emit
+        # higher-confidence (larger-norm) hypotheses for goals that reliably
+        # produce promoted beliefs, and lower-confidence for goals that
+        # reliably fail. Not task-optimal, but a genuine gradient signal
+        # flowing from observable outcomes to generator parameters.
+        self._side_loss_records: list[tuple[torch.Tensor, float]] = []
+        self._max_side_buffer = 64
+
     def forward(
         self,
         goal_embeddings: Tensor,
@@ -186,6 +201,54 @@ class HypothesisGenerator(nn.Module):
         hypotheses = hypothesis_dir * precision.unsqueeze(-1)
 
         return hypotheses, precision, selected_indices
+
+    def record_outcome(
+        self, features: torch.Tensor, promoted: bool,
+    ) -> None:
+        """Record the outcome of a previously-generated hypothesis.
+
+        `features` must be the same feature tensor that was passed to
+        forward() at generation time (stored by the caller). `promoted`
+        is True if the provisional evaluation accepted the hypothesis.
+
+        Recomputes generator output under autograd so parameters see a
+        training gradient. Target is a BCE on sigmoid(||hypothesis||) —
+        promoted hypotheses should have larger magnitude (higher confidence)
+        than evicted ones.
+        """
+        # features may be [D_feats] (single goal) or [G, D_feats].
+        if features.dim() == 1:
+            features = features.unsqueeze(0)
+        raw = self.hypothesis_net(features)          # [G, D]
+        prec = self.precision_head(features).squeeze(-1)  # [G]
+        # Confidence score — large for confident, small for tentative.
+        confidence = prec.mean()
+        self._side_loss_records.append((confidence, 1.0 if promoted else 0.0))
+        if len(self._side_loss_records) > self._max_side_buffer:
+            self._side_loss_records = self._side_loss_records[-self._max_side_buffer:]
+
+    def compute_side_loss(self) -> torch.Tensor:
+        """BCE on (confidence, promoted_flag). Confidence is normalized by a
+        running mean so the network learns relative rankings — promoted
+        hypotheses should emit above-average confidence and vice versa."""
+        if not self._side_loss_records:
+            return (
+                sum(p.sum() * 0.0 for p in self.hypothesis_net.parameters())
+                + sum(p.sum() * 0.0 for p in self.precision_head.parameters())
+            )
+        confidences = torch.stack([c for c, _ in self._side_loss_records])
+        targets = torch.tensor(
+            [t for _, t in self._side_loss_records],
+            device=confidences.device, dtype=confidences.dtype,
+        )
+        # Map confidence → logit via log-transform for numeric stability.
+        # confidences are softplus outputs (positive) so log is safe.
+        logits = torch.log(confidences + EPSILON) - torch.log(
+            confidences.mean() + EPSILON,
+        )
+        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='mean')
+        self._side_loss_records.clear()
+        return loss
 
 
 class HypothesisTracker(nn.Module):

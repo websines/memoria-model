@@ -76,6 +76,14 @@ class CuriosityModule(nn.Module):
         self.register_buffer('_critic_ema', torch.tensor(1.0))
         self.register_buffer('_ema_decay', torch.tensor(0.95))
 
+        # Side-loss buffers for self-supervised training. Each entry is a
+        # (predicted_tensor, target_value) pair with the predicted tensor
+        # retained in the autograd graph so compute_side_loss() can flow
+        # gradient back to actor_net / critic_net parameters.
+        self._actor_pairs: list[tuple[torch.Tensor, float]] = []
+        self._critic_pairs: list[tuple[torch.Tensor, float]] = []
+        self._max_pairs = 64  # bounded — we only need a few steps of signal
+
     def compute_actor_curiosity(self, beliefs: torch.Tensor) -> torch.Tensor:
         """Compute actor-side curiosity: expected output entropy.
 
@@ -181,6 +189,96 @@ class CuriosityModule(nn.Module):
         actor = self.compute_actor_curiosity(beliefs)
         critic = self.compute_critic_curiosity(beliefs, efe_scores)
         return curiosity_weight * (actor + critic) / 2.0
+
+    def record_actor_prediction(
+        self, beliefs: torch.Tensor, observed_entropy: float,
+    ) -> None:
+        """Save (prediction, target) pair for actor_net self-supervision.
+
+        The prediction is recomputed under autograd so parameters see a
+        gradient. The target is the actual output entropy measured this
+        step (caller's responsibility to supply — typically the mean
+        cross-entropy loss on the current batch, which equals H(p, target)
+        and upper-bounds the predictive entropy H(p)).
+        """
+        if beliefs.shape[0] == 0:
+            return
+        mean_belief = beliefs.mean(dim=0)
+        pred = self.actor_net(mean_belief.unsqueeze(0)).squeeze()
+        self._actor_pairs.append((pred, float(observed_entropy)))
+        if len(self._actor_pairs) > self._max_pairs:
+            self._actor_pairs = self._actor_pairs[-self._max_pairs:]
+
+    def record_critic_prediction(
+        self,
+        beliefs: torch.Tensor,
+        efe_scores: torch.Tensor,
+    ) -> None:
+        """Save (prediction, target) pair for critic_net self-supervision.
+
+        The target is the *actual* EFE-score variance (observable this
+        step). The critic is trained to predict it from belief features.
+        """
+        if beliefs.shape[0] == 0 or efe_scores is None or efe_scores.numel() < 2:
+            return
+        mean_belief = beliefs.mean(dim=0)
+        device = beliefs.device
+        target_var = efe_scores.var().detach()
+        # Recompute features identical to compute_critic_curiosity
+        efe_range = efe_scores.max() - efe_scores.min()
+        efe_mean = efe_scores.mean()
+        n_actions = torch.tensor(float(len(efe_scores)), device=device)
+        features = torch.cat([
+            mean_belief,
+            efe_scores.var().unsqueeze(0),
+            efe_range.unsqueeze(0),
+            efe_mean.unsqueeze(0),
+            n_actions.unsqueeze(0),
+        ])
+        pred = self.critic_net(features.unsqueeze(0)).squeeze()
+        self._critic_pairs.append((pred, float(target_var.item())))
+        if len(self._critic_pairs) > self._max_pairs:
+            self._critic_pairs = self._critic_pairs[-self._max_pairs:]
+
+    def compute_side_loss(
+        self,
+        actor_weight: torch.Tensor,
+        critic_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Aggregate actor + critic self-supervised MSE losses.
+
+        Returns a differentiable scalar whose backward trains actor_net and
+        critic_net parameters. Empty buffers → zero attached to the
+        modules' parameters (so .backward() is safe).
+        """
+        device = next(self.actor_net.parameters()).device
+
+        # Always include an attached-zero over ALL module parameters (including
+        # goal_generator) so gradient reachability is satisfied for every
+        # registered param regardless of which buffer has content this step.
+        anchor = sum(p.sum() * 0.0 for p in self.parameters())
+
+        if self._actor_pairs:
+            preds = torch.stack([p for p, _ in self._actor_pairs])
+            targets = torch.tensor(
+                [t for _, t in self._actor_pairs], device=device, dtype=preds.dtype,
+            )
+            loss_actor = torch.nn.functional.mse_loss(preds, targets)
+            self._actor_pairs.clear()
+        else:
+            loss_actor = torch.zeros((), device=device)
+
+        if self._critic_pairs:
+            preds = torch.stack([p for p, _ in self._critic_pairs])
+            targets = torch.tensor(
+                [t for _, t in self._critic_pairs], device=device, dtype=preds.dtype,
+            )
+            loss_critic = torch.nn.functional.mse_loss(preds, targets)
+            self._critic_pairs.clear()
+        else:
+            loss_critic = torch.zeros((), device=device)
+
+        return anchor + actor_weight * loss_actor + critic_weight * loss_critic
 
     def generate_exploration_goals(
         self,

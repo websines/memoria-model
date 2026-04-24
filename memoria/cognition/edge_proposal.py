@@ -95,6 +95,13 @@ class EdgeProposer(nn.Module):
         # Initialized to target_accept for consistency (no initial error).
         self.register_buffer('acceptance_ema', torch.tensor(_default_target))
 
+        # Side-loss buffer: (pair_features, observed_survival) tuples.
+        # Filled by record_proposal_outcome() which is called AFTER an edge
+        # has been in the graph long enough to observe whether it was
+        # reinforced vs decayed to zero — see compute_side_loss below.
+        self._side_loss_pairs: list[tuple[torch.Tensor, float]] = []
+        self._max_side_buffer = 128
+
     def propose_edges(
         self,
         candidate_pairs: list[tuple[int, int]],
@@ -259,3 +266,45 @@ class EdgeProposer(nn.Module):
         # (complete shutdown or trivial acceptance).
         new_threshold = max(EPSILON, min(1.0 - EPSILON, new_threshold))
         self.proposal_threshold.fill_(new_threshold)
+
+    def record_proposal_outcome(
+        self,
+        belief_i: Tensor,
+        belief_j: Tensor,
+        survived: float,
+    ) -> None:
+        """Record a (pair_features, observed_survival) pair for training.
+
+        Called when an edge has been observed long enough to decide whether
+        it survived (was reinforced by co-activation → weight grew) or
+        decayed to zero. `survived` is 1.0 / 0.0 (or any real in [0,1]).
+
+        The proposal_net recomputes its forward under autograd here so its
+        parameters get a gradient when compute_side_loss backward's.
+        """
+        features = torch.cat([
+            belief_i, belief_j, (belief_i - belief_j).abs(),
+        ]).unsqueeze(0)
+        logit = self.proposal_net(features).squeeze()
+        self._side_loss_pairs.append((logit, float(survived)))
+        if len(self._side_loss_pairs) > self._max_side_buffer:
+            self._side_loss_pairs = self._side_loss_pairs[-self._max_side_buffer:]
+
+    def compute_side_loss(self) -> Tensor:
+        """BCE-with-logits loss on recorded edge-survival outcomes.
+
+        Trains proposal_net to predict which candidate pairs produce edges
+        that will actually prove useful (survive reinforcement vs decay).
+        Returns a zero attached to parameters when the buffer is empty.
+        """
+        anchor = sum(p.sum() * 0.0 for p in self.parameters())
+        if not self._side_loss_pairs:
+            return anchor
+        logits = torch.stack([l for l, _ in self._side_loss_pairs])
+        targets = torch.tensor(
+            [t for _, t in self._side_loss_pairs],
+            device=logits.device, dtype=logits.dtype,
+        )
+        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='mean')
+        self._side_loss_pairs.clear()
+        return anchor + loss

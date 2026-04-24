@@ -416,6 +416,50 @@ class MetaParams(nn.Module):
         # Reference: PonderNet (arXiv:2107.05407) — learned halting with geometric prior
         self._refinement_ponder_cost = nn.Parameter(torch.tensor(-0.693147))
 
+        # ── Pass-2 Side Loss Weights (self-supervised training for the  ──
+        #    previously-frozen cognitive subsystems). Each subsystem emits a
+        #    prediction-vs-observed self-supervised loss; we weight them so
+        #    the aggregate side loss is moderate relative to L_token. Every
+        #    one is a learnable MetaParam — no hardcoded coefficients.
+        #
+        # DaemonAnomalyNet predicts P(anomaly) from prediction error features.
+        # Target: "was the next step actually anomalous?" (surprise > running
+        # mean + 1σ). BCE loss. softplus(-2.302585) ≈ 0.1 — small default,
+        # matches the magnitude of auxiliary losses elsewhere.
+        self._daemon_anomaly_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # CuriosityActorNet predicts expected output entropy given beliefs.
+        # Target: actual observed output entropy this step. MSE loss.
+        self._curiosity_actor_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # CuriosityCriticNet predicts EFE-variance across candidate actions.
+        # Target: actual measured EFE variance. MSE loss.
+        self._curiosity_critic_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # StructuralPlasticity split_net/prune_net: REINFORCE-style signal
+        # based on whether the split/prune decision was followed by a drop
+        # in free energy over the next consolidation window.
+        self._plasticity_reinforce_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # EdgeProposer: per-edge BCE on (was this edge reinforced by
+        # co-activation within N steps?). Makes the proposal net predict
+        # which candidate edges will actually prove useful.
+        self._edge_proposal_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # ActionSelector: SAC-style advantage-weighted regression on the
+        # EFE head predictions. Target: measured pragmatic / epistemic /
+        # risk components after the action type is committed.
+        self._action_selector_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # HypothesisGen: cross-entropy on promoted/evicted outcome.
+        # Trains the generator to produce hypotheses that pass the
+        # provisional evaluation.
+        self._hypothesis_gen_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # SRWM: prediction target is the next-step meta-parameter modulation
+        # that actually reduced FE. MSE against the realized modulation.
+        self._srwm_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
     # ---------------------------------------------------------------------- #
     # Properties — apply activation to yield constrained values               #
     # ---------------------------------------------------------------------- #
@@ -947,3 +991,45 @@ class MetaParams(nn.Module):
     def refinement_ponder_cost(self) -> torch.Tensor:
         """Per-position penalty for continuing refinement. Range: (0, inf)."""
         return F.softplus(self._refinement_ponder_cost)
+
+    # ── Pass-2 Side Loss Weights — train the previously-frozen subsystems ──
+
+    @property
+    def daemon_anomaly_loss_weight(self) -> torch.Tensor:
+        """BCE weight for DaemonAnomalyNet self-supervised training. Range: (0, inf)."""
+        return F.softplus(self._daemon_anomaly_loss_weight)
+
+    @property
+    def curiosity_actor_loss_weight(self) -> torch.Tensor:
+        """MSE weight for CuriosityActor entropy-prediction loss. Range: (0, inf)."""
+        return F.softplus(self._curiosity_actor_loss_weight)
+
+    @property
+    def curiosity_critic_loss_weight(self) -> torch.Tensor:
+        """MSE weight for CuriosityCritic EFE-variance loss. Range: (0, inf)."""
+        return F.softplus(self._curiosity_critic_loss_weight)
+
+    @property
+    def plasticity_reinforce_weight(self) -> torch.Tensor:
+        """REINFORCE weight for split/prune policy. Range: (0, inf)."""
+        return F.softplus(self._plasticity_reinforce_weight)
+
+    @property
+    def edge_proposal_loss_weight(self) -> torch.Tensor:
+        """BCE weight for EdgeProposer reinforcement-prediction. Range: (0, inf)."""
+        return F.softplus(self._edge_proposal_loss_weight)
+
+    @property
+    def action_selector_loss_weight(self) -> torch.Tensor:
+        """MSE weight for ActionSelector EFE-component prediction. Range: (0, inf)."""
+        return F.softplus(self._action_selector_loss_weight)
+
+    @property
+    def hypothesis_gen_loss_weight(self) -> torch.Tensor:
+        """CE weight for HypothesisGenerator promoted/evicted supervision. Range: (0, inf)."""
+        return F.softplus(self._hypothesis_gen_loss_weight)
+
+    @property
+    def srwm_loss_weight(self) -> torch.Tensor:
+        """MSE weight for SRWM modulation-prediction loss. Range: (0, inf)."""
+        return F.softplus(self._srwm_loss_weight)

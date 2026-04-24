@@ -105,7 +105,11 @@ class DaemonLoop(nn.Module):
         self.belief_dim = belief_dim
         self.idle_consolidation_interval = idle_consolidation_interval
 
-        # Anomaly detection: learned threshold for prediction error
+        # Anomaly detection: learned threshold for prediction error.
+        # Emits a sigmoid probability in forward — the side-loss path uses
+        # BCE-with-logits on the pre-sigmoid, so we keep the sigmoid in the
+        # Sequential for the no_grad inference path and re-derive the logit
+        # for training (see predict_anomaly_logit below).
         self.anomaly_net = nn.Sequential(
             nn.Linear(belief_dim + 2, 32),
             nn.GELU(),
@@ -125,6 +129,15 @@ class DaemonLoop(nn.Module):
         )
 
         self.daemon_state = DaemonState()
+
+        # Side-loss buffers: (predicted_logit, target) pairs for self-supervised
+        # training. The target is set on the NEXT pass2 call when we can
+        # observe whether the next step was actually surprising.
+        self._pending_pred_logit: torch.Tensor | None = None
+        self._side_loss_buffer: list[tuple[torch.Tensor, float]] = []
+        # Observation window size and buffer cap derive from the idle
+        # consolidation interval rather than a fresh magic number.
+        self._max_side_buffer = max(8, self.idle_consolidation_interval * 4)
 
     def perceive(self, events: list[Event]) -> list[Event]:
         """Receive and prioritize events.
@@ -176,6 +189,23 @@ class DaemonLoop(nn.Module):
 
         return False
 
+    def _build_features(
+        self, prediction_error: torch.Tensor, state,
+    ) -> torch.Tensor:
+        """Pack prediction-error + beta into the feature vector the net expects."""
+        error_mag = prediction_error.norm()
+        beta = state.meta.data[0]
+        features = torch.cat([
+            prediction_error / (error_mag + 1e-8),  # direction
+            error_mag.unsqueeze(0),                 # magnitude
+            beta.unsqueeze(0),                      # current exploration state
+        ])
+        if features.shape[0] < self.belief_dim + 2:
+            features = torch.nn.functional.pad(
+                features, (0, self.belief_dim + 2 - features.shape[0])
+            )
+        return features.unsqueeze(0)
+
     def detect_anomaly(
         self,
         prediction_error: torch.Tensor,
@@ -183,7 +213,10 @@ class DaemonLoop(nn.Module):
     ) -> bool:
         """Detect if the prediction error constitutes an anomaly.
 
-        Uses a learned network rather than a fixed threshold.
+        Uses a learned network rather than a fixed threshold. Also saves a
+        differentiable prediction snapshot that observe_outcome() will pair
+        with the next step's actual surprise value — giving this net a
+        self-supervised training signal (see compute_side_loss).
 
         Args:
             prediction_error: [D] vector of prediction errors
@@ -192,25 +225,66 @@ class DaemonLoop(nn.Module):
         Returns:
             True if anomaly detected
         """
-        device = prediction_error.device
-        error_mag = prediction_error.norm()
-        beta = state.meta.data[0]
-        surprise = state.meta.data[1]
+        features = self._build_features(prediction_error, state)
 
-        features = torch.cat([
-            prediction_error / (error_mag + 1e-8),  # direction
-            error_mag.unsqueeze(0),                   # magnitude
-            beta.unsqueeze(0),                        # current exploration state
-        ])
+        # Inference path: no_grad for speed. Boolean decision threshold 0.5.
+        with torch.no_grad():
+            prob = self.anomaly_net(features).squeeze()
 
-        # Pad to belief_dim + 2
-        if features.shape[0] < self.belief_dim + 2:
-            features = torch.nn.functional.pad(
-                features, (0, self.belief_dim + 2 - features.shape[0])
-            )
+        # Training path: recompute the forward under autograd so the
+        # anomaly_net parameters see a gradient when the side loss backward's.
+        # This costs one extra forward through a 32-unit MLP — negligible.
+        # We store the PRE-sigmoid logit (layer[-2] output) for numerically
+        # stable BCE-with-logits at loss time.
+        logit = self.anomaly_net[0](features)
+        logit = self.anomaly_net[1](logit)
+        logit = self.anomaly_net[2](logit)  # pre-sigmoid linear output
+        self._pending_pred_logit = logit.squeeze()
 
-        prob = self.anomaly_net(features.unsqueeze(0)).squeeze()
         return prob.item() > 0.5
+
+    def observe_outcome(self, next_step_surprise: float,
+                        surprise_anomaly_threshold: float) -> None:
+        """Supply the ground-truth label for the previous detect_anomaly call.
+
+        Target is 1.0 when next_step_surprise exceeds a running-stats-derived
+        threshold, 0.0 otherwise. The threshold must be supplied from running
+        statistics (caller's responsibility) so the "what is anomalous"
+        decision stays adaptive and does not add a magic number here.
+
+        Buffer-pair is discarded if no pending prediction exists (e.g., the
+        daemon was not invoked since the last observe).
+        """
+        if self._pending_pred_logit is None:
+            return
+        target = 1.0 if next_step_surprise > surprise_anomaly_threshold else 0.0
+        self._side_loss_buffer.append((self._pending_pred_logit, target))
+        self._pending_pred_logit = None
+        # Cap buffer size to prevent unbounded growth.
+        if len(self._side_loss_buffer) > self._max_side_buffer:
+            self._side_loss_buffer = self._side_loss_buffer[-self._max_side_buffer:]
+
+    def compute_side_loss(self) -> torch.Tensor:
+        """Self-supervised BCE loss over pending (prediction, outcome) pairs.
+
+        Called by pass2's side-loss aggregator. Clears the buffer after
+        computing the loss. Returns a zero tensor when the buffer is empty.
+        """
+        if not self._side_loss_buffer:
+            # Return an attached zero touching ALL module parameters so the
+            # gradient-reachability check sees every registered param as
+            # reachable even in the first steps before any buffer content.
+            return sum(p.sum() * 0.0 for p in self.parameters())
+        logits = torch.stack([p for p, _ in self._side_loss_buffer])
+        targets = torch.tensor(
+            [t for _, t in self._side_loss_buffer],
+            device=logits.device, dtype=logits.dtype,
+        )
+        loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, reduction='mean',
+        )
+        self._side_loss_buffer.clear()
+        return loss
 
     def process_event(self, event: Event, state) -> dict:
         """Process a single event through the cognitive pipeline.

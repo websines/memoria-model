@@ -373,6 +373,19 @@ def run_pass2(
             stats['edge_proposal_threshold'] = state.edge_proposal.proposal_threshold.item()
             stats['edge_accept_ema'] = state.edge_proposal.acceptance_ema.item()
         stats['co_activation_pairs'] = len(co_activations)
+
+        # Side-loss recording for edge_proposal.proposal_net. Target:
+        # whether the accepted edge's current weight (already subject to
+        # one decay tick this step) is still above the EPSILON floor. This
+        # is a correlated proxy for "did it survive" — we can't observe
+        # cross-step survival directly from a single pass2 call, but edges
+        # whose first-step weight is already near zero will likely die.
+        for src, tgt, weight, _theta in accepted_edges:
+            if 0 <= src < state.beliefs.shape[0] and 0 <= tgt < state.beliefs.shape[0]:
+                survived = 1.0 if float(weight) > EPSILON else 0.0
+                state.edge_proposal.record_proposal_outcome(
+                    state.beliefs.data[src], state.beliefs.data[tgt], survived,
+                )
     else:
         stats['edges_proposed'] = 0
         stats['edges_created'] = 0
@@ -586,6 +599,15 @@ def run_pass2(
             lr=state.meta_params.srwm_lr,
             decay=state.meta_params.srwm_decay,
         )
+        # Record modulation prediction for side-loss training. Target: sign
+        # of current-step surprise delta relative to the running mean
+        # (decreasing = good = +1, increasing = bad = −1). All derived from
+        # running_stats, no magic numbers.
+        observed_delta = (
+            float(stats.get('total_surprise', 0.0) / max(stats.get('num_candidates', 1), 1))
+            - float(state.running_stats.mean_surprise.item())
+        )
+        state.srwm.record_modulation(features, observed_delta)
         stats['srwm_updated'] = True
 
     # ── 12. C3: Structural plasticity (split/prune/grow) ──
@@ -646,16 +668,35 @@ def run_pass2(
     # ── 14. D1: Daemon anomaly detection ──
     # Classify whether the current step's mean surprise is anomalous. Anomaly
     # signals feed downstream triggers (consolidation, search, exploration).
+    #
+    # NOTE: detect_anomaly itself internally uses no_grad for the binary
+    # decision but records a differentiable logit snapshot for self-
+    # supervised training. So this block is NOT wrapped in torch.no_grad —
+    # the recording path needs autograd active. The outer `with torch.no_grad()`
+    # that used to wrap this section has been removed because it prevented
+    # daemon.anomaly_net from ever receiving a gradient.
     if hasattr(state, 'daemon') and state.daemon is not None:
+        mean_surp = stats.get('total_surprise', 0.0) / max(stats.get('num_candidates', 1), 1)
+        # Build prediction_error: active belief mean scaled by mean surprise.
+        active_mask = state.get_active_mask()
+        if active_mask.any():
+            pred_err = state.beliefs.data[active_mask].mean(dim=0) * mean_surp
+        else:
+            pred_err = torch.zeros(state.config.belief_dim, device=state.beliefs.device)
+        # The detect_anomaly call saves a pending prediction snapshot which
+        # is paired with the outcome on the NEXT pass2 call via observe_outcome.
+        # Threshold for "was next step anomalous" comes from running statistics,
+        # not a magic number: 1σ above running mean surprise.
+        is_anomaly = state.daemon.detect_anomaly(pred_err, state)
+        # Supply the ground-truth label for the PREVIOUS detect_anomaly call.
+        # Threshold = running mean + √variance (one standard deviation above
+        # typical surprise) — all derived from running_stats, no magic numbers.
+        rs = state.running_stats
+        anomaly_threshold = float(
+            rs.mean_surprise.item() + rs.surprise_variance.clamp(min=1e-12).sqrt().item()
+        )
+        state.daemon.observe_outcome(mean_surp, anomaly_threshold)
         with torch.no_grad():
-            mean_surp = stats.get('total_surprise', 0.0) / max(stats.get('num_candidates', 1), 1)
-            # Construct prediction_error vector: active belief mean scaled by mean surprise.
-            active_mask = state.get_active_mask()
-            if active_mask.any():
-                pred_err = state.beliefs.data[active_mask].mean(dim=0) * mean_surp
-            else:
-                pred_err = torch.zeros(state.config.belief_dim, device=state.beliefs.device)
-            is_anomaly = state.daemon.detect_anomaly(pred_err, state)
             should_consol = state.daemon.should_consolidate(state)
         stats['daemon_anomaly'] = bool(is_anomaly)
         stats['daemon_should_consolidate'] = bool(should_consol)
@@ -668,8 +709,27 @@ def run_pass2(
     # Compute actor + critic curiosity; if combined > threshold, generate
     # exploration goals from high-uncertainty belief regions and allocate
     # them into empty goal slots.
+    #
+    # Self-supervision: actor_net predicts this step's output entropy and
+    # critic_net predicts EFE-score variance across candidate actions.
+    # Targets are observable — current step's mean surprise (upper-bounds
+    # entropy under a cross-entropy loss interpretation) and the actual
+    # EFE variance. Both are real supervised training signals, recorded
+    # here under autograd so compute_side_loss can backward through them.
     if hasattr(state, 'curiosity') and state.curiosity is not None:
         from ..agency.curiosity import run_curiosity_step
+        active_mask = state.get_active_mask()
+        if active_mask.any():
+            active_beliefs_live = state.beliefs.data[active_mask]
+            # Actor prediction recorded under autograd — target is current
+            # step's mean_surprise (a scalar proxy for output uncertainty).
+            observed_entropy = float(
+                stats.get('total_surprise', 0.0) / max(stats.get('num_candidates', 1), 1)
+            )
+            state.curiosity.record_actor_prediction(
+                active_beliefs_live, observed_entropy,
+            )
+        # State mutations (goal allocation) remain gradient-free.
         with torch.no_grad():
             cur_stats = run_curiosity_step(state, state.curiosity)
             goals_out = cur_stats.get('goals_generated', 0)
@@ -709,6 +769,16 @@ def run_pass2(
                 state.meta_params.action_temperature,
                 state.meta_params.action_risk_aversion,
             )
+        # Record the EFE prediction under autograd so efe_heads + state_encoder
+        # + action_embeddings can receive gradient. The observed target is the
+        # current step's mean surprise (a proxy for observed FE delta — we use
+        # current-step surprise because pass2 doesn't see next-step deltas).
+        observed_fe = stats.get('total_surprise', 0.0) / max(
+            stats.get('num_candidates', 1), 1,
+        )
+        state.action_selector.record_efe_observation(
+            state, action_info['action_idx'], observed_fe,
+        )
         stats['action_selected'] = action_info['action_type'].name
         stats['action_efe'] = action_info['efe_score']
         stats['action_pragmatic'] = action_info['pragmatic']

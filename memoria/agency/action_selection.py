@@ -82,6 +82,12 @@ class ActionSelector(nn.Module):
             torch.randn(n_actions, 64) * 0.1,
         )
 
+        # Side-loss buffer: (predicted_efe_components, observed_fe_delta) pairs.
+        # Gives a supervised training signal — the net learns to predict the
+        # EFE decomposition that actually matches observed FE changes.
+        self._side_loss_pairs: list[tuple[torch.Tensor, float]] = []
+        self._max_side_buffer = 64
+
     def extract_state_features(self, state) -> torch.Tensor:
         """Extract fixed-size feature vector from cognitive state.
 
@@ -214,6 +220,49 @@ class ActionSelector(nn.Module):
         }
 
         return action_idx, info
+
+    def record_efe_observation(
+        self, state, action_idx: int, observed_fe_delta: float,
+    ) -> None:
+        """Supervise the EFE head for the chosen action.
+
+        Target: observed FE change after the action was selected. The idea
+        is that a well-calibrated EFE head's sum(−pragmatic + epistemic +
+        risk) should approximate the true Δ(free-energy). Storing the
+        prediction under autograd and the observed delta lets
+        compute_side_loss train it by regression.
+        """
+        features = self.extract_state_features(state)
+        encoded = self.state_encoder(features.unsqueeze(0)).squeeze(0)
+        action_input = encoded + self.action_embeddings[action_idx]
+        head = self.efe_heads[action_idx]
+        predicted_components = head(action_input.unsqueeze(0)).squeeze(0)
+        # Predicted Δ(FE) = sum with EFE sign conventions.
+        predicted_delta = (
+            -predicted_components[0]                  # −pragmatic
+            + predicted_components[1]                 # epistemic
+            + F.softplus(predicted_components[2])     # risk (≥0)
+        )
+        self._side_loss_pairs.append((predicted_delta, float(observed_fe_delta)))
+        if len(self._side_loss_pairs) > self._max_side_buffer:
+            self._side_loss_pairs = self._side_loss_pairs[-self._max_side_buffer:]
+
+    def compute_side_loss(self) -> torch.Tensor:
+        """MSE on predicted vs observed Δ(FE) for selected actions."""
+        if not self._side_loss_pairs:
+            return (
+                sum(p.sum() * 0.0 for p in self.state_encoder.parameters())
+                + sum(p.sum() * 0.0 for h in self.efe_heads for p in h.parameters())
+                + self.action_embeddings.sum() * 0.0
+            )
+        preds = torch.stack([p for p, _ in self._side_loss_pairs])
+        targets = torch.tensor(
+            [t for _, t in self._side_loss_pairs],
+            device=preds.device, dtype=preds.dtype,
+        )
+        loss = F.mse_loss(preds, targets)
+        self._side_loss_pairs.clear()
+        return loss
 
 
 def select_action(state) -> tuple[ActionType, dict]:

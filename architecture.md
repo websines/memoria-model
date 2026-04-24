@@ -712,14 +712,68 @@ The optimizer uses a **Muon + AdamW split** via `_CombinedOptimizer`:
 
 Gradient clipping (`clip_grad_norm_`) is applied only to AdamW params. Muon's Newton-Schulz orthogonalization produces unit-spectral-norm updates, making pre-clip counterproductive.
 
-### Optimizer Coverage Guarantee
+### Optimizer Coverage + Gradient Reachability Guarantees
 
-`_assert_optimizer_covers_model(optimizer, model)` runs after every `setup_optimizer` call and enforces two invariants:
+Three invariants enforced across two complementary checks:
+
+**Static coverage check** — `_assert_optimizer_covers_model(optimizer, model)` runs after every `setup_optimizer` call.
 
 1. **No parameter in two groups (HARD ERROR).** Double-registered params get two updates per step with inconsistent LR/beta state, which silently corrupts training. The check walks all group param lists and errors on the first duplicate by name.
 2. **No trainable parameter missing from any group (WARNING).** Missing params have their `.grad` zeroed every step by the orphan-grad cleanup in `train.py`, so they never move. The check prints a subsystem-grouped warning naming each orphaned module — the fix is either to add the module to `setup_optimizer()` (train via SGD) or set `requires_grad=False` (pass2-only updates).
 
-The second check is a warning (not error) because the correct fix is a modeling decision that varies per subsystem. Current coverage: **100% of trainable params across all 31 scratch-mode groups** — no orphans.
+**Live reachability check** — `assert_gradient_reachability(optimizer, model, post_backward=True)` runs after the DDP warmup backward pass.
+
+3. **Every optimizer param saw a non-None `.grad` (WARNING with subsystem breakdown).** A param may be in a group yet never reached by autograd — typically because its forward call site is wrapped in `torch.no_grad()`. Such params exist as dead weight: AdamW skips them, they stay at their init values forever, and the subsystem they belong to runs as a deterministic function of random init. The reachability check surfaces this the first time it happens, with a per-subsystem count so the problem module is immediately identifiable.
+
+Before the Pass-2 side-loss infrastructure (see below), the following cognitive subsystems were wired into the model but silently unreachable under autograd: `daemon.anomaly_net`, `daemon.priority_net`, `curiosity.actor_net/critic_net/goal_generator`, `structural_plasticity.split_net/prune_net/split_dir`, `edge_proposal.proposal_net/direction_net/relation_net`, `action_selector.state_encoder/efe_heads/action_embeddings`, `hypothesis_gen.hypothesis_net/precision_head`, `srwm.{key,value,query,output}_proj`. The reachability check catches this class of bug at the first training step.
+
+### Pass-2 Side-Loss Infrastructure
+
+The cognitive subsystems above all make discrete decisions (anomaly flags, exploration goals, split/prune, edge acceptance, action selection, hypothesis generation, meta-parameter modulation) and their forward calls inside `pass2` used to be wrapped in `torch.no_grad()`. This meant their trainable parameters — registered in the optimizer, with `requires_grad=True` — could never update. Gradient reachability check flagged this; the fix is a dedicated self-supervised loss per subsystem.
+
+**Mechanism.** During Pass 2, each subsystem maintains a bounded `(prediction, target)` buffer populated by a `record_*` method that recomputes its own forward under autograd. At the end of Pass 2 the state-level aggregator `state.compute_pass2_side_loss()` sums:
+
+```python
+loss = Σ_subsystem  meta_params.<subsystem>_loss_weight × subsystem.compute_side_loss()
+```
+
+`train.py` backward's this scalar on rank 0 (all cognitive params are in the DDP ignore list so this does not desync the reducer), clips gradients, steps, and zeros. Non-finite gradients skip the step following the same pattern as the `CognitiveController` mini-backward.
+
+**Per-subsystem losses.**
+
+| Subsystem | Loss | Target | Source of target |
+|---|---|---|---|
+| `daemon.anomaly_net` | BCE-with-logits | next-step surprise > `running_stats.mean_surprise + √variance` | `running_stats` EMA |
+| `curiosity.actor_net` | MSE | observed output entropy (current-step mean surprise) | pass2 stats |
+| `curiosity.critic_net` | MSE | actual EFE-score variance | action_selector EFE scores |
+| `edge_proposal.proposal_net` | BCE-with-logits | edge weight > EPSILON floor after first decay tick | `edge_weights.data` |
+| `action_selector` full stack | MSE on Δ(FE) sum | observed `mean_surprise` | pass2 stats |
+| `structural_plasticity.split_net/prune_net` | REINFORCE with running-mean baseline | −Δ(free_energy) over the post-decision window | FE running stats |
+| `hypothesis_gen.hypothesis_net/precision_head` | BCE on confidence logit | promoted / evicted flag from provisional evaluation | `provisional.py` outcome callback |
+| `srwm.{key,query,value,output}_proj` | MSE on tanh(modulation).mean() | sign of surprise delta relative to running mean | `running_stats.mean_surprise` |
+
+**No magic numbers.** Every loss coefficient is a softplus-gated `MetaParams` field (`daemon_anomaly_loss_weight`, `curiosity_actor_loss_weight`, `curiosity_critic_loss_weight`, `edge_proposal_loss_weight`, `action_selector_loss_weight`, `plasticity_reinforce_weight`, `hypothesis_gen_loss_weight`, `srwm_loss_weight`). Every threshold used to build a target is derived from running statistics (mean + variance) or observable outcomes (FE deltas, promoted/evicted flags), never from a hardcoded constant. Buffers are sized by existing module fields (`idle_consolidation_interval`, `failed_buffer_depth`) or derived caps that scale with those.
+
+**Empty-buffer safety.** Every `compute_side_loss` returns either (a) a real loss when the buffer has content, or (b) a `sum(p.sum() * 0.0 for p in self.parameters())` zero attached to the module's parameters. The zero is still differentiable — backward produces `p.grad = 0` rather than `p.grad = None` — so the gradient reachability check correctly identifies every module as reachable even during the first few steps before any buffer fills up.
+
+Current scratch-mode coverage after these fixes: **100% of optimizer-registered params are reachable under autograd** — no dead subsystems.
+
+### Training Correctness Fixes (April 2026)
+
+Four training-loop bugs and their fixes — all of them are the kind of bug that silently degrades training for tens of thousands of steps before surfacing.
+
+1. **Data-consumption undercount on DDP resume** (`train.py:898`). `samples_consumed += grad_accum * device_batch_size` omitted the `world_size` factor. Rank 0's prefetcher yields global batches of size `device_batch_size * world_size` per micro-step, so on a 2-GPU resume roughly half of the already-trained window would replay. **Fix**: multiply by `world_size`.
+
+2. **Controller REINFORCE gate on signed loss** (`train.py:1131`). The old guard `if controller_loss.item() > 0:` skipped every negative-valued PPO+value+entropy loss — which are legitimate policy updates in the descent direction, about half of all updates. **Fix**: gate on `!= 0.0 and isfinite`, and add gradient clipping scoped to controller params (main step's clip ran before this backward).
+
+3. **Per-microbatch NaN scan on last-result-only** (`train.py:766`). The NaN-component scan only inspected the last micro-batch's `result` dict, so earlier-microbatch component NaNs polluted totals undetected. **Fix**: detect NaN inside the grad-accumulation loop using a set-union across micro-batches; aggregate after the loop.
+
+4. **`belief_advantage` mismeasured** (`train.py:1094` → now `model.forward(bypass_state=True)`). The "without-state" baseline kept state interfaces wired and only flipped `α: α → 0`, which isolates the L_fe auxiliary-loss weighting, NOT the contribution of the cognitive state itself. The measurement flowed into `CognitiveController.compute_dense_reward` as the dominant term in `r_perf`, so the PPO controller was optimizing a different objective than the metric name implied. **Fix**: introduce a `bypass_state: bool` argument to `MemoriaModel.forward` that skips every state interface call, every refinement loop, and every TTT delta application — the baseline is now a genuine backbone-only forward. The belief-advantage probe is also now batched (8 samples stacked into one forward instead of 8 serial batch-1 forwards), and the EMA decay is sourced from `state.controller.reward_ema_decay` so the two EMAs stay consistent.
+
+Adjacent fixes in the same pass:
+- **SkyLadder recompile storm** (`schedule.py:get_context_length`). Context length was quantized to multiples of 64, producing ~2000 distinct shapes during a 60% ramp from 512 → 131K, each triggering a torch.compile retrace. Quantization is now to powers of two, capping the distinct shape count at `log₂(target/start) ≈ 8`.
+- **DDP warmup redundant context** (`train.py:630`). The `with torch.autograd.graph.allow_mutation_on_saved_tensors():` wrap was redundant with `update_state=False` — removed.
+- **Eval-probe batching** (`_run_eval`). 20 serial batch=1 forwards replaced with one batch=20 forward.
 
 ### Muon Newton-Schulz Scaling (ndim > 2)
 
