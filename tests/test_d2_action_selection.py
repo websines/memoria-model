@@ -40,6 +40,16 @@ def test_extract_state_features(state):
     assert features.shape == (64 + 8,)
 
 
+def test_skill_bias_changes_state_features(state):
+    """Routed skill bias participates in action-selection features."""
+    selector = state.action_selector
+    before = selector.extract_state_features(state)
+    with torch.no_grad():
+        state.active_skill_bias.fill_(1.0)
+    after = selector.extract_state_features(state)
+    assert not torch.allclose(before[:64], after[:64])
+
+
 def test_score_actions(state):
     """Action scoring produces correct shapes."""
     selector = state.action_selector

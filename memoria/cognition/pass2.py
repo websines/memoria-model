@@ -757,6 +757,59 @@ def run_pass2(
                 cur_stats['exploration_goals_allocated'] = n_alloc
         stats['curiosity'] = cur_stats
 
+    # ── 15b. D4: Differentiable skill routing ──
+    # Skills are softly routed against the current belief context and exposed
+    # as a transient bias for downstream action selection. The route also
+    # records a continuous outcome-prediction side loss using belief_advantage;
+    # later tool/test outcomes can feed the same API without reward tables.
+    if (hasattr(state, 'skill_bank') and state.skill_bank is not None
+            and state.skill_detector is not None and state.skill_composer is not None):
+        active_mask = state.get_active_mask()
+        if active_mask.any():
+            skill_context = state.beliefs.data[active_mask].mean(dim=0)
+        else:
+            skill_context = torch.zeros(
+                state.config.belief_dim,
+                device=state.beliefs.device,
+                dtype=state.beliefs.dtype,
+            )
+        route = state.skill_bank.route_skills(
+            skill_context,
+            state.meta_params.skill_router_temperature,
+        )
+        with torch.no_grad():
+            state.active_skill_bias.copy_(route['skill_bias'].detach())
+            state.active_skill_weights.zero_()
+            state.active_skill_mask.zero_()
+            if route['indices'].numel() > 0:
+                state.active_skill_weights[route['indices']] = route['weights'].detach()
+                state.active_skill_mask[route['indices']] = True
+
+        if route['indices'].numel() > 0:
+            state.skill_bank.record_outcome_prediction(
+                skill_context,
+                route['skill_bias'],
+                route['weights'],
+                float(belief_advantage),
+            )
+            state.skill_bank.update_routed_utility(
+                route['indices'],
+                route['weights'].detach(),
+                float(belief_advantage),
+                decay=float(state.meta_params.skill_utility_decay.item()),
+                step=current_step,
+            )
+        stats['skill_route_active'] = int(route['indices'].numel())
+        stats['skill_route_entropy'] = float(route['entropy'].detach().item())
+        stats['skill_route_max_weight'] = float(route['max_weight'].detach().item())
+        stats['skill_bias_norm'] = float(route['skill_bias'].detach().norm().item())
+    elif hasattr(state, 'active_skill_bias'):
+        with torch.no_grad():
+            state.active_skill_bias.zero_()
+            state.active_skill_weights.zero_()
+            state.active_skill_mask.zero_()
+        stats['skill_route_active'] = 0
+
     # ── 16. D2: Action selection (EFE-based policy) ──
     # Score every action by its Expected Free Energy. The chosen action type
     # is a cognitive decision (not an externally-visible action during
@@ -792,8 +845,9 @@ def run_pass2(
             and state.skill_detector is not None and state.skill_composer is not None):
         from ..agency.skills import run_skill_step
         with torch.no_grad():
-            # Reward signal: positive belief_advantage = successful step.
-            # Pass this into the detector as the pattern reward.
+            # Continuous signal: positive belief_advantage marks a useful
+            # pattern for crystallization; negative values still train the
+            # differentiable router/outcome head above.
             active_mask = state.get_active_mask()
             if belief_advantage > 0 and active_mask.any():
                 pattern = state.beliefs.data[active_mask].mean(dim=0)

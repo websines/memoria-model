@@ -69,6 +69,31 @@ def test_get_active_skills(bank):
     assert embeddings.shape == (2, 64)
 
 
+def test_route_skills_empty(bank):
+    """Routing with no active skills returns a zero bias."""
+    route = bank.route_skills(torch.randn(64), torch.tensor(1.0))
+    assert route['indices'].numel() == 0
+    assert route['weights'].numel() == 0
+    assert route['skill_bias'].shape == (64,)
+    assert route['skill_bias'].abs().sum().item() == 0.0
+
+
+def test_route_skills_is_differentiable(bank):
+    """Soft skill routing sends gradients into skill embeddings."""
+    bank.allocate_skill(torch.randn(64))
+    bank.allocate_skill(torch.randn(64))
+
+    route = bank.route_skills(torch.randn(64), torch.tensor(1.0))
+    assert route['weights'].shape == (2,)
+    assert route['weights'].sum().item() == pytest.approx(1.0, abs=1e-5)
+    assert route['skill_bias'].requires_grad
+
+    loss = route['skill_bias'].pow(2).sum()
+    loss.backward()
+    assert bank.skill_embeddings.grad is not None
+    assert bank.skill_embeddings.grad.abs().sum().item() > 0
+
+
 def test_update_utility(bank):
     """Utility updates via EMA."""
     slot = bank.allocate_skill(torch.randn(64))
@@ -77,6 +102,47 @@ def test_update_utility(bank):
     bank.update_utility(slot, 1.0)
     assert bank.skill_utility[slot].item() > 0.5  # increased
     assert bank.skill_use_count[slot].item() == 1
+
+
+def test_routed_utility_weighted(bank):
+    """Soft route weights proportionally attribute continuous outcomes."""
+    slot_a = bank.allocate_skill(torch.randn(64), step=1)
+    slot_b = bank.allocate_skill(torch.randn(64), step=1)
+
+    bank.update_routed_utility(
+        torch.tensor([slot_a, slot_b]),
+        torch.tensor([0.75, 0.25]),
+        outcome=1.0,
+        decay=0.0,
+        step=12,
+    )
+
+    assert bank.skill_utility[slot_a].item() == pytest.approx(0.75)
+    assert bank.skill_utility[slot_b].item() == pytest.approx(0.25)
+    assert bank.skill_last_used[slot_a].item() == 12.0
+
+
+def test_skill_outcome_side_loss_trains_bank(bank):
+    """Outcome side loss remains differentiable through routed skill bias."""
+    bank.allocate_skill(torch.randn(64))
+    bank.allocate_skill(torch.randn(64))
+    route = bank.route_skills(torch.randn(64), torch.tensor(1.0))
+
+    bank.record_outcome_prediction(
+        torch.randn(64),
+        route['skill_bias'],
+        route['weights'],
+        observed_outcome=0.25,
+    )
+    loss = bank.compute_side_loss(
+        outcome_weight=torch.tensor(1.0),
+        transition_weight=torch.tensor(1.0),
+        router_entropy_weight=torch.tensor(0.01),
+    )
+    assert loss.requires_grad
+    loss.backward()
+    assert bank.skill_embeddings.grad is not None
+    assert bank.outcome_head[0].weight.grad is not None
 
 
 def test_skill_bank_full(bank):
@@ -228,5 +294,17 @@ def test_metaparams_skills(state):
     """MetaParams has skill thresholds."""
     d = state.meta_params.skill_detection_threshold
     s = state.meta_params.skill_similarity_threshold
+    t = state.meta_params.skill_router_temperature
+    b = state.meta_params.skill_bias_strength
+    decay = state.meta_params.skill_utility_decay
+    ow = state.meta_params.skill_outcome_loss_weight
+    tw = state.meta_params.skill_transition_loss_weight
+    ew = state.meta_params.skill_router_entropy_weight
     assert d.item() > 0  # softplus
     assert 0 < s.item() < 1  # sigmoid
+    assert t.item() > 0
+    assert b.item() > 0
+    assert 0 < decay.item() < 1
+    assert ow.item() > 0
+    assert tw.item() > 0
+    assert ew.item() > 0

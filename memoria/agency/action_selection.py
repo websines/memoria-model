@@ -104,6 +104,15 @@ class ActionSelector(nn.Module):
         else:
             mean_belief = torch.zeros(state.config.belief_dim, device=device)
 
+        if hasattr(state, 'active_skill_bias'):
+            skill_bias = state.active_skill_bias.to(device=device, dtype=mean_belief.dtype)
+            skill_strength = getattr(
+                state.meta_params,
+                'skill_bias_strength',
+                torch.tensor(0.0, device=device, dtype=mean_belief.dtype),
+            )
+            mean_belief = mean_belief + skill_strength * skill_bias
+
         # Contextual features
         max_b = max(state.config.max_beliefs, 1)
         max_e = max(state.config.max_edges, 1)

@@ -767,6 +767,15 @@ class MemoriaModel(nn.Module):
                     goal_embed_mean = torch.zeros(
                         self.state.config.belief_dim, device=x.device,
                     )
+                if hasattr(self.state, 'active_skill_bias'):
+                    skill_bias = self.state.active_skill_bias.to(
+                        device=x.device,
+                        dtype=goal_embed_mean.dtype,
+                    )
+                    goal_embed_mean = (
+                        goal_embed_mean
+                        + self.state.meta_params.skill_bias_strength * skill_bias
+                    )
                 # Strategy perturbation scale: MetaParam * controller action
                 strat_base_scale = self.state.meta_params.strategy_perturbation_scale
 
@@ -1099,7 +1108,9 @@ class MemoriaModel(nn.Module):
             # factor graph. Uses Power Spherical entropy with (d_i - 1) counting correction.
             if alpha > 0:
                 fe_result = compute_bethe_free_energy(
-                    self.state, self.state.meta_params.fe_temperature.item(),
+                    self.state,
+                    self.state.meta_params.fe_temperature.item(),
+                    update_state=update_state,
                 )
                 loss_fe_bethe = fe_result['free_energy']
                 result['free_energy_stats'] = fe_result

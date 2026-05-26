@@ -166,7 +166,11 @@ def compute_expected_free_energy(
     }
 
 
-def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -> dict:
+def compute_bethe_free_energy(
+    state: CognitiveState,
+    temperature: float = 5.0,
+    update_state: bool = True,
+) -> dict:
     """Proper Bethe free energy over the cognitive state factor graph.
 
     F_B = Σ_a U_a + Σ_i (d_i - 1) × H_i
@@ -185,6 +189,7 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
     Args:
         state: cognitive state with differentiable beliefs and edges
         temperature: scales sigmoid sharpness in energy computation
+        update_state: when False, do not write derived beta into state.meta
 
     Returns:
         dict with free_energy (scalar), energy, entropy, beta, and per-component terms
@@ -341,8 +346,9 @@ def compute_bethe_free_energy(state: CognitiveState, temperature: float = 5.0) -
     beta = H_raw / (full_energy.abs() + H_raw + EPSILON)
     beta = beta.clamp(0.0, 1.0)
 
-    with torch.no_grad():
-        state.meta.data[0] = beta.item()
+    if update_state:
+        with torch.no_grad():
+            state.meta.data[0] = beta.item()
 
     return {
         'free_energy': free_energy,
@@ -488,7 +494,11 @@ def compute_telos_energy(state: CognitiveState) -> Tensor:
     return energy_per_goal.sum()
 
 
-def compute_free_energy(state: CognitiveState, temperature: float = 5.0) -> dict:
+def compute_free_energy(
+    state: CognitiveState,
+    temperature: float = 5.0,
+    update_state: bool = True,
+) -> dict:
     """Compute Bethe free energy over the entire cognitive state.
 
     F = E_relations + E_telos - H_beliefs
@@ -498,6 +508,7 @@ def compute_free_energy(state: CognitiveState, temperature: float = 5.0) -> dict
     Args:
         state: The cognitive state
         temperature: Temperature for energy computation
+        update_state: when False, do not write derived beta into state.meta
 
     Returns:
         Dict with:
@@ -532,8 +543,9 @@ def compute_free_energy(state: CognitiveState, temperature: float = 5.0) -> dict
     beta = beta.clamp(0.0, 1.0)
 
     # Update meta region with computed β
-    with torch.no_grad():
-        state.meta.data[0] = beta.item()
+    if update_state:
+        with torch.no_grad():
+            state.meta.data[0] = beta.item()
 
     return {
         'free_energy': free_energy,

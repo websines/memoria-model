@@ -49,6 +49,8 @@ class StateConfig:
     max_strategies: int = 8
     # Per-goal failed-strategy ring buffer depth (mirrors failed_buffer_depth).
     failed_strategy_buffer_depth: int = 8
+    # Maximum crystallized procedural skills stored in D4 SkillBank.
+    max_skills: int = 128
 
 
 class CognitiveState(nn.Module):
@@ -349,9 +351,18 @@ class CognitiveState(nn.Module):
 
         # ── D4: Skill Bank ──
         from ..agency.skills import SkillBank, SkillDetector, SkillComposer
-        self.skill_bank = SkillBank(belief_dim=config.belief_dim, max_skills=128)
+        self.skill_bank = SkillBank(
+            belief_dim=config.belief_dim,
+            max_skills=config.max_skills,
+        )
         self.skill_detector = SkillDetector(belief_dim=config.belief_dim)
         self.skill_composer = SkillComposer(belief_dim=config.belief_dim)
+        self.register_buffer('active_skill_bias', torch.zeros(config.belief_dim))
+        self.register_buffer('active_skill_weights', torch.zeros(config.max_skills))
+        self.register_buffer(
+            'active_skill_mask',
+            torch.zeros(config.max_skills, dtype=torch.bool),
+        )
 
         # ── Read-only gate for measurement passes ──
         # When False, write-path state mutations (touch_beliefs, future
@@ -816,6 +827,17 @@ class CognitiveState(nn.Module):
             except AttributeError:
                 pass
 
+        # Skill bank — differentiable routing credit via outcome/transition prediction.
+        if hasattr(self, 'skill_bank') and self.skill_bank is not None:
+            try:
+                total = total + self.skill_bank.compute_side_loss(
+                    outcome_weight=mp.skill_outcome_loss_weight,
+                    transition_weight=mp.skill_transition_loss_weight,
+                    router_entropy_weight=mp.skill_router_entropy_weight,
+                )
+            except AttributeError:
+                pass
+
         # Structural plasticity — REINFORCE on split/prune decisions.
         if hasattr(self, 'structural_plasticity') and self.structural_plasticity is not None:
             try:
@@ -960,6 +982,9 @@ class CognitiveState(nn.Module):
                 'skill_use_count': self.skill_bank.skill_use_count.clone(),
                 'skill_created_step': self.skill_bank.skill_created_step.clone(),
                 'skill_last_used': self.skill_bank.skill_last_used.clone(),
+                'active_skill_bias': self.active_skill_bias.clone(),
+                'active_skill_weights': self.active_skill_weights.clone(),
+                'active_skill_mask': self.active_skill_mask.clone(),
             },
             'skill_detector': self.skill_detector.state_dict(),
             'skill_composer': self.skill_composer.state_dict(),
@@ -1050,7 +1075,7 @@ class CognitiveState(nn.Module):
             if 'goal_status_logits' in state:
                 self.goal_status_logits.copy_(state['goal_status_logits'])
             if 'meta_params' in state:
-                self.meta_params.load_state_dict(state['meta_params'])
+                self.meta_params.load_state_dict(state['meta_params'], strict=False)
             if 'running_stats' in state:
                 for k, v in state['running_stats'].items():
                     if hasattr(self.running_stats, k):
@@ -1116,7 +1141,7 @@ class CognitiveState(nn.Module):
                 self.curiosity.load_state_dict(state['curiosity'])
             # D4: Skills
             if 'skill_bank' in state:
-                self.skill_bank.load_state_dict(state['skill_bank'])
+                self.skill_bank.load_state_dict(state['skill_bank'], strict=False)
             if 'skill_bank_buffers' in state:
                 sb = state['skill_bank_buffers']
                 self.skill_bank.skill_active.copy_(sb['skill_active'])
@@ -1124,6 +1149,12 @@ class CognitiveState(nn.Module):
                 self.skill_bank.skill_use_count.copy_(sb['skill_use_count'])
                 self.skill_bank.skill_created_step.copy_(sb['skill_created_step'])
                 self.skill_bank.skill_last_used.copy_(sb['skill_last_used'])
+                if 'active_skill_bias' in sb:
+                    self.active_skill_bias.copy_(sb['active_skill_bias'])
+                if 'active_skill_weights' in sb:
+                    self.active_skill_weights.copy_(sb['active_skill_weights'])
+                if 'active_skill_mask' in sb:
+                    self.active_skill_mask.copy_(sb['active_skill_mask'])
             if 'skill_detector' in state:
                 self.skill_detector.load_state_dict(state['skill_detector'])
             if 'skill_composer' in state:

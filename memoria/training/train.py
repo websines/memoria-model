@@ -896,6 +896,7 @@ def train(
         #   curiosity.actor_net/critic_net (MSE vs observed entropy/variance)
         #   edge_proposal.proposal_net (BCE vs observed edge survival)
         #   action_selector.state_encoder/efe_heads/action_embeddings (MSE vs Δ(FE))
+        #   skill_bank router/outcome heads (MSE vs belief-advantage + successor delta)
         #   structural_plasticity.split_net/prune_net (REINFORCE vs FE delta)
         #   hypothesis_gen.hypothesis_net/precision_head (BCE vs promoted flag)
         #   srwm.key_proj/value_proj/query_proj/output_proj (MSE vs surprise-delta sign)

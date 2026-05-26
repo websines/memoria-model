@@ -121,7 +121,7 @@ def load_cognitive_seed(
 
     # 1. Always transfer meta-parameters (most stable across runs)
     if 'meta_params' in seed:
-        state.meta_params.load_state_dict(seed['meta_params'])
+        state.meta_params.load_state_dict(seed['meta_params'], strict=False)
         print("  Loaded meta_params")
 
     # 2. Always transfer Telos weights

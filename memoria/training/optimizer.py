@@ -523,17 +523,31 @@ def _add_cognitive_subsystem_groups(param_groups: list, model: nn.Module, tc, be
                 })
 
     # Skill embedding bank — a learnable content store, same pattern as
-    # goal_embeddings: belief_lr + half weight decay.
+    # goal_embeddings: belief_lr + half weight decay. Router/outcome heads
+    # train faster with the interface subsystems because they are side-loss
+    # predictors, not long-lived content slots.
     if hasattr(model.state, 'skill_bank'):
         sb = model.state.skill_bank
-        sb_params = [p for p in sb.parameters() if p.requires_grad]
-        if sb_params:
+        embedding_params = [sb.skill_embeddings] if sb.skill_embeddings.requires_grad else []
+        if embedding_params:
             param_groups.append({
-                'params': sb_params,
+                'params': embedding_params,
                 'lr': tc.belief_lr,
                 'betas': (0.9, 0.999),
                 'eps': 1e-8,
                 'weight_decay': tc.weight_decay * 0.5,
+            })
+        router_params = [
+            p for name, p in sb.named_parameters()
+            if name != 'skill_embeddings' and p.requires_grad
+        ]
+        if router_params:
+            param_groups.append({
+                'params': router_params,
+                'lr': tc.interface_lr,
+                'betas': betas,
+                'eps': 1e-8,
+                'weight_decay': 0.0,
             })
 
 

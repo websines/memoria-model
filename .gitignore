@@ -42,6 +42,7 @@ venv/
 *.log
 run.log
 results.tsv
+audit/
 
 # Prototype Memoria code (reference only, not tracked)
 prototype-research/

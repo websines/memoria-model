@@ -250,6 +250,15 @@ class MetaParams(nn.Module):
         # Similarity threshold for matching actions to existing skills.
         # sigmoid(1.386) ≈ 0.8 → 80% cosine similarity required
         self._skill_similarity_threshold = nn.Parameter(torch.tensor(1.386294))
+        # Router temperature for differentiable skill matching.
+        # softplus(0.0) ≈ 0.693 → moderately sparse routing when entmax is used
+        self._skill_router_temperature = nn.Parameter(torch.tensor(0.0))
+        # Strength of routed skill bias in downstream action/state features.
+        # softplus(-2.302585) ≈ 0.095 → skills start as a light behavioral prior
+        self._skill_bias_strength = nn.Parameter(torch.tensor(-2.302585))
+        # Utility EMA decay for non-gradient metadata credit assignment.
+        # sigmoid(2.197225) ≈ 0.9 → slow utility tracking
+        self._skill_utility_decay = nn.Parameter(torch.tensor(2.197225))
 
         # ── E1: Two-Factor Sleep Consolidation ──
         # Homeostatic target: desired total precision budget (sum of radii).
@@ -450,6 +459,13 @@ class MetaParams(nn.Module):
         # EFE head predictions. Target: measured pragmatic / epistemic /
         # risk components after the action type is committed.
         self._action_selector_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+
+        # SkillBank: predicts continuous outcome and successor transition from
+        # routed skill bias. Router entropy is minimized lightly to prefer
+        # sparse credit paths without forcing hard top-k selection.
+        self._skill_outcome_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+        self._skill_transition_loss_weight = nn.Parameter(torch.tensor(-2.302585))
+        self._skill_router_entropy_weight = nn.Parameter(torch.tensor(-4.595120))
 
         # HypothesisGen: cross-entropy on promoted/evicted outcome.
         # Trains the generator to produce hypotheses that pass the
@@ -776,6 +792,21 @@ class MetaParams(nn.Module):
         """Cosine similarity threshold for skill matching. Range: (0, 1)."""
         return torch.sigmoid(self._skill_similarity_threshold)
 
+    @property
+    def skill_router_temperature(self) -> torch.Tensor:
+        """Temperature for differentiable skill routing. Range: (0, inf)."""
+        return F.softplus(self._skill_router_temperature)
+
+    @property
+    def skill_bias_strength(self) -> torch.Tensor:
+        """Scale on routed skill bias injected into downstream features. Range: (0, inf)."""
+        return F.softplus(self._skill_bias_strength)
+
+    @property
+    def skill_utility_decay(self) -> torch.Tensor:
+        """EMA decay for non-gradient skill utility metadata. Range: (0, 1)."""
+        return torch.sigmoid(self._skill_utility_decay)
+
     # ── E1: Two-Factor Sleep Consolidation ──
 
     @property
@@ -1023,6 +1054,21 @@ class MetaParams(nn.Module):
     def action_selector_loss_weight(self) -> torch.Tensor:
         """MSE weight for ActionSelector EFE-component prediction. Range: (0, inf)."""
         return F.softplus(self._action_selector_loss_weight)
+
+    @property
+    def skill_outcome_loss_weight(self) -> torch.Tensor:
+        """MSE weight for SkillBank outcome prediction. Range: (0, inf)."""
+        return F.softplus(self._skill_outcome_loss_weight)
+
+    @property
+    def skill_transition_loss_weight(self) -> torch.Tensor:
+        """MSE weight for SkillBank successor-transition prediction. Range: (0, inf)."""
+        return F.softplus(self._skill_transition_loss_weight)
+
+    @property
+    def skill_router_entropy_weight(self) -> torch.Tensor:
+        """Entropy penalty weight for sparse differentiable skill routing. Range: (0, inf)."""
+        return F.softplus(self._skill_router_entropy_weight)
 
     @property
     def hypothesis_gen_loss_weight(self) -> torch.Tensor:
