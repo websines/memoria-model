@@ -54,7 +54,7 @@ class TransformerConfig:
     # RoPE position encoding — native long context, no scaling
     # High base frequency for native 200K support (like Llama 3 at 128K)
     max_position: int = 204800        # max position for RoPE
-    rope_scaling: str = "none"        # "none" or "yarn" (yarn only for extending pretrained models)
+    rope_scaling: str = "none"        # "none" or "yarn"
     rope_scaling_factor: float = 1.0  # only used when rope_scaling="yarn"
     rope_base: int = 500000           # high base for native long context (Llama 3 style)
 
@@ -271,10 +271,6 @@ class MemoriaConfig:
     state: StateConfig = field(default_factory=StateConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
-    # Backbone mode: "scratch" trains transformer from scratch, "pretrained" bolts onto HF model
-    backbone: str = "scratch"
-    pretrained_model: str = ""  # HuggingFace model name (only used when backbone="pretrained")
-
 
 # ── Preset Configurations ──
 
@@ -359,109 +355,6 @@ def large_config() -> MemoriaConfig:
         training=TrainingConfig(
             device_batch_size=2,
             alpha_max=0.1,
-        ),
-    )
-
-
-def lfm2_config() -> MemoriaConfig:
-    """LFM2.5-350M with cognitive state bolted on.
-
-    Backbone is frozen. Only interface layers (~15M params) are trained.
-    LFM2: 16 layers (10 conv + 6 attn), 1024 hidden, 65536 vocab.
-    Interface layers inserted after attention layers [2, 5, 8, 10, 12, 14].
-
-    Why LFM2.5-350M:
-    - 350M params — small enough that cognitive state must earn its keep
-    - 28T tokens training — best language capability per parameter at this scale
-    - Hybrid conv+attention — conv handles local, cognitive state handles global
-    - 1024 hidden dim — matches Memoria medium config
-    - 128K native context
-    """
-    return MemoriaConfig(
-        backbone="pretrained",
-        pretrained_model="LiquidAI/LFM2.5-350M",
-        transformer=TransformerConfig(
-            vocab_size=65536,
-            sequence_len=2048,
-            n_layer=16,
-            n_head=16,
-            n_kv_head=8,
-            n_embd=1024,
-            # Interface placement is overridden to attention-only positions
-            # in PretrainedMemoriaModel when backbone_type == "lfm2".
-            # interface_every is approximate — actual positions: [2,5,8,10,12,14]
-            interface_every=3,
-            interface_num_heads=4,
-            interface_top_k=48,
-            max_position=128000,
-            rope_scaling="none",   # LFM2 handles its own RoPE
-            rope_base=1000000,     # from LFM2 config.json rope_theta
-        ),
-        state=StateConfig(
-            belief_dim=256,
-            max_beliefs=16384,
-            max_edges=65536,
-            max_goals=256,
-            relation_dim=64,
-        ),
-        training=TrainingConfig(
-            total_batch_size=2**13,   # 8192 tokens/step
-            device_batch_size=2,      # 350M fits easily on 24GB GPU
-            interface_lr=0.001,
-            phase1_steps=200,         # very short — backbone already knows language
-            alpha_warmup_steps=300,
-            alpha_max=0.1,
-            fe_temperature=5.0,
-        ),
-    )
-
-
-def qwen_config() -> MemoriaConfig:
-    """Qwen3.5-2B-Base with cognitive state bolted on.
-
-    Backbone is frozen. Only interface layers (~25M params) are trained.
-    Qwen3.5-2B: 24 layers, 2048 hidden, 8 heads, 2 KV heads, 248320 vocab.
-    Hybrid architecture: linear_attention + full_attention (every 4th layer).
-    Interface layers inserted after layers 5, 11, 17, 23 (every 6 layers).
-
-    Much faster training: only adapters + pass 2. Should work on a single 24GB GPU
-    with small batch since the backbone runs in eval mode with no grad.
-    """
-    return MemoriaConfig(
-        backbone="pretrained",
-        pretrained_model="Qwen/Qwen3.5-2B-Base",
-        transformer=TransformerConfig(
-            # These must match Qwen3.5-2B architecture for interface layer dims
-            vocab_size=248320,
-            sequence_len=2048,
-            n_layer=24,
-            n_head=8,
-            n_kv_head=2,
-            n_embd=2048,
-            interface_every=6,  # 4 interface layers at positions 5, 11, 17, 23
-            interface_num_heads=4,
-            interface_top_k=64,  # more beliefs since the model is more capable
-            # Pretrained mode: backbone handles its own attention.
-            # Qwen3.5 uses YaRN internally — we extend its RoPE for long context.
-            max_position=204800,
-            rope_scaling="yarn",
-            rope_scaling_factor=100.0,
-        ),
-        state=StateConfig(
-            belief_dim=512,  # larger to match richer representations from 2B model
-            max_beliefs=32768,   # 4x from 8K — RotorQuant compressed
-            max_edges=262144,    # 8× beliefs — 2B model creates edges fast
-            max_goals=256,
-            relation_dim=64,
-        ),
-        training=TrainingConfig(
-            total_batch_size=2**13,  # 8192 tokens/step — adapters don't need 131K
-            device_batch_size=1,  # 2B model + grad checkpointing on 24GB GPU
-            interface_lr=0.001,  # lower LR for adapters on pretrained backbone
-            phase1_steps=500,    # shorter phase 1: backbone already knows language
-            alpha_warmup_steps=500,
-            alpha_max=0.1,
-            fe_temperature=5.0,
         ),
     )
 

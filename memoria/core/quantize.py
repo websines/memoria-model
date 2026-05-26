@@ -385,7 +385,7 @@ def apply_weight_qat(model: nn.Module, bits: int = 4, mlp_bits: int = 0) -> list
     cognitive state, DFlash, and all small cognitive modules.
 
     Args:
-        model: MemoriaModel or PretrainedMemoriaModel
+        model: MemoriaModel
         bits: default bit-width for weight quantization
         mlp_bits: bit-width for MLP layers (0 = use bits)
 

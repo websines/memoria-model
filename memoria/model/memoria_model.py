@@ -372,8 +372,8 @@ class MemoriaModel(nn.Module):
         # for dynamic/experiential memory by handling static knowledge separately.
         # Reference: Engram (DeepSeek, arXiv:2601.07372) — conditional memory
         # via scalable lookup as a complementary sparsity axis.
-        # Tokenizer name for Engram compression table — empty string means no compression
-        engram_tokenizer = config.pretrained_model if config.backbone == "pretrained" else ""
+        # Empty tokenizer name means no compression table lookup.
+        engram_tokenizer = ""
         blt_on = getattr(config.transformer, 'blt_enabled', False)
         self.engram_cache = EngramCache(
             # BLT mode: EngramCache operates on byte IDs at local_dim

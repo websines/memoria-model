@@ -28,7 +28,6 @@ from pathlib import Path
 
 from ..model.config import MemoriaConfig
 from ..model.memoria_model import MemoriaModel
-from ..model.pretrained_model import PretrainedMemoriaModel
 from ..cognition.pass2 import run_pass2
 from ..data.tokenizer import get_tokenizer
 from ..data.curated import curated_stream
@@ -360,16 +359,12 @@ def train(
     else:
         tokenizer = get_tokenizer(
             vocab_size=config.transformer.vocab_size,
-            pretrained_model=config.pretrained_model if config.backbone == "pretrained" else None,
         )
 
     # Model
     if is_main:
         print("Building model...")
-    if config.backbone == "pretrained":
-        model = PretrainedMemoriaModel(config)
-    else:
-        model = MemoriaModel(config)
+    model = MemoriaModel(config)
     model.init_weights()
 
     # Weight QAT: wrap eligible nn.Linear with STE quantization
@@ -444,14 +439,9 @@ def train(
         checkpoint = torch.load(resume_from, map_location=device, weights_only=True)
         load_result = base_model.load_state_dict(checkpoint['model_state'], strict=False)
         if is_main and (load_result.missing_keys or load_result.unexpected_keys):
-            # Filter out expected missing keys (frozen backbone excluded from checkpoint)
-            unexpected_missing = [k for k in load_result.missing_keys
-                                  if not k.startswith('backbone.')]
-            if unexpected_missing:
-                print(f"  Resume: {len(unexpected_missing)} missing keys (new params): "
-                      f"{unexpected_missing[:5]}{'...' if len(unexpected_missing) > 5 else ''}")
-            elif load_result.missing_keys:
-                print(f"  Resume: {len(load_result.missing_keys)} missing backbone keys (expected, backbone loaded from pretrained)")
+            if load_result.missing_keys:
+                print(f"  Resume: {len(load_result.missing_keys)} missing keys (new params): "
+                      f"{load_result.missing_keys[:5]}{'...' if len(load_result.missing_keys) > 5 else ''}")
             if load_result.unexpected_keys:
                 print(f"  Resume: {len(load_result.unexpected_keys)} unexpected keys (removed params): "
                       f"{load_result.unexpected_keys[:5]}{'...' if len(load_result.unexpected_keys) > 5 else ''}")
@@ -554,17 +544,10 @@ def train(
         prefetcher = None
 
     # torch.compile
-    should_compile = (
-        config.backbone == "pretrained"
-        or os.environ.get('MEMORIA_COMPILE', '') == '1'
-    )
+    should_compile = os.environ.get('MEMORIA_COMPILE', '') == '1'
     if should_compile:
         try:
-            if config.backbone == "pretrained":
-                for i, layer in enumerate(base_model.backbone.model.layers):
-                    base_model.backbone.model.layers[i] = torch.compile(layer)
-            else:
-                base_model.transformer = torch.compile(base_model.transformer)
+            base_model.transformer = torch.compile(base_model.transformer)
             if is_main:
                 print("torch.compile enabled")
         except Exception as e:
@@ -1369,11 +1352,7 @@ def _run_eval(model, eval_stream, device, ctx_len: int, n_batches: int = 20) -> 
 def save_checkpoint(model, optimizer, step: int, path: Path,
                     samples_consumed: int = 0):
     """Save model + cognitive state + optimizer + stream position checkpoint."""
-    # In pretrained mode, skip frozen backbone to avoid multi-GB checkpoint bloat
     model_state = model.state_dict()
-    if hasattr(model, 'backbone'):
-        model_state = {k: v for k, v in model_state.items()
-                       if not k.startswith('backbone.')}
 
     ckpt = {
         'step': step,

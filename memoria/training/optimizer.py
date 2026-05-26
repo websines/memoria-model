@@ -101,7 +101,6 @@ class Muon(torch.optim.Optimizer):
 def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Optimizer:
     """Set up optimizer with per-group learning rates.
 
-    Scratch mode (MemoriaModel):
     - 2D matrix params in transformer blocks (attention, MLP, DeltaProduct) → Muon
     - 1D params in transformer blocks (biases, norms) → AdamW
     - Embedding / unembedding → AdamW
@@ -109,13 +108,8 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     - State interface params → AdamW
     - Cognitive state params → NOT optimized (updated by pass 2)
 
-    Pretrained mode (PretrainedMemoriaModel):
-    - Backbone → frozen (not in optimizer at all)
-    - State interface params + read gates → AdamW
-    - Cognitive state params → NOT optimized (updated by pass 2)
-
     Args:
-        model: MemoriaModel or PretrainedMemoriaModel instance
+        model: MemoriaModel instance
         config: full configuration
 
     Returns:
@@ -124,10 +118,6 @@ def setup_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Opti
     tc = config.training
     betas = tc.adam_betas
 
-    if config.backbone == "pretrained":
-        return _setup_pretrained_optimizer(model, config)
-
-    # ── Scratch mode ──
     param_groups = []
 
     # 1. Transformer embedding
@@ -726,170 +716,3 @@ class _CombinedOptimizer:
             )
         for o, sd in zip(self._optimizers, saved):
             o.load_state_dict(sd)
-
-
-def _setup_pretrained_optimizer(model: nn.Module, config: MemoriaConfig) -> torch.optim.Optimizer:
-    """Optimizer for pretrained mode: interface layers + cognitive state + telos."""
-    tc = config.training
-    betas = tc.adam_betas
-
-    param_groups = [
-        {
-            'params': list(model.interfaces.parameters()),
-            'lr': tc.interface_lr,
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        },
-        {
-            'params': [model.read_gate],
-            'lr': tc.interface_lr * 10,  # gates learn faster
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        },
-    ]
-
-    # Cognitive state (beliefs, edges, relations) -- no weight decay (see group 6 comment)
-    cognitive_params = [p for p in [model.state.beliefs, model.state.edge_weights, model.state.edge_relations] if p.requires_grad]
-    if cognitive_params:
-        param_groups.append({
-            'params': cognitive_params,
-            'lr': tc.belief_lr,
-            'betas': (0.9, 0.999),
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # Cognitive meta-parameters
-    cognitive_meta_params = list(model.state.meta_params.parameters())
-    if cognitive_meta_params:
-        param_groups.append({
-            'params': cognitive_meta_params,
-            'lr': tc.cognitive_meta_lr,
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # Telos module (surprise predictor, goal generator, transition net, progress head)
-    telos_params = [p for p in model.state.telos.parameters() if p.requires_grad]
-    if telos_params:
-        param_groups.append({
-            'params': telos_params,
-            'lr': tc.interface_lr,
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # Goal embeddings
-    if model.state.goal_embeddings.requires_grad:
-        param_groups.append({
-            'params': [model.state.goal_embeddings],
-            'lr': tc.belief_lr,
-            'betas': (0.9, 0.999),
-            'eps': 1e-8,
-            'weight_decay': tc.weight_decay * 0.5,
-        })
-
-    # Edge proposal network
-    edge_proposal_params = [p for p in model.state.edge_proposal.parameters() if p.requires_grad]
-    if edge_proposal_params:
-        param_groups.append({
-            'params': edge_proposal_params,
-            'lr': tc.interface_lr,
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # Edge directions
-    if model.state.edge_direction.requires_grad:
-        param_groups.append({
-            'params': [model.state.edge_direction],
-            'lr': tc.belief_lr * 10,
-            'betas': (0.9, 0.999),
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # Cognitive controller
-    controller_params = [p for p in model.state.controller.parameters() if p.requires_grad]
-    if controller_params:
-        param_groups.append({
-            'params': controller_params,
-            'lr': tc.interface_lr * 0.1,
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # In-Place TTT module (step-size modulators + meta-learned init)
-    if hasattr(model, 'ttt'):
-        ttt_params = [p for p in model.ttt.parameters() if p.requires_grad]
-        if ttt_params:
-            param_groups.append({
-                'params': ttt_params,
-                'lr': tc.interface_lr,
-                'betas': betas,
-                'eps': 1e-8,
-                'weight_decay': 0.0,
-            })
-
-    # SleepGate (learned sleep cycle)
-    sleep_params = [p for p in model.state.sleep_gate.parameters() if p.requires_grad]
-    if sleep_params:
-        param_groups.append({
-            'params': sleep_params,
-            'lr': tc.interface_lr * 0.1,
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # Message passing (relation transform + DEQ parameters)
-    mp_params = [p for p in model.state.message_passing.parameters() if p.requires_grad]
-    if mp_params:
-        param_groups.append({
-            'params': mp_params,
-            'lr': tc.interface_lr,
-            'betas': betas,
-            'eps': 1e-8,
-            'weight_decay': 0.0,
-        })
-
-    # Kendall/Gal uncertainty weighting parameters (log_sigma per loss group)
-    if hasattr(model, 'log_sigma'):
-        sigma_params = list(model.log_sigma.parameters())
-        if sigma_params:
-            param_groups.append({
-                'params': sigma_params,
-                'lr': tc.scalar_lr if hasattr(tc, 'scalar_lr') else 0.5,
-                'betas': (0.8, 0.95),
-                'eps': 1e-8,
-                'weight_decay': 0.0,
-            })
-
-    # Hypothesis generator (autoresearch loop)
-    if hasattr(model.state, 'hypothesis_gen'):
-        hyp_params = [p for p in model.state.hypothesis_gen.parameters() if p.requires_grad]
-        if hyp_params:
-            param_groups.append({
-                'params': hyp_params,
-                'lr': tc.interface_lr,
-                'betas': betas,
-                'eps': 1e-8,
-                'weight_decay': 0.0,
-            })
-
-    # Cognitive subsystems (C1–D4) — see scratch-mode comment.
-    _add_cognitive_subsystem_groups(param_groups, model, tc, betas)
-
-    optimizer = torch.optim.AdamW(param_groups)
-    for group in optimizer.param_groups:
-        group['initial_lr'] = group['lr']
-
-    _assert_optimizer_covers_model(optimizer, model)
-
-    return optimizer
