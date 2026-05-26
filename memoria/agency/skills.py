@@ -337,16 +337,27 @@ class SkillDetector(nn.Module):
         buffer_size: how many recent patterns to remember
     """
 
-    def __init__(self, belief_dim: int, buffer_size: int = 256):
+    def __init__(
+        self,
+        belief_dim: int,
+        buffer_size: int = 256,
+        action_dim: int = 6,
+        outcome_dim: int = 6,
+    ):
         super().__init__()
         self.belief_dim = belief_dim
         self.buffer_size = buffer_size
+        self.action_dim = action_dim
+        self.outcome_dim = outcome_dim
 
         # Circular buffer of successful patterns
         self.register_buffer('pattern_buffer', torch.zeros(buffer_size, belief_dim))
         self.register_buffer('pattern_rewards', torch.zeros(buffer_size))
         self.register_buffer('_buffer_ptr', torch.tensor(0, dtype=torch.long))
         self.register_buffer('_buffer_count', torch.tensor(0, dtype=torch.long))
+        self.register_buffer('_pending_context', torch.zeros(belief_dim))
+        self.register_buffer('_pending_action', torch.zeros(action_dim))
+        self.register_buffer('_pending_valid', torch.tensor(False, dtype=torch.bool))
 
         # Pattern encoder: compress action-belief pattern to skill-space
         self.encoder = nn.Sequential(
@@ -354,6 +365,20 @@ class SkillDetector(nn.Module):
             nn.GELU(),
             nn.Linear(belief_dim // 2, belief_dim),
         )
+        episode_dim = belief_dim * 2 + action_dim + outcome_dim
+        self.episode_encoder = nn.Sequential(
+            nn.Linear(episode_dim, belief_dim),
+            nn.GELU(),
+            nn.Linear(belief_dim, belief_dim),
+        )
+
+    @staticmethod
+    def _fixed_width(vector: Tensor, width: int, device, dtype) -> Tensor:
+        """Pad or truncate a runtime feature vector to a stable schema width."""
+        flat = vector.detach().flatten().to(device=device, dtype=dtype)
+        if flat.numel() >= width:
+            return flat[:width]
+        return F.pad(flat, (0, width - flat.numel()))
 
     def record_pattern(self, pattern: torch.Tensor, reward: float):
         """Record a successful action-belief pattern.
@@ -371,6 +396,68 @@ class SkillDetector(nn.Module):
             self.pattern_rewards[ptr] = reward
             self._buffer_ptr = (self._buffer_ptr + 1) % self.buffer_size
             self._buffer_count = min(self._buffer_count + 1, self.buffer_size)
+
+    def start_episode(self, context_before: Tensor, action_features: Tensor) -> None:
+        """Begin a pending skill episode with context and soft action features."""
+        with torch.no_grad():
+            self._pending_context.copy_(
+                self._fixed_width(
+                    context_before,
+                    self.belief_dim,
+                    self._pending_context.device,
+                    self._pending_context.dtype,
+                )
+            )
+            self._pending_action.copy_(
+                self._fixed_width(
+                    action_features,
+                    self.action_dim,
+                    self._pending_action.device,
+                    self._pending_action.dtype,
+                )
+            )
+            self._pending_valid.fill_(True)
+
+    def complete_episode(
+        self,
+        context_after: Tensor,
+        outcome_features: Tensor,
+        reward: float,
+    ) -> bool:
+        """Finish a pending action/outcome episode and record it if successful.
+
+        The crystallized pattern is:
+            context_before + action_distribution + outcome_features + context_after
+
+        The `reward` gate remains continuous and externally supplied; this
+        method does not define verifier-specific scores.
+        """
+        if not bool(self._pending_valid.item()):
+            return False
+
+        device = self.pattern_buffer.device
+        dtype = self.pattern_buffer.dtype
+        context_after = self._fixed_width(context_after, self.belief_dim, device, dtype)
+        outcome = self._fixed_width(outcome_features, self.outcome_dim, device, dtype)
+
+        did_record = False
+        if reward > 0:
+            with torch.no_grad():
+                episode = torch.cat([
+                    self._pending_context.to(device=device, dtype=dtype),
+                    self._pending_action.to(device=device, dtype=dtype),
+                    outcome,
+                    context_after,
+                ])
+                pattern = self.episode_encoder(episode.unsqueeze(0)).squeeze(0)
+                self.record_pattern(pattern, reward)
+                did_record = True
+
+        with torch.no_grad():
+            self._pending_context.zero_()
+            self._pending_action.zero_()
+            self._pending_valid.fill_(False)
+        return did_record
 
     def detect_skills(
         self,

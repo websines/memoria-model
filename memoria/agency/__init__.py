@@ -5,4 +5,5 @@ Phase D modules:
 - action_selection: EFE-based action scoring and selection
 - curiosity: intrinsic motivation and exploration goal generation
 - skills: skill crystallization, disentanglement, and composition
+- persistence: opt-in checkpoint policy for adaptive deployment state
 """

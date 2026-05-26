@@ -170,6 +170,36 @@ def test_record_pattern_ignores_negative(detector):
     assert detector._buffer_count.item() == 0
 
 
+def test_episode_pattern_includes_action_outcome(detector):
+    """Pending episodes crystallize context + action + outcome + next context."""
+    context_before = torch.randn(64)
+    action_probs = torch.softmax(torch.randn(6), dim=-1)
+    context_after = torch.randn(64)
+    outcome = torch.randn(6)
+
+    detector.start_episode(context_before, action_probs)
+    recorded = detector.complete_episode(context_after, outcome, reward=0.5)
+
+    assert recorded
+    assert detector._buffer_count.item() == 1
+    assert not detector._pending_valid.item()
+    assert detector.pattern_buffer[0].shape == (64,)
+
+
+def test_episode_pattern_ignores_negative_outcome(detector):
+    """Failed episodes clear pending state without crystallizing a skill pattern."""
+    detector.start_episode(torch.randn(64), torch.softmax(torch.randn(6), dim=-1))
+    recorded = detector.complete_episode(
+        torch.randn(64),
+        torch.randn(6),
+        reward=-0.25,
+    )
+
+    assert not recorded
+    assert detector._buffer_count.item() == 0
+    assert not detector._pending_valid.item()
+
+
 def test_detect_skills_empty(detector):
     """No skills detected with empty buffer."""
     skills = detector.detect_skills(

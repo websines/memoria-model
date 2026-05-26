@@ -762,6 +762,7 @@ def run_pass2(
     # as a transient bias for downstream action selection. The route also
     # records a continuous outcome-prediction side loss using belief_advantage;
     # later tool/test outcomes can feed the same API without reward tables.
+    skill_context_for_episode = None
     if (hasattr(state, 'skill_bank') and state.skill_bank is not None
             and state.skill_detector is not None and state.skill_composer is not None):
         active_mask = state.get_active_mask()
@@ -773,6 +774,7 @@ def run_pass2(
                 device=state.beliefs.device,
                 dtype=state.beliefs.dtype,
             )
+        skill_context_for_episode = skill_context.detach()
         route = state.skill_bank.route_skills(
             skill_context,
             state.meta_params.skill_router_temperature,
@@ -803,12 +805,31 @@ def run_pass2(
         stats['skill_route_entropy'] = float(route['entropy'].detach().item())
         stats['skill_route_max_weight'] = float(route['max_weight'].detach().item())
         stats['skill_bias_norm'] = float(route['skill_bias'].detach().norm().item())
+
+        mean_surprise = stats.get('total_surprise', 0.0) / max(
+            stats.get('num_candidates', 1), 1,
+        )
+        outcome_features = torch.tensor([
+            float(belief_advantage),
+            float(mean_surprise),
+            stats['skill_route_entropy'],
+            stats['skill_route_max_weight'],
+            stats['skill_bias_norm'],
+            state.num_active_goals() / max(state.config.max_goals, 1),
+        ], device=state.beliefs.device, dtype=state.beliefs.dtype)
+        episode_recorded = state.skill_detector.complete_episode(
+            skill_context,
+            outcome_features,
+            float(belief_advantage),
+        )
+        stats['skill_episode_recorded'] = int(episode_recorded)
     elif hasattr(state, 'active_skill_bias'):
         with torch.no_grad():
             state.active_skill_bias.zero_()
             state.active_skill_weights.zero_()
             state.active_skill_mask.zero_()
         stats['skill_route_active'] = 0
+        stats['skill_episode_recorded'] = 0
 
     # ── 16. D2: Action selection (EFE-based policy) ──
     # Score every action by its Expected Free Energy. The chosen action type
@@ -832,6 +853,13 @@ def run_pass2(
         state.action_selector.record_efe_observation(
             state, action_info['action_idx'], observed_fe,
         )
+        if (skill_context_for_episode is not None
+                and hasattr(state, 'skill_detector')
+                and state.skill_detector is not None):
+            state.skill_detector.start_episode(
+                skill_context_for_episode,
+                action_info['probs'],
+            )
         stats['action_selected'] = action_info['action_type'].name
         stats['action_efe'] = action_info['efe_score']
         stats['action_pragmatic'] = action_info['pragmatic']

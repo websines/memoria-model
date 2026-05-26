@@ -1156,7 +1156,7 @@ class CognitiveState(nn.Module):
                 if 'active_skill_mask' in sb:
                     self.active_skill_mask.copy_(sb['active_skill_mask'])
             if 'skill_detector' in state:
-                self.skill_detector.load_state_dict(state['skill_detector'])
+                self.skill_detector.load_state_dict(state['skill_detector'], strict=False)
             if 'skill_composer' in state:
                 self.skill_composer.load_state_dict(state['skill_composer'])
             # LSR Strategy Bank
