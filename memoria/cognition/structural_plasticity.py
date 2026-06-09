@@ -209,6 +209,44 @@ class StructuralPlasticity(nn.Module):
             'growth_pressure': growth_pressure,
         }
 
+    def propose_split(self, state, belief_idx: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Compute the two candidate child vectors for a split WITHOUT mutating.
+
+        Factored out of `split_belief` so the SGM safety gate (A4) can score a
+        proposed split before it commits. Returns the same child A / child B
+        vectors that `split_belief` would write.
+
+        Returns:
+            (child_a_vec, child_b_vec), or None if the parent is degenerate
+            (radius below EPSILON → nothing to split).
+        """
+        parent = state.beliefs.data[belief_idx]  # [D]
+        parent_radius = parent.norm().item()
+
+        if parent_radius < EPSILON:
+            return None
+
+        # Compute split directions from learned network
+        split_out = self.split_dir(parent.unsqueeze(0)).squeeze(0)  # [2D]
+        dir_a = split_out[:self.belief_dim]
+        dir_b = split_out[self.belief_dim:]
+
+        # Normalize and scale
+        parent_angle = parent / max(parent_radius, EPSILON)
+        # Children diverge from parent by the learned perturbation. The 0.1
+        # divergence scale is the module's fixed FPE perturbation gain (also
+        # used as the split_dir init gain above) — a structural constant of the
+        # operator, not a tunable acceptance threshold.
+        child_a_angle = F.normalize(parent_angle + 0.1 * dir_a, dim=-1, eps=EPSILON)
+        child_b_angle = F.normalize(parent_angle + 0.1 * dir_b, dim=-1, eps=EPSILON)
+
+        # Split precision: each child gets radius/sqrt(2) (energy conservation)
+        child_radius = parent_radius / math.sqrt(2)
+
+        child_a_vec = child_a_angle * child_radius
+        child_b_vec = child_b_angle * child_radius
+        return child_a_vec, child_b_vec
+
     def split_belief(self, state, belief_idx: int) -> tuple[int, int]:
         """Split a polysemantic belief into two children (FPE-style).
 
@@ -228,28 +266,10 @@ class StructuralPlasticity(nn.Module):
         Returns:
             (child_a_idx, child_b_idx), or (-1, -1) if no slot available
         """
-        parent = state.beliefs.data[belief_idx]  # [D]
-        parent_radius = parent.norm().item()
-
-        if parent_radius < EPSILON:
+        proposal = self.propose_split(state, belief_idx)
+        if proposal is None:
             return (-1, -1)
-
-        # Compute split directions from learned network
-        split_out = self.split_dir(parent.unsqueeze(0)).squeeze(0)  # [2D]
-        dir_a = split_out[:self.belief_dim]
-        dir_b = split_out[self.belief_dim:]
-
-        # Normalize and scale
-        parent_angle = parent / max(parent_radius, EPSILON)
-        # Children diverge from parent by the learned perturbation
-        child_a_angle = F.normalize(parent_angle + 0.1 * dir_a, dim=-1, eps=EPSILON)
-        child_b_angle = F.normalize(parent_angle + 0.1 * dir_b, dim=-1, eps=EPSILON)
-
-        # Split precision: each child gets radius/sqrt(2) (energy conservation)
-        child_radius = parent_radius / math.sqrt(2)
-
-        child_a_vec = child_a_angle * child_radius
-        child_b_vec = child_b_angle * child_radius
+        child_a_vec, child_b_vec = proposal
 
         # Reuse parent slot for child A
         with torch.no_grad():
@@ -361,6 +381,44 @@ class StructuralPlasticity(nn.Module):
         return anchor
 
 
+def _neighbour_beliefs(state, belief_idx: int) -> torch.Tensor | None:
+    """Belief vectors of every active neighbour of belief_idx.
+
+    The relation-energy term is a SUM over edges; each connected belief is an
+    independent local-FE measurement. Returning the neighbours individually
+    (rather than their mean) lets the safety gate see one improvement sample per
+    edge — a real statistical sample, not a single collapsed number. Returns
+    None when the belief has no active edges (no relational signal to certify).
+    """
+    if state.num_active_edges() == 0:
+        return None
+    src_m = (state.edge_src == belief_idx) & state.edge_active
+    tgt_m = (state.edge_tgt == belief_idx) & state.edge_active
+    neigh = []
+    if src_m.any():
+        neigh.append(state.beliefs.data[state.edge_tgt[src_m]])
+    if tgt_m.any():
+        neigh.append(state.beliefs.data[state.edge_src[tgt_m]])
+    if not neigh:
+        return None
+    return torch.cat(neigh, dim=0)  # [K, D]
+
+
+def _disagreement(vecs: torch.Tensor, neighbours: torch.Tensor) -> torch.Tensor:
+    """Per-neighbour local disagreement = 1 - cos(angle_vec, angle_neighbour).
+
+    Lower = belief better integrated with that neighbour = lower local relation
+    free energy. Same proxy used to gate the C2 learned update, applied per edge.
+
+    Args:
+        vecs: [D] the belief vector being scored (broadcast over neighbours)
+        neighbours: [K, D] neighbour belief vectors
+    Returns:
+        [K] disagreement per neighbour
+    """
+    return 1.0 - F.cosine_similarity(vecs.unsqueeze(0), neighbours, dim=-1, eps=EPSILON)
+
+
 def run_structural_plasticity(
     state,
     plasticity: StructuralPlasticity,
@@ -371,6 +429,16 @@ def run_structural_plasticity(
 
     Called periodically from pass2 (not every step — only when fill ratio
     is moderate and there's enough activation data).
+
+    Every proposed split/prune is certified through the SGM safety gate (A4)
+    before it commits. The per-change improvement signal is the reduction in
+    local relational free energy (1 - cos to the belief's edge-context):
+      • split: parent_disagreement - best_child_disagreement  (children
+        specialise → align better with the neighbourhood)
+      • prune: the dead belief's own disagreement (removing a poorly-integrated
+        belief reduces local relation energy)
+    Beliefs with no relational context yield no measurable sample and so cannot
+    be certified — they are skipped rather than mutated blindly.
 
     Args:
         state: CognitiveState
@@ -390,25 +458,80 @@ def run_structural_plasticity(
     # Evaluate
     result = plasticity.evaluate(state, split_threshold, prune_threshold)
 
-    # Execute splits (capped)
+    gate = getattr(state, 'safety_gate', None)
+
+    # ── Gate + execute splits (capped) ──
     splits_done = 0
+    splits_rejected = 0
     for bidx in result['split_candidates'][:max_splits]:
+        neighbours = _neighbour_beliefs(state, bidx)
+        proposal = plasticity.propose_split(state, bidx)
+        if neighbours is None or proposal is None:
+            # No relational signal (or degenerate parent) → cannot certify.
+            splits_rejected += 1
+            continue
+        child_a, child_b = proposal
+        parent_dis = _disagreement(state.beliefs.data[bidx], neighbours)        # [K]
+        # Per-neighbour improvement: how much the better-aligned child reduces
+        # disagreement with EACH neighbour vs the parent (children specialise →
+        # align better with the local neighbourhood). One sample per edge.
+        best_child_dis = torch.minimum(
+            _disagreement(child_a, neighbours),
+            _disagreement(child_b, neighbours),
+        )
+        improvements = (parent_dis - best_child_dis).tolist()
+        if not _gate_structural_change(gate, f'c3_split_{bidx}', improvements):
+            splits_rejected += 1
+            continue
         a, b = plasticity.split_belief(state, bidx)
         if b >= 0:
             splits_done += 1
             plasticity.reset_stats(torch.tensor([bidx, b], device=state.beliefs.device))
 
-    # Execute prunes (capped)
+    # ── Gate + execute prunes (capped) ──
     prunes_done = 0
+    prunes_rejected = 0
     for bidx in result['prune_candidates'][:max_prunes]:
+        neighbours = _neighbour_beliefs(state, bidx)
+        if neighbours is None:
+            # No edges → no relational free-energy contribution to reclaim,
+            # and no sample to certify the removal with → skip.
+            prunes_rejected += 1
+            continue
+        # Removing a poorly-integrated belief lowers local relation energy by
+        # its per-neighbour disagreement → one improvement sample per edge.
+        improvements = _disagreement(state.beliefs.data[bidx], neighbours).tolist()
+        if not _gate_structural_change(gate, f'c3_prune_{bidx}', improvements):
+            prunes_rejected += 1
+            continue
         plasticity.prune_belief(state, bidx)
         prunes_done += 1
 
     return {
         'split_candidates': len(result['split_candidates']),
         'splits_executed': splits_done,
+        'splits_rejected': splits_rejected,
         'prune_candidates': len(result['prune_candidates']),
         'prunes_executed': prunes_done,
+        'prunes_rejected': prunes_rejected,
         'should_grow': result['should_grow'],
         'growth_pressure': result['growth_pressure'],
     }
+
+
+def _gate_structural_change(gate, name: str, improvements: list[float]) -> bool:
+    """Certify a single structural change through the SGM safety gate (A4).
+
+    Returns True iff the gate accepts. A change with no measurable improvement
+    sample (empty list) or an exhausted error budget is conservatively rejected
+    without spending budget / crashing the live loop. Reuses the gate's
+    pre-configured global_alpha — no new acceptance thresholds are introduced.
+    """
+    if gate is None or len(improvements) == 0:
+        return False
+    handle = f"{name}_{gate.n_modifications.item()}"
+    try:
+        record = gate.evaluate_modification(handle, improvements)
+    except RuntimeError:
+        return False
+    return record.accepted

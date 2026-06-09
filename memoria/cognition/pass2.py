@@ -129,6 +129,96 @@ def _make_tracker_callback(state: CognitiveState):
     return callback
 
 
+def _local_fe_improvement(
+    before: torch.Tensor,
+    after: torch.Tensor,
+    edge_context: torch.Tensor,
+) -> list[float]:
+    """Per-belief local free-energy improvement signal for the safety gate.
+
+    The relation-energy term (free_energy.compute_energy) penalises a belief
+    disagreeing with its (relation-transformed) neighbours. We use a cheap
+    per-belief proxy of that disagreement: the cosine *distance* between a
+    belief's angle and its weighted neighbourhood mean (edge_context), i.e.
+
+        disagreement = 1 - cos(angle_belief, angle_context)   ∈ [0, 2]
+
+    Lower disagreement = belief better integrated with its relational context =
+    lower local free energy. The improvement of a proposed modification is
+
+        improvement = disagreement_before - disagreement_after
+
+    (positive = the edit reduced local free energy = good). Only beliefs that
+    actually have a relational context carry signal; beliefs with an all-zero
+    edge_context (isolated, no active edges) are excluded — the local relation
+    energy is identically zero for them so there is nothing to certify.
+
+    Args:
+        before: [N, D] beliefs prior to the proposed modification
+        after:  [N, D] proposed (uncommitted) beliefs
+        edge_context: [N, D] weighted mean of connected beliefs (0 if isolated)
+
+    Returns:
+        list of improvement floats, one per belief that has relational context
+    """
+    # Beliefs with no relational neighbours carry no local-FE signal.
+    has_context = edge_context.norm(dim=-1) > EPSILON
+    if not has_context.any():
+        return []
+
+    b = before[has_context]
+    a = after[has_context]
+    ctx = edge_context[has_context]
+
+    # cos(belief, context); F.cosine_similarity handles the angle normalisation
+    # (radius cancels) consistently with how compute_energy compares angles.
+    cos_before = torch.nn.functional.cosine_similarity(b, ctx, dim=-1, eps=EPSILON)
+    cos_after = torch.nn.functional.cosine_similarity(a, ctx, dim=-1, eps=EPSILON)
+    disagreement_before = 1.0 - cos_before
+    disagreement_after = 1.0 - cos_after
+    improvement = disagreement_before - disagreement_after  # >0 = better
+
+    return improvement.detach().cpu().tolist()
+
+
+def _gate_self_modification(
+    state: CognitiveState,
+    name: str,
+    improvements: list[float],
+) -> tuple[bool, int]:
+    """Route a proposed self-modification through the SGM safety gate (A4).
+
+    Feeds the per-edit improvement samples to `state.safety_gate` and returns
+    whether the modification is statistically certified superior at the gate's
+    pre-configured confidence level (global_alpha=0.05; no new thresholds).
+
+    A modification with no measurable samples cannot be certified, so it is
+    conservatively rejected without spending budget. If the global error budget
+    is already exhausted the gate raises — we treat that as a (conservative)
+    rejection rather than letting it crash the live loop.
+
+    Args:
+        state: CognitiveState (provides state.safety_gate)
+        name: unique handle for this modification attempt
+        improvements: per-edit improvement samples (metric_before - metric_after)
+
+    Returns:
+        (accepted, n_samples_evaluated)
+    """
+    if state.safety_gate is None or len(improvements) == 0:
+        return False, len(improvements)
+
+    # The handle must be unique per attempt (begin_evaluation rejects an active
+    # duplicate name); disambiguate by the gate's modification counter.
+    handle = f"{name}_{state.safety_gate.n_modifications.item()}"
+    try:
+        record = state.safety_gate.evaluate_modification(handle, improvements)
+    except RuntimeError:
+        # Global error budget exhausted → no more certified modifications.
+        return False, len(improvements)
+    return record.accepted, record.n_samples
+
+
 def run_pass2(
     state: CognitiveState,
     candidates: list[WriteCandidate],
@@ -169,6 +259,9 @@ def run_pass2(
     )
     state.controller.record_reward(dense_reward)
     stats['controller_actions'] = actions
+    # Expose the exact scalar the controller PPO is trained against so the
+    # credit diagnostic (train.py) can correlate it with future token loss.
+    stats['controller_dense_reward'] = float(dense_reward)
 
     # ── 0b. Adaptive depth — decide which operations are needed this step ──
     # Rule-based using running statistics (not a learned probe — the training
@@ -191,6 +284,60 @@ def run_pass2(
     )
     # Goals: only when there are active beliefs and not too many active goals
     need_goals = n_active > 0 and state.num_active_goals() < state.config.max_goals * 0.8
+
+    # ── 0c. D2b: Apply consequence of the PREVIOUS step's selected action ──
+    # The EFE policy (§16) selected an action type LAST step and persisted it
+    # in state.last_action_idx. There is no external environment to act on in a
+    # fixed-corpus next-token trainer, so the consequence is INTERNAL: each
+    # action type reallocates a fraction of the relevant controller rate's
+    # remaining headroom toward the bound its semantics favour, and may force
+    # consolidation. This makes the policy's decision behaviourally real
+    # (changes how many candidates allocate, edges propose, whether sleep runs)
+    # rather than a logged-only label. Full external action remains out of scope.
+    #
+    # Modulation magnitude `s` = state.meta_params.action_consequence_strength,
+    # the fraction of a rate's [lo,hi] headroom a fully-committed 1-of-N choice
+    # claims (derivation in MetaParams: max-entropy reduction 1 − 1/N_ACTIONS).
+    # Each multiplicand below is an EXISTING controller rate (from get_actions)
+    # or an existing running-stat bound — no free-floating magic multipliers.
+    stats['action_consequence'] = None
+    if getattr(state, 'last_action_idx', None) is not None and state.last_action_idx.item() >= 0:
+        from ..agency.action_selection import ACTION_TYPES
+        from ..agency.daemon import ActionType
+        prev_idx = int(state.last_action_idx.item())
+        prev_action = ACTION_TYPES[prev_idx] if prev_idx < len(ACTION_TYPES) else None
+        s = float(state.meta_params.action_consequence_strength.item())
+
+        def _toward(value: float, bound: float) -> float:
+            # Move `value` a fraction `s` of its remaining headroom toward `bound`.
+            return value + s * (bound - value)
+
+        if prev_action == ActionType.EXPLORE:
+            # EXPLORE → expand world model: push allocation toward its upper
+            # bound (1.0) so more write-candidates become beliefs this step.
+            actions['allocate_rate'] = _toward(actions.get('allocate_rate', 1.0), 1.0)
+            stats['action_consequence'] = ('EXPLORE', 'allocate_rate↑', actions['allocate_rate'])
+        elif prev_action == ActionType.SEARCH:
+            # SEARCH → information gathering: push edge connection rate toward
+            # its upper bound (1.0) so more proposed links are considered. The
+            # existing need_edges capacity gate (edge_fill < 0.9) is left intact.
+            actions['connect_rate'] = _toward(actions.get('connect_rate', 1.0), 1.0)
+            stats['action_consequence'] = ('SEARCH', 'connect_rate↑', actions['connect_rate'])
+        elif prev_action == ActionType.CONSOLIDATE:
+            # CONSOLIDATE → run the sleep/dream cleanup this step: force the
+            # consolidation gate on (sleep §8 / hard cleanup also key off it).
+            need_consolidation = True
+            stats['action_consequence'] = ('CONSOLIDATE', 'need_consolidation', True)
+        elif prev_action == ActionType.WAIT:
+            # WAIT → conserve: damp allocation toward its lower bound (0.0) so
+            # fewer new beliefs are committed while waiting for more evidence.
+            actions['allocate_rate'] = _toward(actions.get('allocate_rate', 1.0), 0.0)
+            stats['action_consequence'] = ('WAIT', 'allocate_rate↓', actions['allocate_rate'])
+        else:
+            # RESPOND / TOOL_CALL → nominal: no structural-rate modulation.
+            stats['action_consequence'] = (
+                prev_action.name if prev_action is not None else 'UNKNOWN', 'nominal', None,
+            )
 
     stats['pass2_skip'] = {
         'allocation': not need_allocation,
@@ -653,15 +800,42 @@ def run_pass2(
                 delta_learned, prec_scale_learned, _merge = state.learned_update(
                     beliefs_batch, observation, precisions, errors, edge_context,
                 )
-                # Gated blend: new = old + gate * delta
-                state.beliefs.data[idx_t] = beliefs_batch + gate * delta_learned
-                # Precision scaling applied to radius
+                # Proposed (uncommitted) post-update beliefs.
+                proposed = beliefs_batch + gate * delta_learned
                 new_radii = precisions * (1.0 + gate * (prec_scale_learned - 1.0))
-                # Renormalize to new radius
-                angles = torch.nn.functional.normalize(state.beliefs.data[idx_t], dim=-1, eps=EPSILON)
-                state.beliefs.data[idx_t] = angles * new_radii.unsqueeze(-1)
-            stats['learned_update_gate'] = gate
-            stats['learned_update_applied'] = len(updated_indices)
+                proposed = torch.nn.functional.normalize(proposed, dim=-1, eps=EPSILON) \
+                    * new_radii.unsqueeze(-1)
+
+                # ── A4: certify the learned update through the SGM safety gate ──
+                # Per-edit improvement = local relational free-energy reduction.
+                # The system's relation energy (free_energy.compute_energy) penalizes
+                # a belief disagreeing with its (relation-transformed) neighbours; the
+                # cheap per-belief proxy is the angular disagreement between a belief
+                # and its weighted edge-context. Lower-is-better, so
+                #   improvement = disagreement_before - disagreement_after.
+                # Only beliefs with a relational context (non-zero edge_context) carry
+                # a measurable local-FE signal; isolated beliefs are excluded.
+                improvements = _local_fe_improvement(
+                    beliefs_batch, proposed, edge_context,
+                )
+                accepted, n_eval = _gate_self_modification(
+                    state, 'c2_learned_belief_update', improvements,
+                )
+                if accepted:
+                    # Commit the certified write.
+                    state.beliefs.data[idx_t] = proposed
+                    stats['learned_update_gate'] = gate
+                    stats['learned_update_applied'] = len(updated_indices)
+                    stats['learned_update_accepted'] = 1
+                    stats['learned_update_rejected'] = 0
+                else:
+                    # Reject → roll back (beliefs.data was never overwritten, so
+                    # no restore is needed; the slices are untouched).
+                    stats['learned_update_gate'] = gate
+                    stats['learned_update_applied'] = 0
+                    stats['learned_update_accepted'] = 0
+                    stats['learned_update_rejected'] = 1
+                    stats['learned_update_samples_evaluated'] = n_eval
         else:
             stats['learned_update_applied'] = 0
 
@@ -832,10 +1006,13 @@ def run_pass2(
         stats['skill_episode_recorded'] = 0
 
     # ── 16. D2: Action selection (EFE-based policy) ──
-    # Score every action by its Expected Free Energy. The chosen action type
-    # is a cognitive decision (not an externally-visible action during
-    # training); it biases which pass-2 operations run more aggressively
-    # next step and feeds the daemon loop with a recommended action.
+    # Score every action by its Expected Free Energy. The chosen action type is
+    # a cognitive decision. During a fixed-corpus next-token trainer there is no
+    # external environment to act on, so the consequence is INTERNAL only: the
+    # chosen action is persisted to state.last_action_idx and read at the START
+    # of the NEXT run_pass2 (§0c above) to modulate that step's structural
+    # operation rates. This closes the control loop the comment used to only
+    # promise — full external-environment coupling remains out of scope here.
     if hasattr(state, 'action_selector') and state.action_selector is not None:
         with torch.no_grad():
             action_idx, action_info = state.action_selector.select_action(
@@ -865,6 +1042,11 @@ def run_pass2(
         stats['action_pragmatic'] = action_info['pragmatic']
         stats['action_epistemic'] = action_info['epistemic']
         stats['action_risk'] = action_info['risk']
+        # Persist the choice so the NEXT run_pass2 can apply its consequence
+        # (read in §0c). This is the write half of the D2b internal loop.
+        if hasattr(state, 'last_action_idx'):
+            with torch.no_grad():
+                state.last_action_idx.fill_(int(action_info['action_idx']))
 
     # ── 17. D4: Skill crystallization ──
     # Record any successful high-advantage step's belief mean as a pattern,

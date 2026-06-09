@@ -234,6 +234,16 @@ class MetaParams(nn.Module):
         # Risk aversion: multiplier on risk term in action EFE.
         # softplus(0.0) ≈ 0.693 → balanced risk sensitivity
         self._action_risk_aversion = nn.Parameter(torch.tensor(0.0))
+        # Action-consequence strength: fraction of a controller rate's remaining
+        # headroom that the *selected* action type reallocates toward the bound
+        # its semantics favour (D2b — closes the internal control loop in pass2).
+        # Derivation (not a magic number): the EFE policy makes one HARD
+        # categorical choice over N_ACTIONS=6 actions. The information that a
+        # single committed choice carries over the uniform prior is the
+        # max-entropy reduction 1 − 1/N = 5/6 ≈ 0.833 of the available headroom;
+        # i.e. a fully-decided policy claims that fraction of the rate's range.
+        # sigmoid keeps it a valid fraction in (0,1); logit(5/6) = ln 5 ≈ 1.6094.
+        self._action_consequence_strength = nn.Parameter(torch.tensor(1.6094379124341003))
 
         # ── D3: Curiosity ──
         # Curiosity threshold: above this, generate exploration goals.
@@ -767,6 +777,12 @@ class MetaParams(nn.Module):
     def action_risk_aversion(self) -> torch.Tensor:
         """Multiplier on risk term in action EFE. Range: (0, inf)."""
         return F.softplus(self._action_risk_aversion)
+
+    @property
+    def action_consequence_strength(self) -> torch.Tensor:
+        """Fraction of a controller rate's headroom claimed by the selected
+        action type (D2b internal control loop). Range: (0, 1)."""
+        return torch.sigmoid(self._action_consequence_strength)
 
     # ── D3: Curiosity ──
 

@@ -344,6 +344,14 @@ class CognitiveState(nn.Module):
         # ── D2: Action Selection ──
         from ..agency.action_selection import ActionSelector
         self.action_selector = ActionSelector(belief_dim=config.belief_dim)
+        # D2b: Selected-action consequence loop. The EFE policy's choice each
+        # step is persisted here and read at the START of the NEXT run_pass2 to
+        # modulate that step's structural operation rates (see pass2 §0c).
+        # -1 = no prior action selected (nominal/RESPOND-equivalent behaviour).
+        # Persistent across save/load so the control loop survives checkpoints.
+        self.register_buffer(
+            'last_action_idx', torch.tensor(-1, dtype=torch.long),
+        )
 
         # ── D3: Curiosity Module ──
         from ..agency.curiosity import CuriosityModule
@@ -972,6 +980,8 @@ class CognitiveState(nn.Module):
             'daemon': self.daemon.state_dict(),
             # D2: Action Selector
             'action_selector': self.action_selector.state_dict(),
+            # D2b: persisted selected-action index (consequence loop)
+            'last_action_idx': self.last_action_idx.clone(),
             # D3: Curiosity
             'curiosity': self.curiosity.state_dict(),
             # D4: Skills
@@ -1136,6 +1146,9 @@ class CognitiveState(nn.Module):
             # D2: Action Selector
             if 'action_selector' in state:
                 self.action_selector.load_state_dict(state['action_selector'])
+            # D2b: persisted selected-action index (consequence loop)
+            if 'last_action_idx' in state:
+                self.last_action_idx.copy_(state['last_action_idx'])
             # D3: Curiosity
             if 'curiosity' in state:
                 self.curiosity.load_state_dict(state['curiosity'])

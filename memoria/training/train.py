@@ -432,6 +432,20 @@ def train(
     # Belief advantage tracking (with-state vs without-state loss delta)
     belief_advantage_ema = 0.0
 
+    # Credit-assignment diagnostic (observe-only): running correlation between
+    # the controller's per-step proxy reward and the FUTURE drop in token loss
+    # `credit_horizon` steps later. Measures whether the single-step
+    # detach-every-step proxy actually predicts downstream token utility.
+    # EMA decay is sourced from the controller's reward_ema_decay (the same
+    # MetaParam-derived constant used for belief_advantage_ema below), so the
+    # diagnostic smooths on the same timescale the controller learns against —
+    # no second magic number.
+    from .credit_diagnostics import CreditDiagnostic
+    credit_diagnostic = CreditDiagnostic(
+        horizon=tc.credit_horizon,
+        ema_decay=float(base_model.state.controller.reward_ema_decay),
+    )
+
     # Resume
     start_step = 0
     samples_consumed = 0
@@ -516,6 +530,13 @@ def train(
         print(f"Phase 1 (α=0): steps 0-{tc.phase1_steps}")
         print(f"Phase 2 (α ramps): steps {tc.phase1_steps}-{tc.phase1_steps + tc.alpha_warmup_steps}")
         print(f"Phase 3 (α={tc.alpha_max}): steps {tc.phase1_steps + tc.alpha_warmup_steps}+")
+        if tc.tbptt_window > 1:
+            print(
+                f"WARNING: tbptt_window={tc.tbptt_window} (>1) is EXPERIMENTAL. "
+                f"State stays graph-connected across {tc.tbptt_window} steps; "
+                f"multi-step gradient correctness through the in-place TTT path "
+                f"is NOT validated. Use 1 for the proven single-step behavior."
+            )
 
     # Data loading: process-based prefetcher on rank 0, broadcast to other ranks.
     # Uses a subprocess (not a thread) so fsspec/aiohttp get their own asyncio
@@ -844,8 +865,26 @@ def train(
         packed = gather_candidates(packed, rank, world_size, belief_dim, device=device)
         all_read_indices = gather_read_indices(all_read_indices, rank, world_size, device)
 
-        # Pass 2: cognitive update on rank 0 only
-        base_model.detach_state()
+        # Pass 2: cognitive update on rank 0 only.
+        #
+        # ── k-step TBPTT window (PART B) ──
+        # tbptt_window=1 (default) detaches the cognitive-state tensors from the
+        # autograd graph EVERY step, exactly as before — 1-step truncated BPTT,
+        # byte-identical to the prior `base_model.detach_state()` call.
+        #
+        # tbptt_window>1 (EXPERIMENTAL) defers the detach so the state stays
+        # graph-connected across up to k steps, letting a write decision at
+        # step t receive gradient from a loss at step t+<k. We detach when the
+        # window closes ((step+1) % k == 0) so the *next* step starts a fresh
+        # graph. CAVEAT: forward() mutates state in-place under
+        # allow_mutation_on_saved_tensors(); retaining the graph across steps
+        # grows memory and has NOT been validated for gradient correctness with
+        # the in-place TTT path. Treat window>1 as a research toggle. The detach
+        # must happen here (before run_pass2's structural .data writes) on every
+        # window-close step so pass2 never mutates graph-tracked tensors.
+        _close_tbptt_window = ((step + 1) % max(tc.tbptt_window, 1) == 0)
+        if _close_tbptt_window:
+            base_model.detach_state()
 
         # Detect actual sequence boundaries (EOS token/byte present in last batch)
         if blt_enabled:
@@ -971,6 +1010,18 @@ def train(
         if step > 5:
             total_training_time += dt
 
+        # ── Credit-assignment diagnostic (observe-only) ──
+        # Feed the controller's per-step proxy reward together with this step's
+        # token loss; the diagnostic aligns reward[t] with -(loss[t+k]-loss[t])
+        # internally via its ring buffer. Rank-0-only: controller_dense_reward
+        # is produced inside run_pass2 which is is_main-gated, matching the
+        # belief_advantage / controller-PPO bookkeeping above. Zero training
+        # effect — it only reads scalars.
+        credit_corr = None
+        if is_main:
+            proxy_reward = pass2_stats.get('controller_dense_reward', 0.0)
+            credit_corr = credit_diagnostic.update(proxy_reward, total_loss_token)
+
         # Logging
         ema = 0.9
         smooth_loss = ema * smooth_loss + (1 - ema) * total_loss
@@ -980,11 +1031,15 @@ def train(
 
         if step % tc.log_interval == 0 and is_main:
             phase = "P1" if alpha == 0 else ("P2" if alpha < tc.alpha_max else "P3")
+            # Credit correlation: proxy-reward[t] vs future token-loss drop.
+            # 'warmup' until the diagnostic has its first aligned (x, y) pair.
+            credit_str = f"{credit_corr:+.3f}" if credit_corr is not None else "warmup"
             print(
                 f"\rstep {step:05d} [{phase}] | "
                 f"loss: {debiased:.4f} (tok: {smooth_loss_token / (1 - ema ** (step - start_step + 1)):.4f}, "
                 f"fe: {smooth_loss_fe / (1 - ema ** (step - start_step + 1)):.4f}) | "
                 f"α: {alpha:.4f} | β: {pass2_stats['beta']:.3f} | "
+                f"credit_corr(k={tc.credit_horizon}): {credit_str} | "
                 f"beliefs: {pass2_stats['active_beliefs']} | "
                 f"edges: {pass2_stats['active_edges']} | "
                 f"goals: {pass2_stats['active_goals']} | "
@@ -1029,7 +1084,15 @@ def train(
                 'parl/goal_completion_rate': pass2_stats.get('controller_actions', {}).get('_goal_completion_rate', 0.0) if isinstance(pass2_stats.get('controller_actions'), dict) else 0.0,
                 'parl/goals_with_hypotheses': pass2_stats.get('goals_with_hypotheses', 0),
                 'parl/training_progress': step / max(max_steps, 1),
+                # Credit-assignment diagnostic: does the per-step proxy reward
+                # predict future token-loss improvement? See credit_diagnostics.
+                'credit/proxy_reward': pass2_stats.get('controller_dense_reward', 0.0),
+                'credit/pairs_ingested': credit_diagnostic.n_pairs,
             }
+            # Correlation is None during warmup / degenerate variance — only log
+            # a real number so wandb panels don't break on None.
+            if credit_corr is not None:
+                log_dict['credit/reward_vs_future_loss_corr'] = credit_corr
             # Per-operation pass2 diagnostics — essential for isolating which
             # of the 12 structural operations is misbehaving during training.
             for key in ['beliefs_cleaned', 'edges_cleaned', 'belief_allocated',

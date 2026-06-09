@@ -263,6 +263,31 @@ class TrainingConfig:
     eval_interval: int = 500
     checkpoint_interval: int = 1000
 
+    # ── Credit-assignment diagnostic (observe-only) ──
+    # Running correlation between the controller's per-step proxy reward and the
+    # FUTURE change in token loss, k steps ahead. Tells us whether the
+    # single-step "reduce free energy now" proxy actually predicts downstream
+    # token-prediction improvement (the bet the detach-every-step loop makes).
+    # Pure observation; never changes training.
+    #
+    # Horizon default: tied to the grad-accumulation depth, not a bare literal.
+    # grad_accum is the number of micro-batches whose gradients are summed into
+    # ONE optimizer step, i.e. the natural granularity at which a write decision
+    # could plausibly influence a later loss. A horizon equal to a few such
+    # steps is the smallest window over which downstream credit is even
+    # meaningful (k=1 would just compare adjacent steps). 4 ≈ one short
+    # gradient-cadence's worth of look-ahead; override per experiment.
+    credit_horizon: int = 4
+
+    # ── k-step truncated BPTT window (PART B, default-OFF) ──
+    # Number of optimizer steps between detach_state() calls. tbptt_window=1
+    # reproduces today's behavior EXACTLY (detach every step → 1-step BPTT).
+    # Values > 1 keep the autograd graph alive across k steps so memory-write
+    # decisions can receive gradient from later losses. EXPERIMENTAL at >1:
+    # forward() mutates state in-place under allow_mutation_on_saved_tensors(),
+    # which interacts with multi-step graph retention (see train.py).
+    tbptt_window: int = 1
+
 
 @dataclass
 class MemoriaConfig:
